@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,20 +16,15 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 
-# ============================================================
-# NEWS ENGINE
-# ============================================================
-
 from news_engine import (
     collect_news,
     search_news,
     build_ai_context,
-    format_news_for_telegram,
 )
 
 
 # ============================================================
-# SETTINGS
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -37,6 +33,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -60,6 +61,7 @@ ai_client = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
+# Stable current Gemini Flash model.
 GEMINI_MODEL = "gemini-3.5-flash"
 
 
@@ -70,6 +72,61 @@ GEMINI_MODEL = "gemini-3.5-flash"
 MAX_NEWS_FOR_AI = 20
 MAX_SEARCH_RESULTS = 15
 MAX_HISTORY = 6
+
+TELEGRAM_MAX_LENGTH = 3900
+
+
+# ============================================================
+# USER LOCKS
+# ============================================================
+
+# يمنع المستخدم نفسه من إرسال عدة طلبات
+# في نفس الوقت والتسبب في تداخل النتائج.
+USER_LOCKS = defaultdict(asyncio.Lock)
+
+
+# ============================================================
+# TOPICS
+# ============================================================
+
+TOPICS = {
+
+    "urgent": (
+        "عاجل هجوم صاروخ قصف انفجار حرب تصعيد"
+    ),
+
+    "world": (
+        "العالم دولي دولية أزمة اتفاق"
+    ),
+
+    "gulf": (
+        "السعودية الخليج العربي قطر الإمارات"
+    ),
+
+    "america": (
+        "أمريكا الولايات المتحدة واشنطن"
+    ),
+
+    "europe": (
+        "أوروبا بريطانيا فرنسا ألمانيا"
+    ),
+
+    "asia": (
+        "آسيا الصين اليابان الهند روسيا"
+    ),
+
+    "energy": (
+        "نفط أوبك أوبك+ غاز طاقة أسواق اقتصاد"
+    ),
+
+    "security": (
+        "أمن صراع حرب هجوم عسكري صاروخ"
+    ),
+
+    "foreign": (
+        "وزارة الخارجية وزير الخارجية بيان تصريح"
+    ),
+}
 
 
 # ============================================================
@@ -83,75 +140,75 @@ def get_main_keyboard():
         [
             InlineKeyboardButton(
                 "🔴 عاجل الآن",
-                callback_data="topic_عاجل هجوم صاروخ قصف انفجار حرب تصعيد"
+                callback_data="topic:urgent",
             )
         ],
 
         [
             InlineKeyboardButton(
                 "🌍 العالم",
-                callback_data="topic_العالم دولي دولية أزمة اتفاق"
+                callback_data="topic:world",
             )
         ],
 
         [
             InlineKeyboardButton(
                 "🇸🇦 الخليج والعالم العربي",
-                callback_data="topic_السعودية الخليج العربي قطر الإمارات"
+                callback_data="topic:gulf",
             )
         ],
 
         [
             InlineKeyboardButton(
                 "🇺🇸 أمريكا",
-                callback_data="topic_أمريكا الولايات المتحدة واشنطن"
+                callback_data="topic:america",
             ),
 
             InlineKeyboardButton(
                 "🇪🇺 أوروبا",
-                callback_data="topic_أوروبا بريطانيا فرنسا ألمانيا"
+                callback_data="topic:europe",
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "🌏 آسيا",
-                callback_data="topic_آسيا الصين اليابان الهند روسيا"
+                callback_data="topic:asia",
             )
         ],
 
         [
             InlineKeyboardButton(
                 "🛢️ الطاقة والأسواق",
-                callback_data="topic_نفط أوبك أوبك+ غاز طاقة أسواق اقتصاد"
+                callback_data="topic:energy",
             )
         ],
 
         [
             InlineKeyboardButton(
                 "🛡️ الأمن والصراعات",
-                callback_data="topic_أمن صراع حرب هجوم عسكري صاروخ"
+                callback_data="topic:security",
             )
         ],
 
         [
             InlineKeyboardButton(
                 "🏛️ بيانات وزارات الخارجية",
-                callback_data="topic_وزارة الخارجية وزير الخارجية بيان تصريح"
+                callback_data="topic:foreign",
             )
         ],
 
         [
             InlineKeyboardButton(
                 "⚡ تحليل مقارن شامل",
-                callback_data="compare_all"
+                callback_data="compare",
             )
         ],
     ])
 
 
 # ============================================================
-# BACK BUTTON
+# BACK KEYBOARD
 # ============================================================
 
 def get_back_keyboard():
@@ -160,19 +217,19 @@ def get_back_keyboard():
         [
             InlineKeyboardButton(
                 "🔙 العودة للقائمة الرئيسية",
-                callback_data="back_to_menu",
+                callback_data="back",
             )
         ]
     ])
 
 
 # ============================================================
-# SAFE MESSAGE SPLITTER
+# SAFE TEXT SPLITTER
 # ============================================================
 
 def split_text_safely(
-    text,
-    max_length=3900,
+    text: str,
+    max_length: int = TELEGRAM_MAX_LENGTH,
 ):
 
     if not text:
@@ -185,6 +242,8 @@ def split_text_safely(
     current = ""
 
     for paragraph in paragraphs:
+
+        paragraph = paragraph.strip()
 
         candidate = (
             paragraph
@@ -242,37 +301,38 @@ def split_text_safely(
 # ============================================================
 
 async def send_long_message(
-    update,
-    text,
+    update: Update,
+    text: str,
     query=None,
     keyboard=None,
 ):
 
-    chunks = split_text_safely(
-        text
-    )
+    chunks = split_text_safely(text)
 
     try:
 
         if query:
 
+            # أول جزء يستبدل رسالة التحميل
             await query.edit_message_text(
                 text=chunks[0]
             )
 
+            # الأجزاء الوسطية
+            for chunk in chunks[1:-1]:
+
+                await update.get_bot().send_message(
+                    chat_id=update.effective_chat.id,
+                    text=chunk,
+                )
+
+            # الجزء الأخير مع الزر
             if len(chunks) > 1:
 
-                for chunk in chunks[1:-1]:
-
-                    await context_bot_send(
-                        update,
-                        chunk,
-                    )
-
-                await context_bot_send(
-                    update,
-                    chunks[-1],
-                    keyboard,
+                await update.get_bot().send_message(
+                    chat_id=update.effective_chat.id,
+                    text=chunks[-1],
+                    reply_markup=keyboard,
                 )
 
             elif keyboard:
@@ -283,23 +343,21 @@ async def send_long_message(
 
         else:
 
-            for index, chunk in enumerate(
-                chunks
-            ):
+            for index, chunk in enumerate(chunks):
 
                 if index == len(chunks) - 1:
 
-                    await context_bot_send(
-                        update,
-                        chunk,
-                        keyboard,
+                    await update.get_bot().send_message(
+                        chat_id=update.effective_chat.id,
+                        text=chunk,
+                        reply_markup=keyboard,
                     )
 
                 else:
 
-                    await context_bot_send(
-                        update,
-                        chunk,
+                    await update.get_bot().send_message(
+                        chat_id=update.effective_chat.id,
+                        text=chunk,
                     )
 
     except Exception as exc:
@@ -308,19 +366,6 @@ async def send_long_message(
             "Telegram send error: %s",
             exc,
         )
-
-
-async def context_bot_send(
-    update,
-    text,
-    keyboard=None,
-):
-
-    await update.get_bot().send_message(
-        chat_id=update.effective_chat.id,
-        text=text,
-        reply_markup=keyboard,
-    )
 
 
 # ============================================================
@@ -346,7 +391,7 @@ async def get_fresh_news(
             len(items),
         )
 
-        return items
+        return items or []
 
     except Exception as exc:
 
@@ -359,29 +404,43 @@ async def get_fresh_news(
 
 
 # ============================================================
-# GEMINI ANALYSIS
+# GEMINI
 # ============================================================
 
 async def ask_gemini(
-    prompt,
+    prompt: str,
 ):
 
-    response = await asyncio.to_thread(
-        ai_client.models.generate_content,
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(
-                thinking_level=types.ThinkingLevel.LOW
-            )
-        ),
-    )
+    try:
 
-    return (
-        response.text
-        if response and response.text
-        else "لم يُرجع نموذج الذكاء الاصطناعي إجابة."
-    )
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="low"
+                )
+            ),
+        )
+
+        if response and response.text:
+
+            return response.text.strip()
+
+        return (
+            "لم يُرجع نموذج الذكاء الاصطناعي "
+            "إجابة نصية."
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Gemini API error: %s",
+            exc,
+        )
+
+        raise
 
 
 # ============================================================
@@ -398,32 +457,37 @@ async def generate_report(
         max_items=MAX_NEWS_FOR_AI,
     )
 
+    if not context:
+
+        return (
+            "لم يتم العثور على بيانات إخبارية "
+            "كافية للتحليل."
+        )
+
     if report_type == "compare":
 
         prompt = f"""
-أنت محلل سياسي واقتصادي محترف.
-
-لديك الآن بيانات أخبار حديثة جمعت من مصادر
-متعددة.
+أنت محلل سياسي واقتصادي محترف متخصص
+في مقارنة المصادر الإخبارية.
 
 حلل البيانات التالية فقط.
 
-المطلوب:
+القواعد:
 
-1. تحديد أهم الأحداث.
-2. مقارنة الروايات بين المصادر.
-3. تحديد الحقائق المشتركة.
-4. تحديد الاختلافات في التغطية.
-5. إبراز البيانات الرسمية.
-6. التمييز بوضوح بين:
+1. حدد أهم الأحداث.
+2. قارن الروايات بين المصادر.
+3. حدد الحقائق المشتركة.
+4. حدد الاختلافات بين التغطيات.
+5. أبرز البيانات الرسمية.
+6. ميز بوضوح بين:
    - بيان رسمي
-   - تقرير وكالة أنباء
-   - تقرير قناة أو موقع إخباري
+   - وكالة أنباء
+   - قناة أو موقع إخباري
    - استنتاج تحليلي
 7. لا تخترع أي معلومة.
 8. لا تعتبر غياب الخبر دليلاً على عدم حدوثه.
-9. إذا كانت البيانات غير كافية، قل ذلك صراحة.
-10. ركز على الأخبار الحديثة والمهمة فقط.
+9. إذا كانت البيانات غير كافية، قل ذلك.
+10. لا تكرر الأحداث المتشابهة.
 
 مصادر الأخبار:
 
@@ -433,15 +497,23 @@ async def generate_report(
 
 اكتب بالعربية.
 
-ابدأ بملخص تنفيذي قصير، ثم:
-- أبرز التطورات
-- المواقف الرسمية
-- مقارنة التغطية
-- ما هو مؤكد
-- ما هو غير مؤكد
-- قراءة تحليلية مختصرة
+الهيكل:
 
-لا تكرر الأخبار المتشابهة.
+الملخص التنفيذي
+
+أبرز التطورات
+
+المواقف الرسمية
+
+مقارنة التغطية
+
+ما هو مؤكد
+
+ما هو غير مؤكد
+
+القراءة التحليلية
+
+اجعل التقرير مركزاً وواضحاً.
 """
 
     else:
@@ -455,14 +527,15 @@ async def generate_report(
 
 - اعتمد فقط على البيانات الموجودة.
 - لا تختلق أسماء أو تصريحات أو أرقاماً.
-- نسب كل معلومة إلى مصدرها.
+- انسب المعلومات إلى مصادرها.
 - أعط الأولوية للبيانات الرسمية.
 - افصل الخبر المؤكد عن التحليل.
-- إذا كان الخبر من وكالة أو قناة، اذكر أنه تقرير إعلامي.
-- لا تكرر نفس الحدث عدة مرات.
+- إذا كان المصدر وكالة أو قناة،
+  اذكر أنه تقرير إعلامي.
+- لا تكرر نفس الحدث.
 - تجاهل الحشو.
-- ركز على ما حدث ومتى ومن قال ماذا.
-- إذا لم توجد معلومات كافية، قل ذلك بوضوح.
+- ركز على ماذا حدث ومتى ومن قال ماذا.
+- إذا لم توجد معلومات كافية، قل ذلك صراحة.
 
 الأخبار:
 
@@ -482,13 +555,11 @@ async def generate_report(
 لا تضف معلومات من خارج البيانات.
 """
 
-    return await ask_gemini(
-        prompt
-    )
+    return await ask_gemini(prompt)
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 async def start(
@@ -501,14 +572,14 @@ async def start(
     await update.message.reply_text(
         "مرحباً بك في نظام الرصد الإخباري المباشر.\n\n"
         "المحرك يجلب الأخبار الحديثة من المصادر "
-        "المتاحة ثم يفرزها ويزيل التكرار قبل التحليل.\n\n"
+        "المتاحة، ثم يفرزها ويزيل التكرار قبل التحليل.\n\n"
         "اختر ملفاً أو اكتب سؤالك مباشرة.",
         reply_markup=get_main_keyboard(),
     )
 
 
 # ============================================================
-# /RESET
+# RESET
 # ============================================================
 
 async def reset(
@@ -519,7 +590,8 @@ async def reset(
     context.user_data.clear()
 
     await update.message.reply_text(
-        "تمت إعادة ضبط جلسة الرصد والمحادثة."
+        "تمت إعادة ضبط جلسة الرصد والمحادثة.",
+        reply_markup=get_main_keyboard(),
     )
 
 
@@ -542,7 +614,7 @@ async def button_handler(
     # BACK
     # --------------------------------------------------------
 
-    if data == "back_to_menu":
+    if data == "back":
 
         await query.edit_message_text(
             text=(
@@ -555,148 +627,188 @@ async def button_handler(
         return
 
     # --------------------------------------------------------
-    # LOADING
+    # COMPARE
     # --------------------------------------------------------
 
-    await query.edit_message_text(
-        text=(
-            "📡 جاري جمع الأخبار الحديثة...\n\n"
-            "• فحص المصادر\n"
-            "• إزالة التكرار\n"
-            "• ترتيب الأخبار حسب الأهمية\n"
-            "• تجهيز البيانات للتحليل"
-        )
-    )
+    if data == "compare":
+
+        topic_key = None
+        report_type = "compare"
 
     # --------------------------------------------------------
-    # FRESH NEWS
+    # TOPIC
     # --------------------------------------------------------
 
-    fresh_items = await get_fresh_news(
-        max_items=100
-    )
+    elif data.startswith("topic:"):
 
-    if not fresh_items:
-
-        await query.edit_message_text(
-            text=(
-                "تعذر الحصول على أخبار من المصادر "
-                "حالياً.\n\n"
-                "قد يكون أحد المصادر متوقفاً أو "
-                "محجوباً مؤقتاً."
-            ),
-            reply_markup=get_back_keyboard(),
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SELECT TOPIC
-    # --------------------------------------------------------
-
-    if data.startswith("topic_"):
-
-        keywords = data.replace(
-            "topic_",
-            "",
+        topic_key = data.split(
+            ":",
             1,
-        )
+        )[1]
 
-        selected_items = search_news(
-            fresh_items,
-            keywords,
-            limit=MAX_SEARCH_RESULTS,
-        )
+        if topic_key not in TOPICS:
 
-        # إذا لم يجد البحث نتائج قوية،
-        # نستخدم أحدث الأخبار كاحتياط.
-        if len(selected_items) < 3:
+            await query.edit_message_text(
+                text="الخيار غير معروف.",
+                reply_markup=get_back_keyboard(),
+            )
 
-            selected_items = fresh_items[
-                :MAX_SEARCH_RESULTS
-            ]
+            return
 
         report_type = "normal"
-
-    elif data == "compare_all":
-
-        selected_items = fresh_items[
-            :MAX_SEARCH_RESULTS
-        ]
-
-        report_type = "compare"
 
     else:
 
         return
 
     # --------------------------------------------------------
-    # SHOW STATUS
+    # USER LOCK
     # --------------------------------------------------------
 
-    try:
+    user_id = update.effective_user.id
 
-        await query.edit_message_text(
-            text=(
-                f"🧠 تم العثور على "
-                f"{len(selected_items)} خبراً مناسباً.\n\n"
-                "جاري تحليلها ومقارنة المصادر..."
+    async with USER_LOCKS[user_id]:
+
+        # ----------------------------------------------------
+        # LOADING
+        # ----------------------------------------------------
+
+        try:
+
+            await query.edit_message_text(
+                text=(
+                    "📡 جاري جمع الأخبار الحديثة...\n\n"
+                    "• فحص المصادر\n"
+                    "• إزالة التكرار\n"
+                    "• ترتيب الأخبار\n"
+                    "• تجهيز البيانات للتحليل"
+                )
             )
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # NEWS
+        # ----------------------------------------------------
+
+        fresh_items = await get_fresh_news(
+            max_items=100
         )
 
-    except Exception:
+        if not fresh_items:
 
-        pass
+            await query.edit_message_text(
+                text=(
+                    "تعذر الحصول على أخبار من المصادر "
+                    "حالياً.\n\n"
+                    "قد يكون أحد المصادر متوقفاً أو "
+                    "محجوباً مؤقتاً."
+                ),
+                reply_markup=get_back_keyboard(),
+            )
 
-    # --------------------------------------------------------
-    # AI
-    # --------------------------------------------------------
+            return
 
-    try:
+        # ----------------------------------------------------
+        # SELECT
+        # ----------------------------------------------------
 
-        reply_text = await generate_report(
-            selected_items,
-            report_type,
+        if topic_key:
+
+            keywords = TOPICS[topic_key]
+
+            selected_items = search_news(
+                fresh_items,
+                keywords,
+                limit=MAX_SEARCH_RESULTS,
+            )
+
+            if len(selected_items) < 3:
+
+                selected_items = fresh_items[
+                    :MAX_SEARCH_RESULTS
+                ]
+
+        else:
+
+            selected_items = fresh_items[
+                :MAX_SEARCH_RESULTS
+            ]
+
+        # ----------------------------------------------------
+        # STATUS
+        # ----------------------------------------------------
+
+        try:
+
+            await query.edit_message_text(
+                text=(
+                    f"🧠 تم العثور على "
+                    f"{len(selected_items)} خبراً مناسباً.\n\n"
+                    "جاري تحليلها ومقارنة المصادر..."
+                )
+            )
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # AI
+        # ----------------------------------------------------
+
+        try:
+
+            reply_text = await generate_report(
+                selected_items,
+                report_type,
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Gemini report error: %s",
+                exc,
+            )
+
+            reply_text = (
+                "تعذر تحليل الأخبار بواسطة "
+                "نموذج الذكاء الاصطناعي حالياً.\n\n"
+                "يرجى المحاولة مرة أخرى بعد قليل."
+            )
+
+        # ----------------------------------------------------
+        # SAVE SESSION
+        # ----------------------------------------------------
+
+        context.user_data[
+            "current_report"
+        ] = reply_text
+
+        context.user_data[
+            "latest_news"
+        ] = selected_items
+
+        context.user_data[
+            "chat_history"
+        ] = []
+
+        context.user_data[
+            "last_topic"
+        ] = data
+
+        # ----------------------------------------------------
+        # SEND
+        # ----------------------------------------------------
+
+        await send_long_message(
+            update,
+            reply_text,
+            query=query,
+            keyboard=get_back_keyboard(),
         )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Gemini report error: %s",
-            exc,
-        )
-
-        reply_text = (
-            "حدث خطأ أثناء تحليل الأخبار بواسطة Gemini.\n\n"
-            f"التفاصيل التقنية:\n{str(exc)}"
-        )
-
-    # --------------------------------------------------------
-    # SAVE SESSION
-    # --------------------------------------------------------
-
-    context.user_data["current_report"] = (
-        reply_text
-    )
-
-    context.user_data["latest_news"] = (
-        selected_items
-    )
-
-    context.user_data["chat_history"] = []
-
-    context.user_data["last_topic"] = data
-
-    # --------------------------------------------------------
-    # SEND
-    # --------------------------------------------------------
-
-    await send_long_message(
-        update,
-        reply_text,
-        query=query,
-        keyboard=get_back_keyboard(),
-    )
 
 
 # ============================================================
@@ -718,95 +830,97 @@ async def handle_user_message(
 
         return
 
-    # --------------------------------------------------------
-    # THINKING MESSAGE
-    # --------------------------------------------------------
+    user_id = update.effective_user.id
 
-    thinking_message = await update.message.reply_text(
-        "📡 جاري فحص الأخبار الحديثة ثم تحليل سؤالك..."
-    )
+    async with USER_LOCKS[user_id]:
 
-    # --------------------------------------------------------
-    # ALWAYS GET FRESH NEWS
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # THINKING
+        # ----------------------------------------------------
 
-    fresh_items = await get_fresh_news(
-        max_items=100
-    )
-
-    # --------------------------------------------------------
-    # SEARCH CURRENT NEWS
-    # --------------------------------------------------------
-
-    matching_items = search_news(
-        fresh_items,
-        user_text,
-        limit=MAX_SEARCH_RESULTS,
-    )
-
-    # --------------------------------------------------------
-    # PREVIOUS REPORT
-    # --------------------------------------------------------
-
-    current_report = context.user_data.get(
-        "current_report",
-        "",
-    )
-
-    # --------------------------------------------------------
-    # HISTORY
-    # --------------------------------------------------------
-
-    history = context.user_data.setdefault(
-        "chat_history",
-        [],
-    )
-
-    recent_history = history[
-        -MAX_HISTORY:
-    ]
-
-    conversation_text = ""
-
-    for item in recent_history:
-
-        conversation_text += (
-            f"\nالمستخدم: {item['user']}\n"
-            f"المحلل: {item['assistant']}\n"
+        thinking_message = await update.message.reply_text(
+            "📡 جاري فحص الأخبار الحديثة ثم تحليل سؤالك..."
         )
 
-    # --------------------------------------------------------
-    # BUILD CURRENT NEWS CONTEXT
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # FRESH NEWS
+        # ----------------------------------------------------
 
-    if matching_items:
-
-        news_context = build_ai_context(
-            matching_items,
-            max_items=MAX_SEARCH_RESULTS,
+        fresh_items = await get_fresh_news(
+            max_items=100
         )
 
-    elif fresh_items:
+        # ----------------------------------------------------
+        # SEARCH
+        # ----------------------------------------------------
 
-        # لا يوجد تطابق قوي،
-        # لكن لا نعود للتقرير القديم وحده.
-        news_context = build_ai_context(
+        matching_items = search_news(
             fresh_items,
-            max_items=12,
+            user_text,
+            limit=MAX_SEARCH_RESULTS,
         )
 
-    else:
+        # ----------------------------------------------------
+        # PREVIOUS REPORT
+        # ----------------------------------------------------
 
-        news_context = (
-            "لم يتم الحصول على أخبار حديثة "
-            "من المصادر الحالية."
+        current_report = context.user_data.get(
+            "current_report",
+            "",
         )
 
-    # --------------------------------------------------------
-    # AI PROMPT
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # HISTORY
+        # ----------------------------------------------------
 
-    prompt = f"""
+        history = context.user_data.setdefault(
+            "chat_history",
+            [],
+        )
+
+        recent_history = history[
+            -MAX_HISTORY:
+        ]
+
+        conversation_text = ""
+
+        for item in recent_history:
+
+            conversation_text += (
+                f"\nالمستخدم: {item['user']}\n"
+                f"المحلل: {item['assistant']}\n"
+            )
+
+        # ----------------------------------------------------
+        # NEWS CONTEXT
+        # ----------------------------------------------------
+
+        if matching_items:
+
+            news_context = build_ai_context(
+                matching_items,
+                max_items=MAX_SEARCH_RESULTS,
+            )
+
+        elif fresh_items:
+
+            news_context = build_ai_context(
+                fresh_items,
+                max_items=12,
+            )
+
+        else:
+
+            news_context = (
+                "لم يتم الحصول على أخبار حديثة "
+                "من المصادر الحالية."
+            )
+
+        # ----------------------------------------------------
+        # PROMPT
+        # ----------------------------------------------------
+
+        prompt = f"""
 أنت مساعد رصد إخباري وتحليل سياسي واقتصادي.
 
 السؤال الحالي للمستخدم:
@@ -814,7 +928,7 @@ async def handle_user_message(
 {user_text}
 
 ========================
-الأخبار الحديثة التي جرى جمعها الآن
+الأخبار الحديثة التي جُمعت الآن
 ========================
 
 {news_context}
@@ -823,104 +937,119 @@ async def handle_user_message(
 التقرير السابق - إن وجد
 ========================
 
-{current_report if current_report else "لا يوجد تقرير سابق."}
+{
+    current_report
+    if current_report
+    else
+    "لا يوجد تقرير سابق."
+}
 
 ========================
 المحادثة السابقة
 ========================
 
-{conversation_text if conversation_text else "لا توجد محادثة سابقة."}
+{
+    conversation_text
+    if conversation_text
+    else
+    "لا توجد محادثة سابقة."
+}
 
 ========================
 قواعد الإجابة
 ========================
 
 1. السؤال الحالي هو الأولوية.
-2. استخدم الأخبار الحديثة التي جُمعت الآن قبل التقرير السابق.
-3. لا تجعل التقرير السابق مصدراً وحيداً للمعلومة.
-4. إذا كان السؤال عن حدث جديد، أجب من الأخبار الحالية.
-5. إذا كان السؤال لا علاقة له بالتقرير السابق، لا تجبر الإجابة على استخدامه.
-6. إذا كان السؤال عن تصريح أو موقف رسمي:
+2. استخدم الأخبار الحديثة أولاً.
+3. لا تجعل التقرير السابق مصدراً وحيداً.
+4. إذا كان السؤال عن حدث جديد، استخدم الأخبار الحالية.
+5. إذا كان السؤال عن تصريح أو موقف رسمي:
    - اذكر الجهة.
    - اذكر المصدر.
    - وضح أنه موقف رسمي إذا كان كذلك.
-7. إذا كان المصدر وكالة أنباء أو قناة:
+6. إذا كان المصدر وكالة أو قناة:
    - انسب المعلومة للمصدر.
-   - لا تقدمها كحقيقة رسمية إلا إذا كان هناك مصدر رسمي.
+7. لا تقدم تقريراً إعلامياً كحقيقة رسمية.
 8. لا تخترع أي معلومة.
-9. لا تملأ الفراغ بتخمين.
-10. إذا لم نجد معلومات كافية، قل:
+9. لا تملأ الفراغ بالتخمين.
+10. إذا لم توجد معلومات كافية قل:
    "لم أجد في المصادر التي تم فحصها معلومات كافية للإجابة بدقة."
-11. إذا قدمت استنتاجاً، ضع بوضوح:
+11. إذا قدمت استنتاجاً، اكتب:
    "استنتاج تحليلي:"
 12. لا تعيد التقرير السابق كاملاً.
-13. لا تكرر نفس الخبر.
+13. لا تكرر الأخبار.
 14. أجب بالعربية.
-15. كن مباشراً ومختصراً قدر الإمكان.
+15. كن مباشراً ومختصراً.
+16. لا تضف معلومات من خارج البيانات المتاحة.
 
 أجب الآن عن سؤال المستخدم.
 """
 
-    # --------------------------------------------------------
-    # GEMINI
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # GEMINI
+        # ----------------------------------------------------
 
-    try:
+        try:
 
-        reply_text = await ask_gemini(
-            prompt
+            reply_text = await ask_gemini(
+                prompt
+            )
+
+            history.append({
+                "user": user_text,
+                "assistant": reply_text,
+            })
+
+            context.user_data[
+                "chat_history"
+            ] = history[-MAX_HISTORY:]
+
+            context.user_data[
+                "latest_news"
+            ] = (
+                matching_items
+                if matching_items
+                else fresh_items[:12]
+            )
+
+            context.user_data[
+                "current_report"
+            ] = reply_text
+
+        except Exception as exc:
+
+            logger.exception(
+                "Gemini conversation error: %s",
+                exc,
+            )
+
+            reply_text = (
+                "تعذر معالجة السؤال بواسطة "
+                "نموذج الذكاء الاصطناعي حالياً.\n\n"
+                "يرجى المحاولة مرة أخرى."
+            )
+
+        # ----------------------------------------------------
+        # DELETE THINKING
+        # ----------------------------------------------------
+
+        try:
+
+            await thinking_message.delete()
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # SEND
+        # ----------------------------------------------------
+
+        await send_long_message(
+            update,
+            reply_text,
+            keyboard=get_back_keyboard(),
         )
-
-        # Save history
-        history.append({
-            "user": user_text,
-            "assistant": reply_text,
-        })
-
-        context.user_data["chat_history"] = (
-            history[-MAX_HISTORY:]
-        )
-
-        # Keep latest fresh news in session
-        context.user_data["latest_news"] = (
-            matching_items
-            if matching_items
-            else fresh_items[:12]
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Gemini conversation error: %s",
-            exc,
-        )
-
-        reply_text = (
-            "حدث خطأ أثناء معالجة السؤال.\n\n"
-            f"التفاصيل التقنية:\n{str(exc)}"
-        )
-
-    # --------------------------------------------------------
-    # DELETE THINKING MESSAGE
-    # --------------------------------------------------------
-
-    try:
-
-        await thinking_message.delete()
-
-    except Exception:
-
-        pass
-
-    # --------------------------------------------------------
-    # SEND ANSWER
-    # --------------------------------------------------------
-
-    await send_long_message(
-        update,
-        reply_text,
-        keyboard=get_back_keyboard(),
-    )
 
 
 # ============================================================
@@ -954,7 +1083,10 @@ def main():
         .build()
     )
 
-    # Commands
+    # --------------------------------------------------------
+    # COMMANDS
+    # --------------------------------------------------------
+
     app.add_handler(
         CommandHandler(
             "start",
@@ -969,15 +1101,21 @@ def main():
         )
     )
 
-    # Buttons
+    # --------------------------------------------------------
+    # BUTTONS
+    # --------------------------------------------------------
+
     app.add_handler(
         CallbackQueryHandler(
             button_handler,
-            pattern=r"^(topic_|compare_all|back_to_menu)",
+            pattern=r"^(topic:|compare$|back$)",
         )
     )
 
-    # Direct questions
+    # --------------------------------------------------------
+    # DIRECT QUESTIONS
+    # --------------------------------------------------------
+
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -985,7 +1123,10 @@ def main():
         )
     )
 
-    # Errors
+    # --------------------------------------------------------
+    # ERRORS
+    # --------------------------------------------------------
+
     app.add_error_handler(
         error_handler
     )
@@ -1004,4 +1145,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()

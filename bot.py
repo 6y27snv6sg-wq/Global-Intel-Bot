@@ -3,7 +3,11 @@ import logging
 import os
 from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -36,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# SETTINGS
+# ENVIRONMENT
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -61,12 +65,11 @@ ai_client = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
-# Stable current Gemini Flash model.
 GEMINI_MODEL = "gemini-3.5-flash"
 
 
 # ============================================================
-# LIMITS
+# SETTINGS
 # ============================================================
 
 MAX_NEWS_FOR_AI = 20
@@ -80,8 +83,6 @@ TELEGRAM_MAX_LENGTH = 3900
 # USER LOCKS
 # ============================================================
 
-# يمنع المستخدم نفسه من إرسال عدة طلبات
-# في نفس الوقت والتسبب في تداخل النتائج.
 USER_LOCKS = defaultdict(asyncio.Lock)
 
 
@@ -90,39 +91,30 @@ USER_LOCKS = defaultdict(asyncio.Lock)
 # ============================================================
 
 TOPICS = {
-
     "urgent": (
         "عاجل هجوم صاروخ قصف انفجار حرب تصعيد"
     ),
-
     "world": (
         "العالم دولي دولية أزمة اتفاق"
     ),
-
     "gulf": (
         "السعودية الخليج العربي قطر الإمارات"
     ),
-
     "america": (
         "أمريكا الولايات المتحدة واشنطن"
     ),
-
     "europe": (
         "أوروبا بريطانيا فرنسا ألمانيا"
     ),
-
     "asia": (
         "آسيا الصين اليابان الهند روسيا"
     ),
-
     "energy": (
         "نفط أوبك أوبك+ غاز طاقة أسواق اقتصاد"
     ),
-
     "security": (
         "أمن صراع حرب هجوم عسكري صاروخ"
     ),
-
     "foreign": (
         "وزارة الخارجية وزير الخارجية بيان تصريح"
     ),
@@ -130,74 +122,64 @@ TOPICS = {
 
 
 # ============================================================
-# MAIN KEYBOARD
+# KEYBOARD
 # ============================================================
 
 def get_main_keyboard():
 
     return InlineKeyboardMarkup([
-
         [
             InlineKeyboardButton(
                 "🔴 عاجل الآن",
                 callback_data="topic:urgent",
             )
         ],
-
         [
             InlineKeyboardButton(
                 "🌍 العالم",
                 callback_data="topic:world",
             )
         ],
-
         [
             InlineKeyboardButton(
                 "🇸🇦 الخليج والعالم العربي",
                 callback_data="topic:gulf",
             )
         ],
-
         [
             InlineKeyboardButton(
                 "🇺🇸 أمريكا",
                 callback_data="topic:america",
             ),
-
             InlineKeyboardButton(
                 "🇪🇺 أوروبا",
                 callback_data="topic:europe",
             ),
         ],
-
         [
             InlineKeyboardButton(
                 "🌏 آسيا",
                 callback_data="topic:asia",
             )
         ],
-
         [
             InlineKeyboardButton(
                 "🛢️ الطاقة والأسواق",
                 callback_data="topic:energy",
             )
         ],
-
         [
             InlineKeyboardButton(
                 "🛡️ الأمن والصراعات",
                 callback_data="topic:security",
             )
         ],
-
         [
             InlineKeyboardButton(
                 "🏛️ بيانات وزارات الخارجية",
                 callback_data="topic:foreign",
             )
         ],
-
         [
             InlineKeyboardButton(
                 "⚡ تحليل مقارن شامل",
@@ -206,10 +188,6 @@ def get_main_keyboard():
         ],
     ])
 
-
-# ============================================================
-# BACK KEYBOARD
-# ============================================================
 
 def get_back_keyboard():
 
@@ -224,7 +202,7 @@ def get_back_keyboard():
 
 
 # ============================================================
-# SAFE TEXT SPLITTER
+# TEXT SPLITTER
 # ============================================================
 
 def split_text_safely(
@@ -273,7 +251,6 @@ def split_text_safely(
             )
 
             if cut < 100:
-
                 cut = max_length
 
             chunks.append(
@@ -297,7 +274,7 @@ def split_text_safely(
 
 
 # ============================================================
-# TELEGRAM SEND
+# SEND LONG MESSAGE
 # ============================================================
 
 async def send_long_message(
@@ -313,12 +290,10 @@ async def send_long_message(
 
         if query:
 
-            # أول جزء يستبدل رسالة التحميل
             await query.edit_message_text(
                 text=chunks[0]
             )
 
-            # الأجزاء الوسطية
             for chunk in chunks[1:-1]:
 
                 await update.get_bot().send_message(
@@ -326,7 +301,6 @@ async def send_long_message(
                     text=chunk,
                 )
 
-            # الجزء الأخير مع الزر
             if len(chunks) > 1:
 
                 await update.get_bot().send_message(
@@ -413,6 +387,10 @@ async def ask_gemini(
 
     try:
 
+        logger.info(
+            "Sending request to Gemini..."
+        )
+
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
             model=GEMINI_MODEL,
@@ -425,6 +403,10 @@ async def ask_gemini(
         )
 
         if response and response.text:
+
+            logger.info(
+                "Gemini response received."
+            )
 
             return response.text.strip()
 
@@ -606,12 +588,15 @@ async def button_handler(
 
     query = update.callback_query
 
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     data = query.data
 
     # --------------------------------------------------------
-    # BACK
+    # العودة
     # --------------------------------------------------------
 
     if data == "back":
@@ -627,17 +612,13 @@ async def button_handler(
         return
 
     # --------------------------------------------------------
-    # COMPARE
+    # نوع التقرير
     # --------------------------------------------------------
 
     if data == "compare":
 
         topic_key = None
         report_type = "compare"
-
-    # --------------------------------------------------------
-    # TOPIC
-    # --------------------------------------------------------
 
     elif data.startswith("topic:"):
 
@@ -661,16 +642,12 @@ async def button_handler(
 
         return
 
-    # --------------------------------------------------------
-    # USER LOCK
-    # --------------------------------------------------------
-
     user_id = update.effective_user.id
 
     async with USER_LOCKS[user_id]:
 
         # ----------------------------------------------------
-        # LOADING
+        # رسالة الحالة
         # ----------------------------------------------------
 
         try:
@@ -690,11 +667,21 @@ async def button_handler(
             pass
 
         # ----------------------------------------------------
-        # NEWS
+        # جمع الأخبار
         # ----------------------------------------------------
+
+        logger.info(
+            "BUTTON: collecting news for user %s",
+            user_id,
+        )
 
         fresh_items = await get_fresh_news(
             max_items=100
+        )
+
+        logger.info(
+            "BUTTON: collection returned %d items",
+            len(fresh_items),
         )
 
         if not fresh_items:
@@ -712,33 +699,60 @@ async def button_handler(
             return
 
         # ----------------------------------------------------
-        # SELECT
+        # البحث داخل الأخبار
         # ----------------------------------------------------
 
-        if topic_key:
+        try:
 
-            keywords = TOPICS[topic_key]
+            if topic_key:
 
-            selected_items = search_news(
-                fresh_items,
-                keywords,
-                limit=MAX_SEARCH_RESULTS,
-            )
+                keywords = TOPICS[topic_key]
 
-            if len(selected_items) < 3:
+                selected_items = search_news(
+                    fresh_items,
+                    keywords,
+                    max_results=MAX_SEARCH_RESULTS,
+                )
+
+                # إذا كانت نتائج الموضوع قليلة
+                # نستخدم أحدث الأخبار كخطة احتياطية
+
+                if len(selected_items) < 3:
+
+                    selected_items = fresh_items[
+                        :MAX_SEARCH_RESULTS
+                    ]
+
+            else:
 
                 selected_items = fresh_items[
                     :MAX_SEARCH_RESULTS
                 ]
 
-        else:
+            logger.info(
+                "BUTTON: selected %d news items",
+                len(selected_items),
+            )
 
-            selected_items = fresh_items[
-                :MAX_SEARCH_RESULTS
-            ]
+        except Exception as exc:
+
+            logger.exception(
+                "News search failed: %s",
+                exc,
+            )
+
+            await query.edit_message_text(
+                text=(
+                    "تم جمع الأخبار، لكن حدث خطأ "
+                    "أثناء تصنيفها."
+                ),
+                reply_markup=get_back_keyboard(),
+            )
+
+            return
 
         # ----------------------------------------------------
-        # STATUS
+        # تحليل Gemini
         # ----------------------------------------------------
 
         try:
@@ -755,15 +769,19 @@ async def button_handler(
 
             pass
 
-        # ----------------------------------------------------
-        # AI
-        # ----------------------------------------------------
-
         try:
+
+            logger.info(
+                "BUTTON: starting Gemini report..."
+            )
 
             reply_text = await generate_report(
                 selected_items,
                 report_type,
+            )
+
+            logger.info(
+                "BUTTON: Gemini report completed."
             )
 
         except Exception as exc:
@@ -780,7 +798,7 @@ async def button_handler(
             )
 
         # ----------------------------------------------------
-        # SAVE SESSION
+        # حفظ الجلسة
         # ----------------------------------------------------
 
         context.user_data[
@@ -800,7 +818,7 @@ async def button_handler(
         ] = data
 
         # ----------------------------------------------------
-        # SEND
+        # إرسال التقرير
         # ----------------------------------------------------
 
         await send_long_message(
@@ -812,7 +830,7 @@ async def button_handler(
 
 
 # ============================================================
-# DIRECT USER QUESTION
+# USER MESSAGE
 # ============================================================
 
 async def handle_user_message(
@@ -827,23 +845,18 @@ async def handle_user_message(
     )
 
     if not user_text:
-
         return
 
     user_id = update.effective_user.id
 
     async with USER_LOCKS[user_id]:
 
-        # ----------------------------------------------------
-        # THINKING
-        # ----------------------------------------------------
-
         thinking_message = await update.message.reply_text(
             "📡 جاري فحص الأخبار الحديثة ثم تحليل سؤالك..."
         )
 
         # ----------------------------------------------------
-        # FRESH NEWS
+        # جمع الأخبار
         # ----------------------------------------------------
 
         fresh_items = await get_fresh_news(
@@ -851,17 +864,28 @@ async def handle_user_message(
         )
 
         # ----------------------------------------------------
-        # SEARCH
+        # البحث
         # ----------------------------------------------------
 
-        matching_items = search_news(
-            fresh_items,
-            user_text,
-            limit=MAX_SEARCH_RESULTS,
-        )
+        try:
+
+            matching_items = search_news(
+                fresh_items,
+                user_text,
+                max_results=MAX_SEARCH_RESULTS,
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "User news search failed: %s",
+                exc,
+            )
+
+            matching_items = []
 
         # ----------------------------------------------------
-        # PREVIOUS REPORT
+        # التقرير السابق
         # ----------------------------------------------------
 
         current_report = context.user_data.get(
@@ -870,7 +894,7 @@ async def handle_user_message(
         )
 
         # ----------------------------------------------------
-        # HISTORY
+        # التاريخ
         # ----------------------------------------------------
 
         history = context.user_data.setdefault(
@@ -892,7 +916,7 @@ async def handle_user_message(
             )
 
         # ----------------------------------------------------
-        # NEWS CONTEXT
+        # سياق الأخبار
         # ----------------------------------------------------
 
         if matching_items:
@@ -917,7 +941,7 @@ async def handle_user_message(
             )
 
         # ----------------------------------------------------
-        # PROMPT
+        # Prompt
         # ----------------------------------------------------
 
         prompt = f"""
@@ -986,7 +1010,7 @@ async def handle_user_message(
 """
 
         # ----------------------------------------------------
-        # GEMINI
+        # Gemini
         # ----------------------------------------------------
 
         try:
@@ -1030,7 +1054,7 @@ async def handle_user_message(
             )
 
         # ----------------------------------------------------
-        # DELETE THINKING
+        # حذف رسالة الانتظار
         # ----------------------------------------------------
 
         try:
@@ -1042,7 +1066,7 @@ async def handle_user_message(
             pass
 
         # ----------------------------------------------------
-        # SEND
+        # إرسال الإجابة
         # ----------------------------------------------------
 
         await send_long_message(
@@ -1068,7 +1092,7 @@ async def error_handler(
 
 
 # ============================================================
-# STARTUP
+# MAIN
 # ============================================================
 
 def main():
@@ -1084,7 +1108,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # COMMANDS
+    # Commands
     # --------------------------------------------------------
 
     app.add_handler(
@@ -1102,7 +1126,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # BUTTONS
+    # Buttons
     # --------------------------------------------------------
 
     app.add_handler(
@@ -1113,7 +1137,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # DIRECT QUESTIONS
+    # Text messages
     # --------------------------------------------------------
 
     app.add_handler(
@@ -1124,7 +1148,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # ERRORS
+    # Errors
     # --------------------------------------------------------
 
     app.add_error_handler(
@@ -1134,6 +1158,10 @@ def main():
     logger.info(
         "Live News Intelligence Bot is running."
     )
+
+    # --------------------------------------------------------
+    # Polling
+    # --------------------------------------------------------
 
     app.run_polling(
         drop_pending_updates=True
@@ -1145,5 +1173,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()

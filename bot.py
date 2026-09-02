@@ -60,7 +60,7 @@ if not GEMINI_API_KEY:
 
 
 # ============================================================
-# GEMINI CLIENT
+# GEMINI
 # ============================================================
 
 ai_client = genai.Client(
@@ -76,6 +76,7 @@ USER_LOCKS: Dict[int, asyncio.Lock] = {}
 
 
 def get_user_lock(user_id: int) -> asyncio.Lock:
+
     if user_id not in USER_LOCKS:
         USER_LOCKS[user_id] = asyncio.Lock()
 
@@ -100,10 +101,11 @@ TOPICS = {
 
 
 # ============================================================
-# TELEGRAM KEYBOARDS
+# KEYBOARDS
 # ============================================================
 
 def main_keyboard() -> InlineKeyboardMarkup:
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -159,10 +161,13 @@ def main_keyboard() -> InlineKeyboardMarkup:
         ],
     ]
 
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 
 
 def back_keyboard() -> InlineKeyboardMarkup:
+
     return InlineKeyboardMarkup(
         [
             [
@@ -179,10 +184,16 @@ def back_keyboard() -> InlineKeyboardMarkup:
 # GEMINI
 # ============================================================
 
-async def ask_gemini(prompt: str) -> str:
-    logger.info("Starting Gemini request...")
+async def ask_gemini(
+    prompt: str,
+) -> str:
+
+    logger.info(
+        "Starting Gemini request..."
+    )
 
     try:
+
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
             model=GEMINI_MODEL,
@@ -194,14 +205,21 @@ async def ask_gemini(prompt: str) -> str:
             ),
         )
 
-        text = getattr(response, "text", None)
+        text = getattr(
+            response,
+            "text",
+            None,
+        )
 
         if not text:
+
             logger.warning(
                 "Gemini returned an empty response."
             )
 
-            return "لا توجد إجابة كافية من البيانات المتاحة."
+            return (
+                "لم توجد إجابة كافية من البيانات المتاحة."
+            )
 
         logger.info(
             "Gemini request completed."
@@ -210,14 +228,14 @@ async def ask_gemini(prompt: str) -> str:
         return text.strip()
 
     except Exception as exc:
+
         logger.exception(
             "Gemini request failed: %s",
             exc,
         )
 
         return (
-            "حدث خطأ أثناء تحليل الأخبار بواسطة الذكاء الاصطناعي.\n\n"
-            f"التفاصيل: {exc}"
+            "حدث خطأ أثناء تحليل الأخبار بواسطة الذكاء الاصطناعي."
         )
 
 
@@ -226,13 +244,17 @@ async def ask_gemini(prompt: str) -> str:
 # ============================================================
 
 async def get_fresh_news():
+
     logger.info(
         "Starting fresh news collection..."
     )
 
     try:
+
         news = await asyncio.wait_for(
-            collect_news(max_items=100),
+            collect_news(
+                max_items=100
+            ),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
 
@@ -244,6 +266,7 @@ async def get_fresh_news():
         return news
 
     except asyncio.TimeoutError:
+
         logger.error(
             "Fresh news collection timed out after %s seconds.",
             NEWS_COLLECTION_TIMEOUT,
@@ -252,6 +275,7 @@ async def get_fresh_news():
         return []
 
     except Exception as exc:
+
         logger.exception(
             "Fresh news collection failed: %s",
             exc,
@@ -261,45 +285,38 @@ async def get_fresh_news():
 
 
 # ============================================================
-# AI REPORT PROMPT
+# أسلوب Gemini
 # ============================================================
 
 REPORT_STYLE_RULES = """
-أسلوبك إلزامي:
+قواعد الأسلوب:
 
-- اكتب كمحلل أخبار محترف، وليس ككاتب مقال.
-- كن مباشرًا ومختصرًا.
+- اكتب كمحلل أخبار محترف.
+- ابدأ بالمعلومة مباشرة.
+- كن مختصرًا ودقيقًا.
 - لا تستخدم مقدمات إنشائية.
 - لا تستخدم عبارات فلسفية أو عامة.
-- لا تكرر نفس المعلومة.
+- لا تكرر المعلومة.
 - لا تشرح ما هو واضح.
-- لا تضف كلامًا فقط لزيادة طول التقرير.
-- لا تخترع معلومات أو مصادر أو أرقامًا.
+- لا تضف كلامًا لزيادة طول الإجابة.
+- لا تختلق معلومات أو مصادر أو أرقامًا.
 - لا تحول الاحتمال إلى حقيقة.
-- لا تقدم توقعات إلا إذا كانت مبنية بوضوح على المعطيات.
-- إذا لم توجد بيانات كافية، قل ذلك صراحة.
-- اجعل كل نقطة تحمل معلومة جديدة.
-- الأولوية للمعلومة، ثم التحليل.
-- التحليل يكون قصيرًا ولا يتجاوز ما تدعمه المصادر.
-- احذف أي جملة لا تضيف معلومة أو تحليلًا مفيدًا.
-- لا تستخدم خاتمة إنشائية مثل "سنواصل المتابعة" أو "الأيام القادمة ستكشف".
-- لا تبدأ بعبارات مثل "في ظل التطورات المتسارعة" أو "مما لا شك فيه".
-- لا تستخدم لغة دعائية أو مبالغات.
-- لا تكرر عنوان الخبر داخل الشرح.
-
-الطول:
-- الخلاصة: 2 إلى 3 جمل.
-- الأخبار المهمة: من 3 إلى 6 نقاط فقط.
-- التحليل: من 2 إلى 4 نقاط فقط.
-- التأثير المحتمل: نقطتان أو ثلاث كحد أقصى.
-- التقرير كاملًا يجب أن يكون قابلًا للقراءة خلال أقل من دقيقة.
-
-إذا كانت الأخبار كثيرة، اختر الأهم فقط ولا تحاول ذكرها كلها.
+- لا تقدم رأيًا شخصيًا.
+- لا تتنبأ من عندك.
+- التحليل يكون فقط إذا كان مدعومًا بالمعلومات.
+- كل نقطة يجب أن تضيف معلومة جديدة.
+- إذا لم توجد معلومات كافية، قل ذلك بوضوح.
+- لا تستخدم عبارات مثل:
+  "في ظل التطورات المتسارعة"
+  أو "مما لا شك فيه"
+  أو "الأيام القادمة ستكشف".
+- لا تختم بعبارات إنشائية.
+- التقرير يجب أن يكون قابلًا للقراءة بسرعة.
 """
 
 
 # ============================================================
-# REPORT GENERATION
+# REPORT
 # ============================================================
 
 async def generate_report(
@@ -308,6 +325,7 @@ async def generate_report(
 ) -> str:
 
     if not news_items:
+
         return (
             "لا توجد أخبار حديثة كافية لإعداد التقرير."
         )
@@ -322,38 +340,30 @@ async def generate_report(
 الموضوع:
 {topic}
 
-مهمتك:
-حلل الأخبار الموجودة في السياق فقط، واستخرج أهم المعلومات
-ذات الصلة بالموضوع.
+حلل الأخبار الموجودة في السياق فقط.
 
 {REPORT_STYLE_RULES}
 
-استخدم هذا الهيكل فقط:
+استخدم الهيكل التالي:
 
 🚨 الخلاصة
-أهم معلومة أو تطورين، باختصار شديد.
+2 إلى 3 جمل فقط.
 
 📰 الأخبار المهمة
-• أهم خبر.
-• ثاني أهم خبر.
-• ثالث أهم خبر.
-• أضف نقاطًا أخرى فقط إذا كانت مهمة فعلًا.
+3 إلى 6 نقاط فقط.
 
 🔎 التحليل
-• ماذا تعني هذه التطورات؟
-• ما الرابط بينها إن وجد؟
-• ما المعلومة الأهم التي يجب الانتباه لها؟
+2 إلى 4 نقاط فقط.
 
 📌 التأثير المحتمل
-• التأثير المباشر أو الأقرب.
-• تأثير آخر مهم إذا كان مدعومًا بالمعلومات.
+نقطتان أو ثلاث كحد أقصى.
 
 ⚠️ ملاحظة
-اذكر هنا فقط وجود معلومات غير مؤكدة أو نقص مهم في البيانات.
-إذا لم توجد مشكلة، اكتب:
+اذكر فقط المعلومات غير المؤكدة أو النقص المهم.
+إذا لم توجد، اكتب:
 لا توجد ملاحظات مهمة.
 
-مصادر الأخبار:
+السياق:
 {context}
 """
 
@@ -371,6 +381,7 @@ async def send_long_message(
     text: str,
     reply_markup=None,
 ):
+
     if not text:
         text = "لم يتم إنشاء محتوى."
 
@@ -388,7 +399,9 @@ async def send_long_message(
             "لم يتم إنشاء محتوى."
         ]
 
-    for index, chunk in enumerate(chunks):
+    for index, chunk in enumerate(
+        chunks
+    ):
 
         markup = (
             reply_markup
@@ -520,8 +533,7 @@ async def button_handler(
             return
 
         await query.edit_message_text(
-            "📡 جاري فحص الأخبار الحديثة ثم تحليلها...\n\n"
-            "قد يستغرق ذلك عدة ثوانٍ."
+            "📡 جاري فحص الأخبار الحديثة ثم تحليلها..."
         )
 
         logger.info(
@@ -529,31 +541,12 @@ async def button_handler(
             user_id,
         )
 
-        # ----------------------------------------------------
-        # COLLECT
-        # ----------------------------------------------------
+        fresh_items = await get_fresh_news()
 
-        try:
-
-            fresh_items = await get_fresh_news()
-
-            logger.info(
-                "BUTTON: collection returned %d items",
-                len(fresh_items),
-            )
-
-        except Exception as exc:
-
-            logger.exception(
-                "BUTTON: collection error: %s",
-                exc,
-            )
-
-            fresh_items = []
-
-        # ----------------------------------------------------
-        # SEARCH
-        # ----------------------------------------------------
+        logger.info(
+            "BUTTON: collection returned %d items",
+            len(fresh_items),
+        )
 
         try:
 
@@ -573,7 +566,7 @@ async def button_handler(
             selected_items = []
 
         # ----------------------------------------------------
-        # FALLBACK
+        # زر المجال يمكنه استخدام الأخبار العامة
         # ----------------------------------------------------
 
         if len(selected_items) < 3:
@@ -596,16 +589,11 @@ async def button_handler(
         if not selected_items:
 
             await query.edit_message_text(
-                "لم أتمكن من العثور على أخبار حديثة "
-                "كافية لهذا الموضوع حاليًا.",
+                "لا توجد أخبار كافية حاليًا.",
                 reply_markup=back_keyboard(),
             )
 
             return
-
-        # ----------------------------------------------------
-        # GEMINI
-        # ----------------------------------------------------
 
         await query.edit_message_text(
             "🧠 تم جمع الأخبار.\n\n"
@@ -625,10 +613,6 @@ async def button_handler(
             "BUTTON: Gemini report completed."
         )
 
-        # ----------------------------------------------------
-        # SEND
-        # ----------------------------------------------------
-
         try:
 
             await query.edit_message_text(
@@ -646,7 +630,7 @@ async def button_handler(
 
 
 # ============================================================
-# USER MESSAGE HANDLER
+# DIRECT QUESTION
 # ============================================================
 
 async def handle_user_message(
@@ -681,17 +665,13 @@ async def handle_user_message(
     async with lock:
 
         status_message = await update.message.reply_text(
-            "📡 جاري فحص الأخبار الحديثة ثم تحليل سؤالك..."
+            "📡 جاري البحث عن أخبار مرتبطة بسؤالك..."
         )
 
         logger.info(
             "MESSAGE: collecting news for user %s",
             user_id,
         )
-
-        # ----------------------------------------------------
-        # COLLECT
-        # ----------------------------------------------------
 
         fresh_items = await get_fresh_news()
 
@@ -701,7 +681,7 @@ async def handle_user_message(
         )
 
         # ----------------------------------------------------
-        # SEARCH
+        # بحث مخصص للسؤال
         # ----------------------------------------------------
 
         try:
@@ -721,42 +701,35 @@ async def handle_user_message(
 
             selected_items = []
 
-        # ----------------------------------------------------
-        # FALLBACK
-        # ----------------------------------------------------
+        logger.info(
+            "MESSAGE: selected %d relevant items for query '%s'",
+            len(selected_items),
+            user_text,
+        )
 
-        if len(selected_items) < 3:
-
-            selected_items = sorted(
-                fresh_items,
-                key=lambda item: getattr(
-                    item,
-                    "importance",
-                    0,
-                ),
-                reverse=True,
-            )[:MAX_SEARCH_RESULTS]
+        # ----------------------------------------------------
+        # مهم:
+        # لا نستخدم الأخبار العامة كـ fallback هنا.
+        # ----------------------------------------------------
 
         if not selected_items:
 
             await status_message.edit_text(
-                "لم أتمكن من الحصول على أخبار حديثة "
-                "كافية للإجابة عن سؤالك."
+                "لم أجد في الأخبار الحالية معلومات مرتبطة "
+                "بموضوع سؤالك.\n\n"
+                "لن أخلط أخبارًا غير مرتبطة بالسؤال "
+                "لإعطاء إجابة مصطنعة."
             )
 
             return
 
         # ----------------------------------------------------
-        # CONTEXT
+        # Gemini
         # ----------------------------------------------------
 
         context_text = build_ai_context(
             selected_items
         )
-
-        # ----------------------------------------------------
-        # USER QUESTION PROMPT
-        # ----------------------------------------------------
 
         prompt = f"""
 أنت محلل أخبار واستخبارات مفتوحة المصدر.
@@ -764,44 +737,44 @@ async def handle_user_message(
 سؤال المستخدم:
 {user_text}
 
-حلل السؤال اعتمادًا على الأخبار الموجودة في السياق فقط.
+تم اختيار الأخبار التالية لأنها مرتبطة بالسؤال.
+
+مهم جدًا:
+- لا تستخدم أخبارًا خارج السياق.
+- لا تخترع معلومات.
+- لا تفترض أن كل خبر في السياق يجيب عن السؤال.
+- استخدم فقط الأخبار التي لها علاقة مباشرة بالسؤال.
+- إذا كانت المعلومات لا تكفي للإجابة الكاملة، قل ذلك بوضوح.
+- لا تحول التحليل إلى توقعات غير مدعومة.
+- لا تكرر الخبر عدة مرات.
 
 {REPORT_STYLE_RULES}
 
-قواعد إضافية للإجابة على سؤال المستخدم:
+ابدأ بالإجابة المباشرة.
 
-- ابدأ بالإجابة مباشرة.
-- لا تعيد كتابة السؤال.
-- لا تبدأ بمقدمة عامة.
-- لا تستخدم كلامًا إنشائيًا.
-- إذا كان السؤال يحتاج معلومات غير موجودة في المصادر، وضح ذلك.
-- إذا كان السؤال يتطلب استنتاجًا، افصل الاستنتاج عن الحقيقة.
-- لا تقدم رأيًا شخصيًا.
-- لا تكرر نفس النقطة بصيغ مختلفة.
-- اجعل الإجابة مختصرة ومفيدة.
-- أعطِ الأولوية للمعلومة الحديثة والأكثر صلة.
-
-إذا كان مناسبًا، استخدم:
+استخدم هذا الهيكل عند الحاجة:
 
 الخلاصة:
-[الإجابة المباشرة]
+الإجابة المباشرة في 2 إلى 3 جمل.
 
-التفاصيل:
-[أهم النقاط فقط]
+أهم ما ورد:
+• النقطة الأولى.
+• النقطة الثانية.
+• النقطة الثالثة.
 
 التحليل:
-[تحليل مختصر عند الحاجة]
+نقاط مختصرة فقط إذا كان هناك تحليل مفيد.
 
 ملاحظة:
-[فقط إذا كانت هناك معلومة غير مؤكدة أو نقص مهم]
+فقط إذا كان هناك نقص أو عدم تأكد مهم.
 
-السياق الإخباري:
+الأخبار المرتبطة بالسؤال:
 {context_text}
 """
 
         await status_message.edit_text(
-            "🧠 تم جمع الأخبار.\n\n"
-            "جاري إعداد الإجابة المختصرة..."
+            "🧠 وجدت أخبارًا مرتبطة بالسؤال.\n\n"
+            "جاري تحليلها باختصار..."
         )
 
         answer = await ask_gemini(
@@ -826,7 +799,9 @@ async def handle_user_message(
 # POST INIT
 # ============================================================
 
-async def post_init(application):
+async def post_init(
+    application,
+):
 
     logger.info(
         "Verifying Telegram connection..."
@@ -872,10 +847,6 @@ def main():
         .build()
     )
 
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
-
     app.add_handler(
         CommandHandler(
             "start",
@@ -883,20 +854,12 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # BUTTONS
-    # --------------------------------------------------------
-
     app.add_handler(
         CallbackQueryHandler(
             button_handler,
             pattern=r"^(topic:|compare$|back$)",
         )
     )
-
-    # --------------------------------------------------------
-    # TEXT
-    # --------------------------------------------------------
 
     app.add_handler(
         MessageHandler(

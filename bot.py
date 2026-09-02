@@ -1,243 +1,638 @@
-# =========================================================
-# تقسيم النص مع الحفاظ على الكلمات وبنية Markdown قدر الإمكان
-# =========================================================
+import asyncio
+import os
+import logging
 
-def split_text_safely(
-    text,
-    max_length=3900
-):
-    """
-    تقسيم النص إلى أجزاء مناسبة لحد Telegram.
-    يحاول التقسيم بالترتيب التالي:
-    1. فواصل الأسطر.
-    2. المسافات بين الكلمات.
-    3. التقسيم الإجباري عند الحاجة.
+import aiohttp
+import feedparser
 
-    كما يحاول عدم تقسيم كتل Markdown المغلقة
-    مثل ``` أو علامات التنسيق الشائعة.
-    """
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+)
 
-    if not text:
-        return [
-            "لم يصل رد من النظام."
+from google import genai
+from google.genai import types
+
+
+# ============================================================
+# الإعدادات
+# ============================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("ERROR: TELEGRAM_BOT_TOKEN is missing!")
+
+if not GEMINI_API_KEY:
+    raise ValueError("ERROR: GEMINI_API_KEY is missing!")
+
+
+# ============================================================
+# Gemini
+# ============================================================
+
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+GEMINI_MODEL = "gemini-3.5-flash"
+
+
+# ============================================================
+# مصادر الأخبار
+# ============================================================
+
+GLOBAL_FEEDS = {
+    "🇸🇦 وكالة الأنباء السعودية (واس)":
+        "https://www.spa.gov.sa/rss.php",
+
+    "🇶🇦 وكالة الأنباء القطرية (قنا)":
+        "https://www.qna.org.qa/Rss/News",
+
+    "🇨🇳 وكالة أنباء الصين (شينخوا)":
+        "http://www.xinhuanet.com/english/rss/worldrss.xml",
+
+    "🇺🇸 رويترز (دولية وعربية)":
+        "https://www.reutersagency.com/feed/?best-topics=political-general&post_type=best",
+
+    "🇷🇺 وكالة أنباء روسيا (TASS)":
+        "https://tass.com/rss/v2.xml",
+
+    "🇫🇷 فرانس 24 (أوروبية/عربية)":
+        "https://www.france24.com/ar/rss",
+
+    "🇬🇧 بي بي سي عربي (بريطانية)":
+        "http://feeds.bbci.co.uk/arabic/rss.xml",
+}
+
+
+# ============================================================
+# جلب مصدر واحد
+# ============================================================
+
+async def fetch_single_feed(session, source_name, url, keywords_list):
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    try:
+        async with session.get(
+            url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as response:
+
+            if response.status != 200:
+                logger.warning(
+                    "Feed %s returned HTTP %s",
+                    source_name,
+                    response.status,
+                )
+                return ""
+
+            content = await response.text()
+
+            feed = feedparser.parse(content)
+
+            extracted = []
+
+            for entry in feed.entries[:6]:
+
+                title = entry.get("title", "").strip()
+                summary = entry.get("summary", "").strip()
+
+                full_text = f"{title} {summary}".lower()
+
+                if any(
+                    word.lower() in full_text
+                    for word in keywords_list
+                    if word.strip()
+                ):
+
+                    extracted.append(
+                        f"\n[المصدر: {source_name}]\n"
+                        f"العنوان: {title}\n"
+                        f"التفاصيل: {summary[:500]}\n"
+                    )
+
+            return "".join(extracted)
+
+    except asyncio.TimeoutError:
+        logger.warning("Timeout while fetching %s", source_name)
+        return ""
+
+    except Exception as e:
+        logger.error(
+            "Error fetching %s: %s",
+            source_name,
+            e,
+        )
+        return ""
+
+
+# ============================================================
+# جلب جميع الأخبار بالتوازي
+# ============================================================
+
+async def fetch_all_news(keywords):
+
+    search_words = keywords.split()
+
+    async with aiohttp.ClientSession() as session:
+
+        tasks = [
+            fetch_single_feed(
+                session,
+                source,
+                url,
+                search_words,
+            )
+            for source, url in GLOBAL_FEEDS.items()
         ]
 
-    text = str(text).strip()
+        results = await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
 
-    if len(text) <= max_length:
-        return [text]
+    collected = []
+
+    for result in results:
+
+        if isinstance(result, str) and result:
+            collected.append(result)
+
+    collected_text = "\n".join(collected)
+
+    if collected_text:
+        return collected_text
+
+    return (
+        "لم يتم العثور على تغطية مباشرة بالكلمات المفتاحية "
+        "المطلوبة في النشرات المتاحة."
+    )
+
+
+# ============================================================
+# القائمة الرئيسية
+# ============================================================
+
+def get_main_keyboard():
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "🛢️ ملف الطاقة والنفط والأسواق",
+                callback_data="topic_طاقة نفط اقتصاد اسعار",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🛡️ ملف الصراعات والتوترات العسكرية",
+                callback_data="topic_صراعات حرب جيوسياسة جيش",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💱 البنوك المركزية والسياسة المالية",
+                callback_data="topic_بنك فدرالي فائدة عملات",
+            ),
+
+            InlineKeyboardButton(
+                "🌐 تصريحات وزارات الخارجية",
+                callback_data="topic_خارجية سفير بيان رسمي",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "⚡ تحليل مقارن شامل (عربي ودولي)",
+                callback_data="compare_all",
+            )
+        ],
+    ])
+
+
+# ============================================================
+# تقسيم الرسائل الطويلة
+# ============================================================
+
+def split_text_safely(text, max_length=3900):
+
+    if not text:
+        return [""]
 
     chunks = []
-    remaining = text
 
-    while len(remaining) > max_length:
+    paragraphs = text.split("\n")
 
-        candidate = remaining[:max_length]
+    current = ""
 
-        # أولوية التقسيم عند نهاية فقرة
-        split_at = candidate.rfind("\n\n")
+    for paragraph in paragraphs:
 
-        # ثم عند نهاية سطر
-        if split_at < max_length // 3:
-            split_at = candidate.rfind("\n")
+        candidate = (
+            paragraph
+            if not current
+            else current + "\n" + paragraph
+        )
 
-        # ثم عند مسافة بين الكلمات
-        if split_at < max_length // 3:
-            split_at = candidate.rfind(" ")
+        if len(candidate) <= max_length:
+            current = candidate
+            continue
 
-        # إذا لم نجد موضعًا مناسبًا، نقسم إجباريًا
-        if split_at <= 0:
-            split_at = max_length
+        if current:
+            chunks.append(current)
+            current = ""
 
-        chunk = remaining[:split_at].rstrip()
-        remaining = remaining[split_at:].lstrip()
+        # إذا كان السطر نفسه طويلًا جدًا
+        while len(paragraph) > max_length:
 
-        if chunk:
-            chunks.append(chunk)
+            # حاول القطع عند مسافة
+            cut = paragraph.rfind(
+                " ",
+                0,
+                max_length,
+            )
 
-    if remaining:
-        chunks.append(remaining)
+            if cut < 100:
+                cut = max_length
 
-    # محاولة موازنة كتل Markdown البرمجية بين الأجزاء.
-    # Telegram قد يرفض الرسالة إذا احتوت على Markdown غير مكتمل.
-    balanced_chunks = []
-    code_block_open = False
+            chunks.append(
+                paragraph[:cut].strip()
+            )
 
-    for chunk in chunks:
+            paragraph = paragraph[cut:].strip()
 
-        if code_block_open:
-            chunk = "```\n" + chunk
+        current = paragraph
 
-        fence_count = chunk.count("```")
+    if current:
+        chunks.append(current)
 
-        if fence_count % 2 == 1:
-            chunk = chunk + "\n```"
-            code_block_open = not code_block_open
-
-        balanced_chunks.append(chunk)
-
-    return balanced_chunks
+    return chunks or [""]
 
 
-# =========================================================
-# إرسال آمن للرسائل الطويلة
-# =========================================================
+# ============================================================
+# إرسال الرسائل
+# ============================================================
 
 async def send_long_message(
     update,
     text,
     query=None,
-    keyboard=None
+    keyboard=None,
 ):
-    """
-    إرسال نص طويل بأمان.
 
-    - يلتزم بحد Telegram للرسائل النصية.
-    - لا يعتمد على edit_message_text وحدها.
-    - إذا فشل تعديل الرسالة، يرسل رسالة جديدة.
-    - يقسم النص عند فواصل مناسبة دون قطع الكلمات قدر الإمكان.
-    - يرسل لوحة المفاتيح في آخر رسالة فقط.
-    - يحاول أولًا الإرسال كنص عادي لتجنب أخطاء Markdown.
-    """
+    chunks = split_text_safely(text)
 
-    max_length = 3900
+    try:
 
-    chunks = split_text_safely(
-        text,
-        max_length=max_length
-    )
+        if query:
 
-    bot = update.get_bot()
-    chat_id = update.effective_chat.id
-
-    async def send_new_message(
-        message_text,
-        reply_markup=None
-    ):
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=message_text,
-            reply_markup=reply_markup
-        )
-
-    # إذا كان الرد ناتجًا عن زر، نحاول تعديل رسالة الحالة.
-    # عند الفشل نرسل رسالة جديدة بدل توقف الدالة.
-    if query and chunks:
-
-        try:
+            # أول جزء يحل محل رسالة التحميل
             await query.edit_message_text(
                 text=chunks[0]
             )
 
-        except Exception as error:
-            logger.warning(
-                "Failed to edit Telegram message; "
-                "sending a new message instead: %s",
-                error
-            )
+            # باقي الأجزاء
+            for chunk in chunks[1:-1]:
 
-            try:
-                await send_new_message(
-                    chunks[0]
+                await context_bot_send(
+                    update,
+                    chunk,
                 )
 
-            except Exception as send_error:
-                logger.error(
-                    "Failed to send fallback Telegram message: %s",
-                    send_error
-                )
+            # لوحة التحكم على آخر جزء
+            if len(chunks) > 1:
 
-                return
-
-        # إرسال الأجزاء الوسطى
-        for chunk in chunks[1:-1]:
-
-            try:
-                await send_new_message(
-                    chunk
-                )
-
-            except Exception as error:
-                logger.error(
-                    "Failed to send message chunk: %s",
-                    error
-                )
-
-                # محاولة إرسال الجزء نفسه دون أي لوحة مفاتيح
-                try:
-                    await send_new_message(
-                        "تعذر إرسال جزء من التقرير."
-                    )
-                except Exception:
-                    pass
-
-                return
-
-        # إرسال الجزء الأخير مع لوحة المفاتيح
-        if len(chunks) > 1:
-
-            try:
-                await send_new_message(
+                await context_bot_send(
+                    update,
                     chunks[-1],
-                    reply_markup=keyboard
+                    keyboard,
                 )
 
-            except Exception as error:
-                logger.error(
-                    "Failed to send final message chunk: %s",
-                    error
-                )
+            else:
 
-                try:
-                    await send_new_message(
-                        chunks[-1]
+                if keyboard:
+
+                    try:
+                        await query.edit_message_reply_markup(
+                            reply_markup=keyboard
+                        )
+                    except Exception:
+                        await context_bot_send(
+                            update,
+                            chunks[0],
+                            keyboard,
+                        )
+
+        else:
+
+            for index, chunk in enumerate(chunks):
+
+                if index == len(chunks) - 1:
+                    await context_bot_send(
+                        update,
+                        chunk,
+                        keyboard,
                     )
-                except Exception:
-                    pass
+                else:
+                    await context_bot_send(
+                        update,
+                        chunk,
+                    )
 
-        elif keyboard:
+    except Exception as e:
 
-            try:
-                await send_new_message(
-                    "يمكنك الآن متابعة السؤال مباشرة.",
-                    reply_markup=keyboard
-                )
+        logger.error(
+            "Telegram Reply Error: %s",
+            e,
+        )
 
-            except Exception as error:
-                logger.error(
-                    "Failed to send follow-up keyboard: %s",
-                    error
-                )
+
+async def context_bot_send(
+    update,
+    text,
+    keyboard=None,
+):
+
+    chat_id = update.effective_chat.id
+
+    await update.get_bot().send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+    )
+
+
+# ============================================================
+# /start
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "مرحباً بك في نظام موجز الأحداث الدولية "
+        "والإحاطة الاستخباراتي الذكي 🌐🏛️\n\n"
+        "اختر أحد الملفات الاستراتيجية أدناه:",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+# ============================================================
+# /reset
+# ============================================================
+
+async def reset(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "تمت إعادة ضبط الجلسة."
+    )
+
+
+# ============================================================
+# معالجة الأزرار
+# ============================================================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    data = query.data
+
+    if data == "back_to_menu":
+
+        await query.edit_message_text(
+            text="اختر أحد الملفات الاستراتيجية أدناه:",
+            reply_markup=get_main_keyboard(),
+        )
 
         return
 
-    # الإرسال العادي عندما لا توجد CallbackQuery
-    for index, chunk in enumerate(chunks):
+    await query.edit_message_text(
+        text="📡 جاري مسح الشبكة الرصدية "
+             "وسحب الأخبار بالتوازي..."
+    )
 
-        is_last = index == len(chunks) - 1
+    # --------------------------------------------------------
+    # تحديد التقرير
+    # --------------------------------------------------------
 
-        try:
-            await send_new_message(
-                chunk,
-                reply_markup=(
-                    keyboard
-                    if is_last
-                    else None
-                )
+    if data.startswith("topic_"):
+
+        keywords = data.replace(
+            "topic_",
+            "",
+            1,
+        )
+
+        raw_news = await fetch_all_news(
+            keywords
+        )
+
+        prompt = f"""
+أنت محلل استخباري سياسي واقتصادي محترف.
+
+حلل الأخبار التالية الصادرة من مصادر عربية
+ودولية.
+
+المطلوب:
+
+1. تلخيص أهم المستجدات.
+2. تحديد الأطراف المعنية.
+3. توضيح المواقف الرسمية.
+4. التمييز بين الخبر المؤكد والتحليل.
+5. تجنب اختلاق أي معلومات غير موجودة في البيانات.
+6. إذا كانت البيانات غير كافية، صرّح بذلك بوضوح.
+
+الأخبار الخام:
+
+{raw_news}
+
+اكتب التقرير باللغة العربية بأسلوب مهني
+ومركز ومنظم بعناوين واضحة.
+"""
+
+    elif data == "compare_all":
+
+        raw_news = await fetch_all_news(
+            "أزمة حرب اتفاق تصريح عقوبات"
+        )
+
+        prompt = f"""
+أنت محلل استخباري رفيع المستوى.
+
+أعد تقريراً بعنوان:
+
+"تحليل مقارنة الروايات الإعلامية"
+
+اعتمد فقط على الأخبار الموجودة أدناه.
+
+قارن بين تناول المصادر العربية
+والغربية والروسية والصينية.
+
+وضح:
+
+- نقاط الاتفاق.
+- نقاط الاختلاف.
+- اختلاف صياغة الأحداث.
+- المواقف الرسمية.
+- ما يمكن اعتباره حقيقة مشتركة.
+- ما يمثل رواية أو تفسيراً من طرف معين.
+- الثغرات أو المعلومات غير المؤكدة.
+
+لا تخترع معلومات غير موجودة في البيانات.
+
+الأخبار الخام:
+
+{raw_news}
+
+اكتب التقرير باللغة العربية
+بشكل مهني ومنظم.
+"""
+
+    else:
+        return
+
+    # --------------------------------------------------------
+    # Gemini
+    # --------------------------------------------------------
+
+    try:
+
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+            ),
+        )
+
+        reply_text = response.text
+
+        if not reply_text:
+            reply_text = (
+                "لم يُرجع نموذج الذكاء الاصطناعي "
+                "نصاً صالحاً."
             )
 
-        except Exception as error:
-            logger.error(
-                "Failed to send Telegram message chunk: %s",
-                error
+    except Exception as e:
+
+        logger.exception(
+            "Gemini API Error"
+        )
+
+        reply_text = (
+            "عذراً، حدث خطأ أثناء تحليل البيانات "
+            "بواسطة Gemini.\n\n"
+            f"تفاصيل الخطأ:\n{str(e)}"
+        )
+
+    # --------------------------------------------------------
+    # زر العودة
+    # --------------------------------------------------------
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 العودة للقائمة الرئيسية",
+                callback_data="back_to_menu",
             )
+        ]
+    ])
 
-            # محاولة أخيرة برسالة مختصرة
-            try:
-                await send_new_message(
-                    "تعذر إرسال الرد كاملًا بسبب خطأ في Telegram."
-                )
-            except Exception:
-                pass
+    await send_long_message(
+        update,
+        reply_text,
+        query=query,
+        keyboard=keyboard,
+    )
 
-            return
+
+# ============================================================
+# أخطاء التطبيق
+# ============================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    logger.exception(
+        "Unhandled exception:",
+        exc_info=context.error,
+    )
+
+
+# ============================================================
+# تشغيل البوت
+# ============================================================
+
+def main():
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "reset",
+            reset,
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler,
+            pattern=r"^(topic_|compare_all|back_to_menu)",
+        )
+    )
+
+    app.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "🌐 نظام الإحاطة الاستخباراتي يعمل الآن..."
+    )
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()

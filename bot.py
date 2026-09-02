@@ -87,8 +87,8 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
 # ============================================================
 
 TOPICS = {
-    "urgent": "أهم الأخبار العاجلة والتطورات المهمة الآن",
-    "world": "أهم الأخبار العالمية",
+    "urgent": "الأخبار العاجلة والتطورات المهمة الآن",
+    "world": "الأخبار العالمية",
     "gulf": "أخبار الخليج العربي",
     "america": "أخبار الولايات المتحدة والأمريكتين",
     "europe": "أخبار أوروبا",
@@ -100,7 +100,7 @@ TOPICS = {
 
 
 # ============================================================
-# TELEGRAM KEYBOARD
+# TELEGRAM KEYBOARDS
 # ============================================================
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -108,53 +108,53 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 "🚨 عاجل",
-                callback_data="topic:urgent"
+                callback_data="topic:urgent",
             ),
             InlineKeyboardButton(
                 "🌍 العالم",
-                callback_data="topic:world"
+                callback_data="topic:world",
             ),
         ],
         [
             InlineKeyboardButton(
                 "🇸🇦 الخليج",
-                callback_data="topic:gulf"
+                callback_data="topic:gulf",
             ),
             InlineKeyboardButton(
                 "🇺🇸 أمريكا",
-                callback_data="topic:america"
+                callback_data="topic:america",
             ),
         ],
         [
             InlineKeyboardButton(
                 "🇪🇺 أوروبا",
-                callback_data="topic:europe"
+                callback_data="topic:europe",
             ),
             InlineKeyboardButton(
                 "🌏 آسيا",
-                callback_data="topic:asia"
+                callback_data="topic:asia",
             ),
         ],
         [
             InlineKeyboardButton(
                 "⛽ الطاقة",
-                callback_data="topic:energy"
+                callback_data="topic:energy",
             ),
             InlineKeyboardButton(
                 "🛡 الأمن",
-                callback_data="topic:security"
+                callback_data="topic:security",
             ),
         ],
         [
             InlineKeyboardButton(
                 "🌐 السياسة الخارجية",
-                callback_data="topic:foreign"
+                callback_data="topic:foreign",
             ),
         ],
         [
             InlineKeyboardButton(
                 "🔄 مقارنة",
-                callback_data="compare"
+                callback_data="compare",
             ),
         ],
     ]
@@ -168,7 +168,7 @@ def back_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     "⬅️ رجوع",
-                    callback_data="back"
+                    callback_data="back",
                 )
             ]
         ]
@@ -197,17 +197,22 @@ async def ask_gemini(prompt: str) -> str:
         text = getattr(response, "text", None)
 
         if not text:
-            logger.warning("Gemini returned an empty response.")
-            return "لم يتمكن النظام من الحصول على تحليل من Gemini."
+            logger.warning(
+                "Gemini returned an empty response."
+            )
 
-        logger.info("Gemini request completed.")
+            return "لا توجد إجابة كافية من البيانات المتاحة."
+
+        logger.info(
+            "Gemini request completed."
+        )
 
         return text.strip()
 
     except Exception as exc:
         logger.exception(
             "Gemini request failed: %s",
-            exc
+            exc,
         )
 
         return (
@@ -221,7 +226,9 @@ async def ask_gemini(prompt: str) -> str:
 # ============================================================
 
 async def get_fresh_news():
-    logger.info("Starting fresh news collection...")
+    logger.info(
+        "Starting fresh news collection..."
+    )
 
     try:
         news = await asyncio.wait_for(
@@ -247,68 +254,112 @@ async def get_fresh_news():
     except Exception as exc:
         logger.exception(
             "Fresh news collection failed: %s",
-            exc
+            exc,
         )
 
         return []
 
 
 # ============================================================
+# AI REPORT PROMPT
+# ============================================================
+
+REPORT_STYLE_RULES = """
+أسلوبك إلزامي:
+
+- اكتب كمحلل أخبار محترف، وليس ككاتب مقال.
+- كن مباشرًا ومختصرًا.
+- لا تستخدم مقدمات إنشائية.
+- لا تستخدم عبارات فلسفية أو عامة.
+- لا تكرر نفس المعلومة.
+- لا تشرح ما هو واضح.
+- لا تضف كلامًا فقط لزيادة طول التقرير.
+- لا تخترع معلومات أو مصادر أو أرقامًا.
+- لا تحول الاحتمال إلى حقيقة.
+- لا تقدم توقعات إلا إذا كانت مبنية بوضوح على المعطيات.
+- إذا لم توجد بيانات كافية، قل ذلك صراحة.
+- اجعل كل نقطة تحمل معلومة جديدة.
+- الأولوية للمعلومة، ثم التحليل.
+- التحليل يكون قصيرًا ولا يتجاوز ما تدعمه المصادر.
+- احذف أي جملة لا تضيف معلومة أو تحليلًا مفيدًا.
+- لا تستخدم خاتمة إنشائية مثل "سنواصل المتابعة" أو "الأيام القادمة ستكشف".
+- لا تبدأ بعبارات مثل "في ظل التطورات المتسارعة" أو "مما لا شك فيه".
+- لا تستخدم لغة دعائية أو مبالغات.
+- لا تكرر عنوان الخبر داخل الشرح.
+
+الطول:
+- الخلاصة: 2 إلى 3 جمل.
+- الأخبار المهمة: من 3 إلى 6 نقاط فقط.
+- التحليل: من 2 إلى 4 نقاط فقط.
+- التأثير المحتمل: نقطتان أو ثلاث كحد أقصى.
+- التقرير كاملًا يجب أن يكون قابلًا للقراءة خلال أقل من دقيقة.
+
+إذا كانت الأخبار كثيرة، اختر الأهم فقط ولا تحاول ذكرها كلها.
+"""
+
+
+# ============================================================
 # REPORT GENERATION
 # ============================================================
 
-async def generate_report(topic: str, news_items) -> str:
+async def generate_report(
+    topic: str,
+    news_items,
+) -> str:
+
     if not news_items:
         return (
-            "لم أتمكن من الحصول على أخبار حديثة كافية "
-            "لإعداد التقرير حاليًا."
+            "لا توجد أخبار حديثة كافية لإعداد التقرير."
         )
 
-    context = build_ai_context(news_items)
+    context = build_ai_context(
+        news_items
+    )
 
     prompt = f"""
 أنت محلل أخبار واستخبارات مفتوحة المصدر.
 
-الموضوع المطلوب:
+الموضوع:
 {topic}
 
-اعتمد فقط على الأخبار والبيانات الموجودة في السياق المرفق.
+مهمتك:
+حلل الأخبار الموجودة في السياق فقط، واستخرج أهم المعلومات
+ذات الصلة بالموضوع.
 
-المطلوب:
-1. تحديد أهم التطورات.
-2. ترتيبها حسب الأهمية.
-3. توضيح ما هو مؤكد وما هو غير مؤكد.
-4. ربط الأحداث ببعضها عند وجود علاقة واضحة.
-5. توضيح التأثير المحتمل.
-6. عدم اختلاق أي معلومات غير موجودة في المصادر.
-7. إذا كانت المعلومات غير كافية، اذكر ذلك بوضوح.
+{REPORT_STYLE_RULES}
 
-اكتب التقرير بالعربية بشكل واضح ومختصر.
-
-استخدم هذا الهيكل:
+استخدم هذا الهيكل فقط:
 
 🚨 الخلاصة
-أهم ما يجب معرفته.
+أهم معلومة أو تطورين، باختصار شديد.
 
-📰 أهم التطورات
-- التطور الأول
-- التطور الثاني
-- التطور الثالث
+📰 الأخبار المهمة
+• أهم خبر.
+• ثاني أهم خبر.
+• ثالث أهم خبر.
+• أضف نقاطًا أخرى فقط إذا كانت مهمة فعلًا.
 
 🔎 التحليل
-تحليل مختصر لما تعنيه التطورات.
+• ماذا تعني هذه التطورات؟
+• ما الرابط بينها إن وجد؟
+• ما المعلومة الأهم التي يجب الانتباه لها؟
 
 📌 التأثير المحتمل
-ما الذي قد يحدث أو يتغير بناءً على المعطيات الحالية.
+• التأثير المباشر أو الأقرب.
+• تأثير آخر مهم إذا كان مدعومًا بالمعلومات.
 
-⚠️ مستوى اليقين
-وضح إن كانت المعلومات مؤكدة أو أولية أو تحتاج إلى متابعة.
+⚠️ ملاحظة
+اذكر هنا فقط وجود معلومات غير مؤكدة أو نقص مهم في البيانات.
+إذا لم توجد مشكلة، اكتب:
+لا توجد ملاحظات مهمة.
 
 مصادر الأخبار:
 {context}
 """
 
-    return await ask_gemini(prompt)
+    return await ask_gemini(
+        prompt
+    )
 
 
 # ============================================================
@@ -325,30 +376,38 @@ async def send_long_message(
 
     chunks = [
         text[i:i + 3900]
-        for i in range(0, len(text), 3900)
+        for i in range(
+            0,
+            len(text),
+            3900,
+        )
     ]
 
     if not chunks:
-        chunks = ["لم يتم إنشاء محتوى."]
+        chunks = [
+            "لم يتم إنشاء محتوى."
+        ]
 
     for index, chunk in enumerate(chunks):
+
+        markup = (
+            reply_markup
+            if index == len(chunks) - 1
+            else None
+        )
+
         if update.callback_query:
+
             await update.callback_query.message.reply_text(
                 chunk,
-                reply_markup=(
-                    reply_markup
-                    if index == len(chunks) - 1
-                    else None
-                ),
+                reply_markup=markup,
             )
+
         elif update.message:
+
             await update.message.reply_text(
                 chunk,
-                reply_markup=(
-                    reply_markup
-                    if index == len(chunks) - 1
-                    else None
-                ),
+                reply_markup=markup,
             )
 
 
@@ -360,6 +419,7 @@ async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.message:
         return
 
@@ -378,6 +438,7 @@ async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     if not query:
@@ -388,13 +449,17 @@ async def button_handler(
     user_id = query.from_user.id
     callback_data = query.data
 
-    lock = get_user_lock(user_id)
+    lock = get_user_lock(
+        user_id
+    )
 
     if lock.locked():
+
         await query.answer(
             "يوجد تحليل جارٍ بالفعل، انتظر قليلًا.",
             show_alert=True,
         )
+
         return
 
     async with lock:
@@ -419,9 +484,8 @@ async def button_handler(
         if callback_data == "compare":
 
             await query.edit_message_text(
-                "ميزة المقارنة تحتاج إلى تحديد موضوعين "
-                "أو حدثين للمقارنة بينهما.\n\n"
-                "أرسل سؤالك مباشرة، مثل:\n"
+                "أرسل موضوعين أو حدثين للمقارنة بينهما.\n\n"
+                "مثال:\n"
                 "قارن بين تطورات الطاقة في الخليج وأوروبا.",
                 reply_markup=back_keyboard(),
             )
@@ -432,17 +496,22 @@ async def button_handler(
         # TOPIC
         # ----------------------------------------------------
 
-        if not callback_data.startswith("topic:"):
+        if not callback_data.startswith(
+            "topic:"
+        ):
             return
 
         topic_key = callback_data.split(
             ":",
-            1
+            1,
         )[1]
 
-        topic = TOPICS.get(topic_key)
+        topic = TOPICS.get(
+            topic_key
+        )
 
         if not topic:
+
             await query.edit_message_text(
                 "الموضوع غير معروف.",
                 reply_markup=back_keyboard(),
@@ -460,7 +529,12 @@ async def button_handler(
             user_id,
         )
 
+        # ----------------------------------------------------
+        # COLLECT
+        # ----------------------------------------------------
+
         try:
+
             fresh_items = await get_fresh_news()
 
             logger.info(
@@ -469,9 +543,10 @@ async def button_handler(
             )
 
         except Exception as exc:
+
             logger.exception(
                 "BUTTON: collection error: %s",
-                exc
+                exc,
             )
 
             fresh_items = []
@@ -481,6 +556,7 @@ async def button_handler(
         # ----------------------------------------------------
 
         try:
+
             selected_items = search_news(
                 fresh_items,
                 topic,
@@ -488,9 +564,10 @@ async def button_handler(
             )
 
         except Exception as exc:
+
             logger.exception(
                 "BUTTON: search_news failed: %s",
-                exc
+                exc,
             )
 
             selected_items = []
@@ -532,7 +609,7 @@ async def button_handler(
 
         await query.edit_message_text(
             "🧠 تم جمع الأخبار.\n\n"
-            "جاري تحليلها وربط التطورات..."
+            "جاري التحليل المختصر..."
         )
 
         logger.info(
@@ -549,13 +626,15 @@ async def button_handler(
         )
 
         # ----------------------------------------------------
-        # SEND REPORT
+        # SEND
         # ----------------------------------------------------
 
         try:
+
             await query.edit_message_text(
                 "📊 تم إعداد التقرير."
             )
+
         except Exception:
             pass
 
@@ -574,7 +653,11 @@ async def handle_user_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.message or not update.message.text:
+
+    if not update.message:
+        return
+
+    if not update.message.text:
         return
 
     user_id = update.effective_user.id
@@ -583,12 +666,16 @@ async def handle_user_message(
     if not user_text:
         return
 
-    lock = get_user_lock(user_id)
+    lock = get_user_lock(
+        user_id
+    )
 
     if lock.locked():
+
         await update.message.reply_text(
             "يوجد تحليل جارٍ بالفعل، انتظر حتى يكتمل."
         )
+
         return
 
     async with lock:
@@ -602,6 +689,10 @@ async def handle_user_message(
             user_id,
         )
 
+        # ----------------------------------------------------
+        # COLLECT
+        # ----------------------------------------------------
+
         fresh_items = await get_fresh_news()
 
         logger.info(
@@ -609,7 +700,12 @@ async def handle_user_message(
             len(fresh_items),
         )
 
+        # ----------------------------------------------------
+        # SEARCH
+        # ----------------------------------------------------
+
         try:
+
             selected_items = search_news(
                 fresh_items,
                 user_text,
@@ -617,12 +713,17 @@ async def handle_user_message(
             )
 
         except Exception as exc:
+
             logger.exception(
                 "MESSAGE: search_news failed: %s",
-                exc
+                exc,
             )
 
             selected_items = []
+
+        # ----------------------------------------------------
+        # FALLBACK
+        # ----------------------------------------------------
 
         if len(selected_items) < 3:
 
@@ -645,9 +746,17 @@ async def handle_user_message(
 
             return
 
+        # ----------------------------------------------------
+        # CONTEXT
+        # ----------------------------------------------------
+
         context_text = build_ai_context(
             selected_items
         )
+
+        # ----------------------------------------------------
+        # USER QUESTION PROMPT
+        # ----------------------------------------------------
 
         prompt = f"""
 أنت محلل أخبار واستخبارات مفتوحة المصدر.
@@ -655,16 +764,36 @@ async def handle_user_message(
 سؤال المستخدم:
 {user_text}
 
-حلل السؤال اعتمادًا على الأخبار الحديثة الموجودة
-في السياق أدناه.
+حلل السؤال اعتمادًا على الأخبار الموجودة في السياق فقط.
 
-القواعد:
-- لا تختلق معلومات.
-- لا تقدم ادعاءات غير موجودة في المصادر.
-- فرّق بين الحقائق والتحليل والاستنتاج.
-- إذا كانت البيانات غير كافية، قل ذلك بوضوح.
-- ركز على الأخبار الحديثة ذات الصلة.
-- أجب بالعربية.
+{REPORT_STYLE_RULES}
+
+قواعد إضافية للإجابة على سؤال المستخدم:
+
+- ابدأ بالإجابة مباشرة.
+- لا تعيد كتابة السؤال.
+- لا تبدأ بمقدمة عامة.
+- لا تستخدم كلامًا إنشائيًا.
+- إذا كان السؤال يحتاج معلومات غير موجودة في المصادر، وضح ذلك.
+- إذا كان السؤال يتطلب استنتاجًا، افصل الاستنتاج عن الحقيقة.
+- لا تقدم رأيًا شخصيًا.
+- لا تكرر نفس النقطة بصيغ مختلفة.
+- اجعل الإجابة مختصرة ومفيدة.
+- أعطِ الأولوية للمعلومة الحديثة والأكثر صلة.
+
+إذا كان مناسبًا، استخدم:
+
+الخلاصة:
+[الإجابة المباشرة]
+
+التفاصيل:
+[أهم النقاط فقط]
+
+التحليل:
+[تحليل مختصر عند الحاجة]
+
+ملاحظة:
+[فقط إذا كانت هناك معلومة غير مؤكدة أو نقص مهم]
 
 السياق الإخباري:
 {context_text}
@@ -672,13 +801,17 @@ async def handle_user_message(
 
         await status_message.edit_text(
             "🧠 تم جمع الأخبار.\n\n"
-            "جاري تحليل سؤالك..."
+            "جاري إعداد الإجابة المختصرة..."
         )
 
-        answer = await ask_gemini(prompt)
+        answer = await ask_gemini(
+            prompt
+        )
 
         try:
+
             await status_message.delete()
+
         except Exception:
             pass
 
@@ -694,11 +827,13 @@ async def handle_user_message(
 # ============================================================
 
 async def post_init(application):
+
     logger.info(
         "Verifying Telegram connection..."
     )
 
     try:
+
         bot_info = await application.bot.get_me()
 
         logger.info(
@@ -711,9 +846,10 @@ async def post_init(application):
         )
 
     except Exception as exc:
+
         logger.exception(
             "Telegram connection verification failed: %s",
-            exc
+            exc,
         )
 
         raise
@@ -759,7 +895,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # USER TEXT
+    # TEXT
     # --------------------------------------------------------
 
     app.add_handler(

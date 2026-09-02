@@ -100,12 +100,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         الأخبار الخام:
         {raw_news}
         
-        وضح للمستخدم: كيف تتناول المصادر العربية الرسمية الحدث مقارنة بالتناول الغربي والروسي والصيني؟ ما هي نقاط الالتقاء والااختلاف بين الروايات؟
+        وضح للمستخدم: كيف تتناول المصادر العربية الرسمية الحدث مقارنة بالتناول الغربي والروسي والصيني؟ ما هي نقاط الالتقاء والاختلاف بين الروايات؟
         """
 
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.3)
         )

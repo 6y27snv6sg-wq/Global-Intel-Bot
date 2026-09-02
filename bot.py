@@ -43,16 +43,24 @@ logger = logging.getLogger(__name__)
 # ENVIRONMENT
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# BOT_TOKEN هو الاسم المفضل الجديد.
+# TELEGRAM_BOT_TOKEN يبقى مدعوماً حتى لا ينكسر إعداد Railway الحالي.
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+)
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError(
-        "ERROR: TELEGRAM_BOT_TOKEN is missing!"
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "ERROR: BOT_TOKEN / TELEGRAM_BOT_TOKEN is missing!"
     )
 
+
 if not GEMINI_API_KEY:
-    raise ValueError(
+    raise RuntimeError(
         "ERROR: GEMINI_API_KEY is missing!"
     )
 
@@ -77,6 +85,8 @@ MAX_SEARCH_RESULTS = 15
 MAX_HISTORY = 6
 
 TELEGRAM_MAX_LENGTH = 3900
+
+NEWS_COLLECTION_TIMEOUT = 20
 
 
 # ============================================================
@@ -214,9 +224,7 @@ def split_text_safely(
         return [""]
 
     chunks = []
-
     paragraphs = text.split("\n")
-
     current = ""
 
     for paragraph in paragraphs:
@@ -236,10 +244,7 @@ def split_text_safely(
 
         if current:
 
-            chunks.append(
-                current
-            )
-
+            chunks.append(current)
             current = ""
 
         while len(paragraph) > max_length:
@@ -257,18 +262,12 @@ def split_text_safely(
                 paragraph[:cut].strip()
             )
 
-            paragraph = (
-                paragraph[cut:]
-                .strip()
-            )
+            paragraph = paragraph[cut:].strip()
 
         current = paragraph
 
     if current:
-
-        chunks.append(
-            current
-        )
+        chunks.append(current)
 
     return chunks or [""]
 
@@ -319,20 +318,15 @@ async def send_long_message(
 
             for index, chunk in enumerate(chunks):
 
-                if index == len(chunks) - 1:
-
-                    await update.get_bot().send_message(
-                        chat_id=update.effective_chat.id,
-                        text=chunk,
-                        reply_markup=keyboard,
-                    )
-
-                else:
-
-                    await update.get_bot().send_message(
-                        chat_id=update.effective_chat.id,
-                        text=chunk,
-                    )
+                await update.get_bot().send_message(
+                    chat_id=update.effective_chat.id,
+                    text=chunk,
+                    reply_markup=(
+                        keyboard
+                        if index == len(chunks) - 1
+                        else None
+                    ),
+                )
 
     except Exception as exc:
 
@@ -356,8 +350,11 @@ async def get_fresh_news(
             "Starting fresh news collection..."
         )
 
-        items = await collect_news(
-            max_items=max_items
+        items = await asyncio.wait_for(
+            collect_news(
+                max_items=max_items
+            ),
+            timeout=NEWS_COLLECTION_TIMEOUT,
         )
 
         logger.info(
@@ -366,6 +363,15 @@ async def get_fresh_news(
         )
 
         return items or []
+
+    except asyncio.TimeoutError:
+
+        logger.error(
+            "Fresh news collection timed out after %s seconds.",
+            NEWS_COLLECTION_TIMEOUT,
+        )
+
+        return []
 
     except Exception as exc:
 
@@ -541,6 +547,35 @@ async def generate_report(
 
 
 # ============================================================
+# STARTUP VERIFICATION
+# ============================================================
+
+async def post_init(application):
+
+    try:
+
+        bot_info = await application.bot.get_me()
+
+        logger.info(
+            "Telegram connection verified successfully."
+        )
+
+        logger.info(
+            "Bot username: @%s",
+            bot_info.username,
+        )
+
+    except Exception as exc:
+
+        logger.error(
+            "Telegram authentication failed: %s",
+            exc,
+        )
+
+        raise
+
+
+# ============================================================
 # START
 # ============================================================
 
@@ -622,10 +657,7 @@ async def button_handler(
 
     elif data.startswith("topic:"):
 
-        topic_key = data.split(
-            ":",
-            1,
-        )[1]
+        topic_key = data.split(":", 1)[1]
 
         if topic_key not in TOPICS:
 
@@ -662,9 +694,12 @@ async def button_handler(
                 )
             )
 
-        except Exception:
+        except Exception as exc:
 
-            pass
+            logger.warning(
+                "Could not update button status: %s",
+                exc,
+            )
 
         # ----------------------------------------------------
         # جمع الأخبار
@@ -714,9 +749,6 @@ async def button_handler(
                     max_results=MAX_SEARCH_RESULTS,
                 )
 
-                # إذا كانت نتائج الموضوع قليلة
-                # نستخدم أحدث الأخبار كخطة احتياطية
-
                 if len(selected_items) < 3:
 
                     selected_items = fresh_items[
@@ -765,9 +797,12 @@ async def button_handler(
                 )
             )
 
-        except Exception:
+        except Exception as exc:
 
-            pass
+            logger.warning(
+                "Could not update Gemini status: %s",
+                exc,
+            )
 
         try:
 
@@ -902,9 +937,7 @@ async def handle_user_message(
             [],
         )
 
-        recent_history = history[
-            -MAX_HISTORY:
-        ]
+        recent_history = history[-MAX_HISTORY:]
 
         conversation_text = ""
 
@@ -1062,7 +1095,6 @@ async def handle_user_message(
             await thinking_message.delete()
 
         except Exception:
-
             pass
 
         # ----------------------------------------------------
@@ -1103,7 +1135,8 @@ def main():
 
     app = (
         ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
+        .token(BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
@@ -1155,13 +1188,13 @@ def main():
         error_handler
     )
 
-    logger.info(
-        "Live News Intelligence Bot is running."
-    )
-
     # --------------------------------------------------------
     # Polling
     # --------------------------------------------------------
+
+    logger.info(
+        "Starting Telegram polling..."
+    )
 
     app.run_polling(
         drop_pending_updates=True

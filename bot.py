@@ -372,7 +372,7 @@ async def ask_gemini(
         contents=prompt,
         config=types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(
-                thinking_level="low"
+                thinking_level=types.ThinkingLevel.LOW
             )
         ),
     )

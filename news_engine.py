@@ -18,15 +18,25 @@ import feedparser
 # الإعدادات
 # ============================================================
 
-REQUEST_TIMEOUT = 10
-SOURCE_TIMEOUT = 7
+# الحد الأقصى لطلب HTTP الواحد
+REQUEST_TIMEOUT = 6
+
+# الحد الأقصى للمصدر الواحد
+SOURCE_TIMEOUT = 4
+
+# الحد الأقصى للعملية الكاملة لجمع الأخبار
+GLOBAL_COLLECTION_TIMEOUT = 10
 
 MAX_ITEMS_PER_SOURCE = 15
 MAX_NEWS_ITEMS = 100
 MAX_SUMMARY_LENGTH = 650
 
+# حماية من تحميل صفحات ضخمة
+MAX_RSS_BYTES = 2 * 1024 * 1024
+MAX_HTML_BYTES = 1 * 1024 * 1024
+
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; LiveNewsBot/3.1; +https://telegram.org)"
+    "Mozilla/5.0 (compatible; LiveNewsBot/3.2; +https://telegram.org)"
 )
 
 logger = logging.getLogger(__name__)
@@ -259,26 +269,24 @@ def normalize_arabic(text: str) -> str:
 
     text = str(text)
 
-    # إزالة التشكيل
     text = re.sub(
         r"[\u0610-\u061A\u064B-\u065F\u0670]",
         "",
         text,
     )
 
-    # إزالة التطويل
     text = text.replace("ـ", "")
 
-    # توحيد الألف
-    text = re.sub(r"[أإآا]", "ا", text)
+    text = re.sub(
+        r"[أإآا]",
+        "ا",
+        text,
+    )
 
-    # توحيد الياء
     text = text.replace("ى", "ي")
 
-    # توحيد التاء المربوطة
     text = text.replace("ة", "ه")
 
-    # إزالة علامات الترقيم
     text = re.sub(
         r"[^\w\s]",
         " ",
@@ -286,7 +294,6 @@ def normalize_arabic(text: str) -> str:
         flags=re.UNICODE,
     )
 
-    # المسافات
     text = re.sub(
         r"\s+",
         " ",
@@ -590,6 +597,35 @@ def is_breaking_news(
 
 
 # ============================================================
+# قراءة استجابة محدودة الحجم
+# ============================================================
+
+async def read_limited_response(
+    response: aiohttp.ClientResponse,
+    max_bytes: int,
+) -> bytes:
+
+    chunks = []
+    total = 0
+
+    while total < max_bytes:
+
+        remaining = max_bytes - total
+
+        chunk = await response.content.read(
+            min(64 * 1024, remaining)
+        )
+
+        if not chunk:
+            break
+
+        chunks.append(chunk)
+        total += len(chunk)
+
+    return b"".join(chunks)
+
+
+# ============================================================
 # جلب RSS
 # ============================================================
 
@@ -601,6 +637,11 @@ async def fetch_rss_source(
     results = []
 
     try:
+
+        logger.info(
+            "Starting RSS source: %s",
+            source["name"],
+        )
 
         async with session.get(
             source["url"],
@@ -619,7 +660,13 @@ async def fetch_rss_source(
 
                 return []
 
-            content = await response.read()
+            content = await read_limited_response(
+                response,
+                MAX_RSS_BYTES,
+            )
+
+        if not content:
+            return []
 
         feed = feedparser.parse(
             content
@@ -679,12 +726,23 @@ async def fetch_rss_source(
                         50,
                     ),
                     event_id=make_event_id(
-                        title
+                        title,
+                        link,
                     ),
                 )
             )
 
+        logger.info(
+            "RSS completed: %s -> %d items",
+            source["name"],
+            len(results),
+        )
+
     except asyncio.CancelledError:
+        logger.info(
+            "RSS cancelled: %s",
+            source["name"],
+        )
         raise
 
     except Exception as exc:
@@ -780,6 +838,11 @@ async def fetch_html_source(
 
     try:
 
+        logger.info(
+            "Starting HTML source: %s",
+            source["name"],
+        )
+
         async with session.get(
             source["url"],
             headers={
@@ -797,9 +860,18 @@ async def fetch_html_source(
 
                 return []
 
-            page_html = await response.text(
-                errors="ignore"
+            content = await read_limited_response(
+                response,
+                MAX_HTML_BYTES,
             )
+
+        if not content:
+            return []
+
+        page_html = content.decode(
+            "utf-8",
+            errors="ignore",
+        )
 
         links = extract_links_from_html(
             page_html,
@@ -832,7 +904,8 @@ async def fetch_html_source(
                         50,
                     ),
                     event_id=make_event_id(
-                        title
+                        title,
+                        link,
                     ),
                 )
             )
@@ -840,7 +913,17 @@ async def fetch_html_source(
             if len(results) >= MAX_ITEMS_PER_SOURCE:
                 break
 
+        logger.info(
+            "HTML completed: %s -> %d items",
+            source["name"],
+            len(results),
+        )
+
     except asyncio.CancelledError:
+        logger.info(
+            "HTML cancelled: %s",
+            source["name"],
+        )
         raise
 
     except Exception as exc:
@@ -1083,20 +1166,20 @@ def sort_news(
 
 async def run_source_safely(
     source_name: str,
-    task,
+    coroutine,
 ):
 
     try:
 
         return await asyncio.wait_for(
-            task,
+            coroutine,
             timeout=SOURCE_TIMEOUT,
         )
 
     except asyncio.TimeoutError:
 
         logger.warning(
-            "Source timeout: %s",
+            "SOURCE TIMEOUT: %s",
             source_name,
         )
 
@@ -1108,12 +1191,131 @@ async def run_source_safely(
     except Exception as exc:
 
         logger.warning(
-            "Source error: %s -> %s",
+            "SOURCE ERROR: %s -> %s",
             source_name,
             exc,
         )
 
         return []
+
+
+# ============================================================
+# جمع الأخبار الداخلي
+# ============================================================
+
+async def _collect_news_internal(
+    session: aiohttp.ClientSession,
+) -> List[NewsItem]:
+
+    all_items = []
+
+    tasks = []
+
+    # --------------------------------------------------------
+    # RSS
+    # --------------------------------------------------------
+
+    for source in RSS_SOURCES:
+
+        task = asyncio.create_task(
+            run_source_safely(
+                source["name"],
+                fetch_rss_source(
+                    session,
+                    source,
+                ),
+            )
+        )
+
+        tasks.append(task)
+
+    # --------------------------------------------------------
+    # HTML
+    # --------------------------------------------------------
+
+    for source in HTML_SOURCES:
+
+        task = asyncio.create_task(
+            run_source_safely(
+                source["name"],
+                fetch_html_source(
+                    session,
+                    source,
+                ),
+            )
+        )
+
+        tasks.append(task)
+
+    if not tasks:
+        return []
+
+    logger.info(
+        "Started %d news sources",
+        len(tasks),
+    )
+
+    # --------------------------------------------------------
+    # الانتظار بمهلة إجمالية
+    # --------------------------------------------------------
+
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=GLOBAL_COLLECTION_TIMEOUT,
+        return_when=asyncio.ALL_COMPLETED,
+    )
+
+    logger.info(
+        "News collection finished: done=%d pending=%d",
+        len(done),
+        len(pending),
+    )
+
+    # --------------------------------------------------------
+    # قراءة المصادر التي انتهت
+    # --------------------------------------------------------
+
+    for task in done:
+
+        if task.cancelled():
+            continue
+
+        try:
+
+            result = task.result()
+
+            if result:
+                all_items.extend(
+                    result
+                )
+
+        except Exception as exc:
+
+            logger.warning(
+                "Completed source task failed: %s",
+                exc,
+            )
+
+    # --------------------------------------------------------
+    # إلغاء المصادر التي ما زالت معلقة
+    # --------------------------------------------------------
+
+    if pending:
+
+        logger.warning(
+            "Cancelling %d pending source tasks",
+            len(pending),
+        )
+
+        for task in pending:
+            task.cancel()
+
+        await asyncio.gather(
+            *pending,
+            return_exceptions=True,
+        )
+
+    return all_items
 
 
 # ============================================================
@@ -1124,17 +1326,23 @@ async def collect_news(
     max_items: int = MAX_NEWS_ITEMS,
 ) -> List[NewsItem]:
 
+    logger.info(
+        "========== NEWS COLLECTION START =========="
+    )
+
     all_items = []
 
     timeout = aiohttp.ClientTimeout(
         total=REQUEST_TIMEOUT,
-        connect=4,
-        sock_read=6,
+        connect=3,
+        sock_connect=3,
+        sock_read=4,
     )
 
     connector = aiohttp.TCPConnector(
-        limit=15,
+        limit=10,
         ssl=True,
+        ttl_dns_cache=300,
     )
 
     try:
@@ -1147,61 +1355,26 @@ async def collect_news(
             },
         ) as session:
 
-            tasks = []
+            # ------------------------------------------------
+            # حماية إضافية للعملية كاملة
+            # ------------------------------------------------
 
-            # RSS
-            for source in RSS_SOURCES:
+            try:
 
-                tasks.append(
-                    asyncio.create_task(
-                        run_source_safely(
-                            source["name"],
-                            fetch_rss_source(
-                                session,
-                                source,
-                            ),
-                        )
-                    )
+                all_items = await asyncio.wait_for(
+                    _collect_news_internal(
+                        session
+                    ),
+                    timeout=GLOBAL_COLLECTION_TIMEOUT + 2,
                 )
 
-            # HTML
-            for source in HTML_SOURCES:
+            except asyncio.TimeoutError:
 
-                tasks.append(
-                    asyncio.create_task(
-                        run_source_safely(
-                            source["name"],
-                            fetch_html_source(
-                                session,
-                                source,
-                            ),
-                        )
-                    )
+                logger.warning(
+                    "GLOBAL NEWS COLLECTION TIMEOUT"
                 )
 
-            # ننتظر كل المصادر، لكن كل مصدر
-            # لديه مهلة مستقلة.
-            results = await asyncio.gather(
-                *tasks,
-                return_exceptions=True,
-            )
-
-            for result in results:
-
-                if isinstance(
-                    result,
-                    BaseException,
-                ):
-                    logger.warning(
-                        "Source task exception: %s",
-                        result,
-                    )
-                    continue
-
-                if result:
-                    all_items.extend(
-                        result
-                    )
+                all_items = []
 
     except asyncio.CancelledError:
         raise
@@ -1213,12 +1386,22 @@ async def collect_news(
             exc,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # المعالجة
-    # --------------------------------------------------------
+    # ========================================================
+
+    logger.info(
+        "Raw news items: %d",
+        len(all_items),
+    )
 
     all_items = deduplicate_news(
         all_items
+    )
+
+    logger.info(
+        "After deduplication: %d",
+        len(all_items),
     )
 
     all_items = cluster_events(
@@ -1229,7 +1412,20 @@ async def collect_news(
         all_items
     )
 
-    return all_items[:max_items]
+    final_items = all_items[
+        :max_items
+    ]
+
+    logger.info(
+        "Final news items: %d",
+        len(final_items),
+    )
+
+    logger.info(
+        "========== NEWS COLLECTION END =========="
+    )
+
+    return final_items
 
 
 # ============================================================
@@ -1450,13 +1646,21 @@ async def test_news_engine():
         "Starting news engine test..."
     )
 
+    started = asyncio.get_running_loop().time()
+
     items = await collect_news(
         max_items=20
     )
 
+    elapsed = (
+        asyncio.get_running_loop().time()
+        - started
+    )
+
     logger.info(
-        "Collected %d news items.",
+        "Collected %d news items in %.2f seconds.",
         len(items),
+        elapsed,
     )
 
     if items:
@@ -1467,6 +1671,12 @@ async def test_news_engine():
                 items,
                 max_items=5,
             ),
+        )
+
+    else:
+
+        logger.warning(
+            "No news items collected."
         )
 
     return items

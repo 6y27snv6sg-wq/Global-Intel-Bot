@@ -1,707 +1,357 @@
 import asyncio
-import hashlib
-import html
 import logging
-import re
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from typing import List, Optional
-from urllib.parse import urljoin
+import os
 
-import aiohttp
-import feedparser
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
+
+from google import genai
+from google.genai import types
+
+# ============================================================
+# NEWS ENGINE
+# ============================================================
+
+from news_engine import (
+    collect_news,
+    search_news,
+    build_ai_context,
+    format_news_for_telegram,
+)
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
-REQUEST_TIMEOUT = 12
-MAX_ITEMS_PER_SOURCE = 15
-MAX_NEWS_ITEMS = 100
-MAX_SUMMARY_LENGTH = 650
-
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; LiveNewsBot/2.0; "
-    "+https://telegram.org)"
-)
-
 logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ============================================================
-# SOURCE PRIORITY
-# ============================================================
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError(
+        "ERROR: TELEGRAM_BOT_TOKEN is missing!"
+    )
 
-SOURCE_PRIORITY = {
-    "official": 100,
-    "official_agency": 90,
-    "international_agency": 80,
-    "news_channel": 70,
-    "news_site": 60,
-}
-
-
-# ============================================================
-# NEWS MODEL
-# ============================================================
-
-@dataclass
-class NewsItem:
-    title: str
-    summary: str
-    source: str
-    source_type: str
-    country: str
-    category: str
-    url: str
-    published_at: Optional[datetime]
-    priority: int
-    event_id: str
+if not GEMINI_API_KEY:
+    raise ValueError(
+        "ERROR: GEMINI_API_KEY is missing!"
+    )
 
 
 # ============================================================
-# SOURCES
+# GEMINI
 # ============================================================
 
-# RSS SOURCES
-RSS_SOURCES = [
-    {
-        "name": "SPA",
-        "url": "https://www.spa.gov.sa/rss",
-        "type": "official_agency",
-        "country": "Saudi Arabia",
-    },
-    {
-        "name": "France24 Arabic",
-        "url": "https://www.france24.com/ar/rss",
-        "type": "news_channel",
-        "country": "France",
-    },
-    {
-        "name": "BBC Arabic",
-        "url": "https://feeds.bbci.co.uk/arabic/rss.xml",
-        "type": "news_channel",
-        "country": "United Kingdom",
-    },
-]
+ai_client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
-
-# DIRECT HTML SOURCES
-# These are intentionally separate from RSS.
-# Many official government websites publish current news
-# without exposing a usable RSS feed.
-
-HTML_SOURCES = [
-    {
-        "name": "Saudi MOFA News",
-        "url": "https://www.mofa.gov.sa/en/ministry/news/Pages/default.aspx",
-        "type": "official",
-        "country": "Saudi Arabia",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "Saudi MOFA Statements",
-        "url": "https://www.mofa.gov.sa/en/ministry/statements/Pages/default.aspx",
-        "type": "official",
-        "country": "Saudi Arabia",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "Qatar MOFA News",
-        "url": "https://mofa.gov.qa/en/all-mofa-news",
-        "type": "official",
-        "country": "Qatar",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "UAE MOFA News",
-        "url": "https://www.mofa.gov.ae/en/mediahub/news",
-        "type": "official",
-        "country": "United Arab Emirates",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "UK FCDO",
-        "url": "https://www.gov.uk/government/organisations/foreign-commonwealth-development-office",
-        "type": "official",
-        "country": "United Kingdom",
-        "category": "foreign_affairs",
-    },
-]
+GEMINI_MODEL = "gemini-3.5-flash"
 
 
 # ============================================================
-# KEYWORDS
+# LIMITS
 # ============================================================
 
-BREAKING_KEYWORDS = [
-    "عاجل",
-    "هجوم",
-    "هجوم مسلح",
-    "صاروخ",
-    "صواريخ",
-    "قصف",
-    "انفجار",
-    "حرب",
-    "هدنة",
-    "وقف إطلاق النار",
-    "اشتباكات",
-    "تصعيد",
-    "عقوبات",
-    "اتفاق",
-    "اتفاقية",
-    "أزمة",
-    "طوارئ",
-    "مقتل",
-    "قتلى",
-    "إصابة",
-    "إصابات",
-    "استهداف",
-    "ضربة",
-    "ضربات",
-    "breaking",
-    "attack",
-    "missile",
-    "missiles",
-    "strike",
-    "strikes",
-    "war",
-    "ceasefire",
-    "sanctions",
-    "agreement",
-    "explosion",
-    "conflict",
-]
-
-
-CATEGORY_KEYWORDS = {
-    "security": [
-        "هجوم",
-        "صاروخ",
-        "قصف",
-        "حرب",
-        "اشتباكات",
-        "عسكري",
-        "دفاع",
-        "أمن",
-        "attack",
-        "missile",
-        "war",
-        "military",
-        "defense",
-        "security",
-    ],
-    "energy": [
-        "نفط",
-        "النفط",
-        "أوبك",
-        "أوبك+",
-        "غاز",
-        "طاقة",
-        "خام",
-        "oil",
-        "opec",
-        "opec+",
-        "gas",
-        "energy",
-        "crude",
-    ],
-    "economy": [
-        "اقتصاد",
-        "اقتصادية",
-        "تجارة",
-        "استثمار",
-        "أسواق",
-        "بنك",
-        "فائدة",
-        "تضخم",
-        "عملة",
-        "economy",
-        "trade",
-        "investment",
-        "markets",
-        "bank",
-        "interest",
-        "inflation",
-        "currency",
-    ],
-    "politics": [
-        "انتخابات",
-        "رئيس",
-        "حكومة",
-        "برلمان",
-        "سياسة",
-        "سياسي",
-        "president",
-        "government",
-        "parliament",
-        "election",
-        "politics",
-    ],
-    "foreign_affairs": [
-        "وزارة الخارجية",
-        "وزير الخارجية",
-        "محادثات",
-        "مباحثات",
-        "اتصال",
-        "زيارة",
-        "بيان",
-        "تصريح",
-        "foreign ministry",
-        "foreign minister",
-        "talks",
-        "statement",
-        "diplomatic",
-    ],
-}
+MAX_NEWS_FOR_AI = 20
+MAX_SEARCH_RESULTS = 15
+MAX_HISTORY = 6
 
 
 # ============================================================
-# CLEANING
+# MAIN KEYBOARD
 # ============================================================
 
-def clean_html(text: str) -> str:
+def get_main_keyboard():
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "🔴 عاجل الآن",
+                callback_data="topic_عاجل هجوم صاروخ قصف انفجار حرب تصعيد"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🌍 العالم",
+                callback_data="topic_العالم دولي دولية أزمة اتفاق"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🇸🇦 الخليج والعالم العربي",
+                callback_data="topic_السعودية الخليج العربي قطر الإمارات"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🇺🇸 أمريكا",
+                callback_data="topic_أمريكا الولايات المتحدة واشنطن"
+            ),
+
+            InlineKeyboardButton(
+                "🇪🇺 أوروبا",
+                callback_data="topic_أوروبا بريطانيا فرنسا ألمانيا"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🌏 آسيا",
+                callback_data="topic_آسيا الصين اليابان الهند روسيا"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🛢️ الطاقة والأسواق",
+                callback_data="topic_نفط أوبك أوبك+ غاز طاقة أسواق اقتصاد"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🛡️ الأمن والصراعات",
+                callback_data="topic_أمن صراع حرب هجوم عسكري صاروخ"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🏛️ بيانات وزارات الخارجية",
+                callback_data="topic_وزارة الخارجية وزير الخارجية بيان تصريح"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "⚡ تحليل مقارن شامل",
+                callback_data="compare_all"
+            )
+        ],
+    ])
+
+
+# ============================================================
+# BACK BUTTON
+# ============================================================
+
+def get_back_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 العودة للقائمة الرئيسية",
+                callback_data="back_to_menu",
+            )
+        ]
+    ])
+
+
+# ============================================================
+# SAFE MESSAGE SPLITTER
+# ============================================================
+
+def split_text_safely(
+    text,
+    max_length=3900,
+):
+
     if not text:
-        return ""
+        return [""]
 
-    text = html.unescape(text)
+    chunks = []
 
-    text = re.sub(
-        r"<script.*?</script>",
-        " ",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    paragraphs = text.split("\n")
 
-    text = re.sub(
-        r"<style.*?</style>",
-        " ",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    current = ""
 
-    text = re.sub(r"<[^>]+>", " ", text)
+    for paragraph in paragraphs:
 
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def clean_title(title: str) -> str:
-    title = clean_html(title)
-
-    title = re.sub(
-        r"^\s*(عاجل|breaking)\s*[:\-|]\s*",
-        "",
-        title,
-        flags=re.IGNORECASE,
-    )
-
-    return title.strip()
-
-
-def clean_summary(summary: str) -> str:
-    summary = clean_html(summary)
-
-    if not summary:
-        return ""
-
-    # Remove common website noise
-    noise_patterns = [
-        r"اقرأ المزيد",
-        r"لمزيد من التفاصيل",
-        r"تابعونا",
-        r"اشترك",
-        r"subscribe",
-        r"read more",
-        r"follow us",
-        r"share",
-    ]
-
-    for pattern in noise_patterns:
-        summary = re.sub(
-            pattern,
-            " ",
-            summary,
-            flags=re.IGNORECASE,
+        candidate = (
+            paragraph
+            if not current
+            else current + "\n" + paragraph
         )
 
-    summary = re.sub(r"\s+", " ", summary).strip()
+        if len(candidate) <= max_length:
 
-    if len(summary) > MAX_SUMMARY_LENGTH:
-        summary = summary[:MAX_SUMMARY_LENGTH].rsplit(" ", 1)[0] + "..."
+            current = candidate
+            continue
 
-    return summary
+        if current:
 
+            chunks.append(
+                current
+            )
 
-# ============================================================
-# DATE PARSING
-# ============================================================
+            current = ""
 
-def parse_datetime(value) -> Optional[datetime]:
-    if not value:
-        return None
+        while len(paragraph) > max_length:
 
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        value = str(value).strip()
+            cut = paragraph.rfind(
+                " ",
+                0,
+                max_length,
+            )
 
-        try:
-            dt = parsedate_to_datetime(value)
-        except Exception:
-            dt = None
+            if cut < 100:
 
-        if dt is None:
-            formats = [
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d",
-            ]
+                cut = max_length
 
-            for fmt in formats:
-                try:
-                    dt = datetime.strptime(value, fmt)
-                    break
-                except Exception:
-                    continue
+            chunks.append(
+                paragraph[:cut].strip()
+            )
 
-    if dt is None:
-        return None
+            paragraph = (
+                paragraph[cut:]
+                .strip()
+            )
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        current = paragraph
 
-    return dt.astimezone(timezone.utc)
+    if current:
+
+        chunks.append(
+            current
+        )
+
+    return chunks or [""]
 
 
 # ============================================================
-# NORMALIZATION / IDS
+# TELEGRAM SEND
 # ============================================================
 
-def normalize_for_hash(text: str) -> str:
-    text = clean_html(text).lower()
+async def send_long_message(
+    update,
+    text,
+    query=None,
+    keyboard=None,
+):
 
-    text = re.sub(
-        r"[^\w\u0600-\u06ff\s]",
-        " ",
-        text,
+    chunks = split_text_safely(
+        text
     )
-
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
-
-
-def make_event_id(title: str, url: str = "") -> str:
-    base = (
-        normalize_for_hash(title)
-        + "|"
-        + normalize_for_hash(url)
-    )
-
-    return hashlib.sha256(
-        base.encode("utf-8")
-    ).hexdigest()[:24]
-
-
-# ============================================================
-# CATEGORY
-# ============================================================
-
-def detect_category(title: str, summary: str) -> str:
-    text = f"{title} {summary}".lower()
-
-    scores = {}
-
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        score = 0
-
-        for keyword in keywords:
-            if keyword.lower() in text:
-                score += 1
-
-        scores[category] = score
-
-    best_category = max(
-        scores,
-        key=scores.get,
-    )
-
-    if scores[best_category] == 0:
-        return "general"
-
-    return best_category
-
-
-# ============================================================
-# RSS READER
-# ============================================================
-
-async def fetch_rss_source(
-    session: aiohttp.ClientSession,
-    source: dict,
-) -> List[NewsItem]:
-
-    items = []
 
     try:
-        async with session.get(
-            source["url"],
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "User-Agent": USER_AGENT,
-            },
-        ) as response:
 
-            if response.status != 200:
-                logger.warning(
-                    "RSS failed: %s -> HTTP %s",
-                    source["name"],
-                    response.status,
+        if query:
+
+            await query.edit_message_text(
+                text=chunks[0]
+            )
+
+            if len(chunks) > 1:
+
+                for chunk in chunks[1:-1]:
+
+                    await context_bot_send(
+                        update,
+                        chunk,
+                    )
+
+                await context_bot_send(
+                    update,
+                    chunks[-1],
+                    keyboard,
                 )
-                return []
 
-            content = await response.read()
+            elif keyboard:
 
-        feed = feedparser.parse(content)
-
-        for entry in feed.entries[:MAX_ITEMS_PER_SOURCE]:
-
-            title = clean_title(
-                entry.get("title", "")
-            )
-
-            if not title:
-                continue
-
-            summary = clean_summary(
-                entry.get(
-                    "summary",
-                    entry.get("description", ""),
+                await query.edit_message_reply_markup(
+                    reply_markup=keyboard
                 )
-            )
 
-            url = entry.get(
-                "link",
-                source["url"],
-            )
+        else:
 
-            published_at = parse_datetime(
-                entry.get(
-                    "published",
-                    entry.get(
-                        "updated",
-                        None,
-                    ),
-                )
-            )
+            for index, chunk in enumerate(
+                chunks
+            ):
 
-            category = detect_category(
-                title,
-                summary,
-            )
+                if index == len(chunks) - 1:
 
-            priority = SOURCE_PRIORITY.get(
-                source["type"],
-                50,
-            )
+                    await context_bot_send(
+                        update,
+                        chunk,
+                        keyboard,
+                    )
 
-            event_id = make_event_id(
-                title,
-                url,
-            )
+                else:
 
-            items.append(
-                NewsItem(
-                    title=title,
-                    summary=summary,
-                    source=source["name"],
-                    source_type=source["type"],
-                    country=source["country"],
-                    category=category,
-                    url=url,
-                    published_at=published_at,
-                    priority=priority,
-                    event_id=event_id,
-                )
-            )
+                    await context_bot_send(
+                        update,
+                        chunk,
+                    )
 
     except Exception as exc:
+
         logger.exception(
-            "RSS error: %s: %s",
-            source["name"],
+            "Telegram send error: %s",
             exc,
         )
 
-    return items
 
+async def context_bot_send(
+    update,
+    text,
+    keyboard=None,
+):
 
-# ============================================================
-# SIMPLE HTML PAGE READER
-# ============================================================
-
-def extract_links_from_html(
-    html_text: str,
-    base_url: str,
-    source: dict,
-) -> List[NewsItem]:
-
-    results = []
-
-    # Extract anchor tags.
-    pattern = re.compile(
-        r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
+    await update.get_bot().send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=keyboard,
     )
 
-    matches = pattern.findall(html_text)
 
-    seen_urls = set()
+# ============================================================
+# NEWS COLLECTION
+# ============================================================
 
-    for href, raw_text in matches:
-
-        title = clean_title(
-            clean_html(raw_text)
-        )
-
-        if not title:
-            continue
-
-        # Ignore tiny navigation labels.
-        if len(title) < 25:
-            continue
-
-        # Ignore huge blocks of text.
-        if len(title) > 300:
-            continue
-
-        url = urljoin(
-            base_url,
-            html.unescape(href).strip(),
-        )
-
-        if url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-
-        # Keep links that look like actual articles.
-        lowered = url.lower()
-
-        looks_like_article = any(
-            token in lowered
-            for token in [
-                "/news/",
-                "/statement",
-                "/statements/",
-                "/mediahub/",
-                "/latest",
-                "/details/",
-                "/press",
-                "/article",
-            ]
-        )
-
-        if not looks_like_article:
-            continue
-
-        category = source.get(
-            "category"
-        ) or detect_category(
-            title,
-            "",
-        )
-
-        priority = SOURCE_PRIORITY.get(
-            source["type"],
-            50,
-        )
-
-        results.append(
-            NewsItem(
-                title=title,
-                summary="",
-                source=source["name"],
-                source_type=source["type"],
-                country=source["country"],
-                category=category,
-                url=url,
-                published_at=None,
-                priority=priority,
-                event_id=make_event_id(
-                    title,
-                    url,
-                ),
-            )
-        )
-
-        if len(results) >= MAX_ITEMS_PER_SOURCE:
-            break
-
-    return results
-
-
-async def fetch_html_source(
-    session: aiohttp.ClientSession,
-    source: dict,
-) -> List[NewsItem]:
+async def get_fresh_news(
+    max_items=100,
+):
 
     try:
-        async with session.get(
-            source["url"],
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": (
-                    "text/html,application/xhtml+xml,"
-                    "application/xml;q=0.9,*/*;q=0.8"
-                ),
-            },
-        ) as response:
 
-            if response.status != 200:
-                logger.warning(
-                    "HTML failed: %s -> HTTP %s",
-                    source["name"],
-                    response.status,
-                )
-                return []
-
-            content_type = response.headers.get(
-                "Content-Type",
-                "",
-            ).lower()
-
-            if "html" not in content_type:
-                logger.warning(
-                    "Not HTML: %s -> %s",
-                    source["name"],
-                    content_type,
-                )
-
-            text = await response.text(
-                errors="ignore"
-            )
-
-        return extract_links_from_html(
-            text,
-            source["url"],
-            source,
+        logger.info(
+            "Starting fresh news collection..."
         )
 
+        items = await collect_news(
+            max_items=max_items
+        )
+
+        logger.info(
+            "Fresh news collected: %s",
+            len(items),
+        )
+
+        return items
+
     except Exception as exc:
+
         logger.exception(
-            "HTML error: %s: %s",
-            source["name"],
+            "News collection failed: %s",
             exc,
         )
 
@@ -709,444 +359,649 @@ async def fetch_html_source(
 
 
 # ============================================================
-# DEDUPLICATION
+# GEMINI ANALYSIS
 # ============================================================
 
-def similarity_key(title: str) -> set:
-    normalized = normalize_for_hash(title)
+async def ask_gemini(
+    prompt,
+):
 
-    words = normalized.split()
-
-    # Remove very short words.
-    words = [
-        word
-        for word in words
-        if len(word) >= 3
-    ]
-
-    return set(words)
-
-
-def title_similarity(
-    first: str,
-    second: str,
-) -> float:
-
-    a = similarity_key(first)
-    b = similarity_key(second)
-
-    if not a or not b:
-        return 0.0
-
-    intersection = len(a & b)
-    union = len(a | b)
-
-    if union == 0:
-        return 0.0
-
-    return intersection / union
-
-
-def deduplicate_news(
-    items: List[NewsItem],
-) -> List[NewsItem]:
-
-    # Highest priority first.
-    items = sorted(
-        items,
-        key=lambda item: (
-            item.priority,
-            item.published_at.timestamp()
-            if item.published_at
-            else 0,
+    response = await asyncio.to_thread(
+        ai_client.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(
+                thinking_level="low"
+            )
         ),
-        reverse=True,
     )
 
-    result = []
-    seen_ids = set()
+    return (
+        response.text
+        if response and response.text
+        else "لم يُرجع نموذج الذكاء الاصطناعي إجابة."
+    )
 
-    for item in items:
 
-        if item.event_id in seen_ids:
-            continue
+# ============================================================
+# GENERATE REPORT
+# ============================================================
 
-        duplicate = False
+async def generate_report(
+    news_items,
+    report_type="normal",
+):
 
-        for existing in result:
+    context = build_ai_context(
+        news_items,
+        max_items=MAX_NEWS_FOR_AI,
+    )
 
-            similarity = title_similarity(
-                item.title,
-                existing.title,
+    if report_type == "compare":
+
+        prompt = f"""
+أنت محلل سياسي واقتصادي محترف.
+
+لديك الآن بيانات أخبار حديثة جمعت من مصادر
+متعددة.
+
+حلل البيانات التالية فقط.
+
+المطلوب:
+
+1. تحديد أهم الأحداث.
+2. مقارنة الروايات بين المصادر.
+3. تحديد الحقائق المشتركة.
+4. تحديد الاختلافات في التغطية.
+5. إبراز البيانات الرسمية.
+6. التمييز بوضوح بين:
+   - بيان رسمي
+   - تقرير وكالة أنباء
+   - تقرير قناة أو موقع إخباري
+   - استنتاج تحليلي
+7. لا تخترع أي معلومة.
+8. لا تعتبر غياب الخبر دليلاً على عدم حدوثه.
+9. إذا كانت البيانات غير كافية، قل ذلك صراحة.
+10. ركز على الأخبار الحديثة والمهمة فقط.
+
+مصادر الأخبار:
+
+----------------
+{context}
+----------------
+
+اكتب بالعربية.
+
+ابدأ بملخص تنفيذي قصير، ثم:
+- أبرز التطورات
+- المواقف الرسمية
+- مقارنة التغطية
+- ما هو مؤكد
+- ما هو غير مؤكد
+- قراءة تحليلية مختصرة
+
+لا تكرر الأخبار المتشابهة.
+"""
+
+    else:
+
+        prompt = f"""
+أنت محلل سياسي واقتصادي محترف.
+
+حلل الأخبار الحديثة التالية.
+
+القواعد الصارمة:
+
+- اعتمد فقط على البيانات الموجودة.
+- لا تختلق أسماء أو تصريحات أو أرقاماً.
+- نسب كل معلومة إلى مصدرها.
+- أعط الأولوية للبيانات الرسمية.
+- افصل الخبر المؤكد عن التحليل.
+- إذا كان الخبر من وكالة أو قناة، اذكر أنه تقرير إعلامي.
+- لا تكرر نفس الحدث عدة مرات.
+- تجاهل الحشو.
+- ركز على ما حدث ومتى ومن قال ماذا.
+- إذا لم توجد معلومات كافية، قل ذلك بوضوح.
+
+الأخبار:
+
+----------------
+{context}
+----------------
+
+اكتب تقريراً عربياً مختصراً ومنظماً:
+
+1. أهم المستجدات
+2. المواقف الرسمية
+3. الأطراف المعنية
+4. الحقائق المؤكدة
+5. ما يحتاج إلى تأكيد
+6. الدلالة المحتملة
+
+لا تضف معلومات من خارج البيانات.
+"""
+
+    return await ask_gemini(
+        prompt
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "مرحباً بك في نظام الرصد الإخباري المباشر.\n\n"
+        "المحرك يجلب الأخبار الحديثة من المصادر "
+        "المتاحة ثم يفرزها ويزيل التكرار قبل التحليل.\n\n"
+        "اختر ملفاً أو اكتب سؤالك مباشرة.",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+# ============================================================
+# /RESET
+# ============================================================
+
+async def reset(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "تمت إعادة ضبط جلسة الرصد والمحادثة."
+    )
+
+
+# ============================================================
+# BUTTON HANDLER
+# ============================================================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    data = query.data
+
+    # --------------------------------------------------------
+    # BACK
+    # --------------------------------------------------------
+
+    if data == "back_to_menu":
+
+        await query.edit_message_text(
+            text=(
+                "اختر أحد الملفات أو اكتب سؤالك "
+                "مباشرة:"
+            ),
+            reply_markup=get_main_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # LOADING
+    # --------------------------------------------------------
+
+    await query.edit_message_text(
+        text=(
+            "📡 جاري جمع الأخبار الحديثة...\n\n"
+            "• فحص المصادر\n"
+            "• إزالة التكرار\n"
+            "• ترتيب الأخبار حسب الأهمية\n"
+            "• تجهيز البيانات للتحليل"
+        )
+    )
+
+    # --------------------------------------------------------
+    # FRESH NEWS
+    # --------------------------------------------------------
+
+    fresh_items = await get_fresh_news(
+        max_items=100
+    )
+
+    if not fresh_items:
+
+        await query.edit_message_text(
+            text=(
+                "تعذر الحصول على أخبار من المصادر "
+                "حالياً.\n\n"
+                "قد يكون أحد المصادر متوقفاً أو "
+                "محجوباً مؤقتاً."
+            ),
+            reply_markup=get_back_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SELECT TOPIC
+    # --------------------------------------------------------
+
+    if data.startswith("topic_"):
+
+        keywords = data.replace(
+            "topic_",
+            "",
+            1,
+        )
+
+        selected_items = search_news(
+            fresh_items,
+            keywords,
+            limit=MAX_SEARCH_RESULTS,
+        )
+
+        # إذا لم يجد البحث نتائج قوية،
+        # نستخدم أحدث الأخبار كاحتياط.
+        if len(selected_items) < 3:
+
+            selected_items = fresh_items[
+                :MAX_SEARCH_RESULTS
+            ]
+
+        report_type = "normal"
+
+    elif data == "compare_all":
+
+        selected_items = fresh_items[
+            :MAX_SEARCH_RESULTS
+        ]
+
+        report_type = "compare"
+
+    else:
+
+        return
+
+    # --------------------------------------------------------
+    # SHOW STATUS
+    # --------------------------------------------------------
+
+    try:
+
+        await query.edit_message_text(
+            text=(
+                f"🧠 تم العثور على "
+                f"{len(selected_items)} خبراً مناسباً.\n\n"
+                "جاري تحليلها ومقارنة المصادر..."
             )
-
-            if similarity >= 0.72:
-                duplicate = True
-                break
-
-        if duplicate:
-            continue
-
-        seen_ids.add(item.event_id)
-        result.append(item)
-
-    return result
-
-
-# ============================================================
-# IMPORTANCE
-# ============================================================
-
-def calculate_importance(
-    item: NewsItem,
-) -> int:
-
-    score = item.priority
-
-    text = (
-        item.title
-        + " "
-        + item.summary
-    ).lower()
-
-    # Breaking event.
-    for keyword in BREAKING_KEYWORDS:
-        if keyword.lower() in text:
-            score += 25
-            break
-
-    # Recent article.
-    if item.published_at:
-
-        age_hours = (
-            datetime.now(timezone.utc)
-            - item.published_at
-        ).total_seconds() / 3600
-
-        if age_hours <= 1:
-            score += 25
-
-        elif age_hours <= 6:
-            score += 18
-
-        elif age_hours <= 24:
-            score += 10
-
-        elif age_hours <= 72:
-            score += 3
-
-    return score
-
-
-def sort_news(
-    items: List[NewsItem],
-) -> List[NewsItem]:
-
-    return sorted(
-        items,
-        key=lambda item: (
-            calculate_importance(item),
-            item.published_at.timestamp()
-            if item.published_at
-            else 0,
-        ),
-        reverse=True,
-    )
-
-
-# ============================================================
-# COLLECT ALL NEWS
-# ============================================================
-
-async def collect_news(
-    max_items: int = MAX_NEWS_ITEMS,
-) -> List[NewsItem]:
-
-    timeout = aiohttp.ClientTimeout(
-        total=REQUEST_TIMEOUT
-    )
-
-    connector = aiohttp.TCPConnector(
-        limit=15,
-        ssl=False,
-    )
-
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-    ) as session:
-
-        tasks = []
-
-        for source in RSS_SOURCES:
-            tasks.append(
-                fetch_rss_source(
-                    session,
-                    source,
-                )
-            )
-
-        for source in HTML_SOURCES:
-            tasks.append(
-                fetch_html_source(
-                    session,
-                    source,
-                )
-            )
-
-        results = await asyncio.gather(
-            *tasks,
-            return_exceptions=True,
         )
 
-    all_items = []
+    except Exception:
 
-    for result in results:
+        pass
 
-        if isinstance(result, Exception):
-            logger.error(
-                "Collector task failed: %s",
-                result,
-            )
-            continue
+    # --------------------------------------------------------
+    # AI
+    # --------------------------------------------------------
 
-        all_items.extend(result)
+    try:
 
-    logger.info(
-        "Collected raw items: %s",
-        len(all_items),
+        reply_text = await generate_report(
+            selected_items,
+            report_type,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Gemini report error: %s",
+            exc,
+        )
+
+        reply_text = (
+            "حدث خطأ أثناء تحليل الأخبار بواسطة Gemini.\n\n"
+            f"التفاصيل التقنية:\n{str(exc)}"
+        )
+
+    # --------------------------------------------------------
+    # SAVE SESSION
+    # --------------------------------------------------------
+
+    context.user_data["current_report"] = (
+        reply_text
     )
 
-    all_items = deduplicate_news(
-        all_items
+    context.user_data["latest_news"] = (
+        selected_items
     )
 
-    all_items = sort_news(
-        all_items
+    context.user_data["chat_history"] = []
+
+    context.user_data["last_topic"] = data
+
+    # --------------------------------------------------------
+    # SEND
+    # --------------------------------------------------------
+
+    await send_long_message(
+        update,
+        reply_text,
+        query=query,
+        keyboard=get_back_keyboard(),
     )
 
-    all_items = all_items[:max_items]
 
-    logger.info(
-        "Final news items: %s",
-        len(all_items),
+# ============================================================
+# DIRECT USER QUESTION
+# ============================================================
+
+async def handle_user_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user_text = (
+        update.message.text.strip()
+        if update.message
+        else ""
     )
 
-    return all_items
+    if not user_text:
 
+        return
 
-# ============================================================
-# SEARCH NEWS
-# ============================================================
+    # --------------------------------------------------------
+    # THINKING MESSAGE
+    # --------------------------------------------------------
 
-def search_news(
-    items: List[NewsItem],
-    query: str,
-    limit: int = 15,
-) -> List[NewsItem]:
-
-    query_words = similarity_key(query)
-
-    if not query_words:
-        return items[:limit]
-
-    scored = []
-
-    for item in items:
-
-        title_words = similarity_key(
-            item.title
-        )
-
-        summary_words = similarity_key(
-            item.summary
-        )
-
-        title_matches = len(
-            query_words & title_words
-        )
-
-        summary_matches = len(
-            query_words & summary_words
-        )
-
-        score = (
-            title_matches * 5
-            + summary_matches * 2
-            + item.priority / 100
-        )
-
-        if score > 1:
-            scored.append(
-                (
-                    score,
-                    calculate_importance(item),
-                    item,
-                )
-            )
-
-    scored.sort(
-        key=lambda x: (
-            x[0],
-            x[1],
-        ),
-        reverse=True,
+    thinking_message = await update.message.reply_text(
+        "📡 جاري فحص الأخبار الحديثة ثم تحليل سؤالك..."
     )
 
-    return [
-        item
-        for _, _, item in scored[:limit]
-    ]
+    # --------------------------------------------------------
+    # ALWAYS GET FRESH NEWS
+    # --------------------------------------------------------
 
+    fresh_items = await get_fresh_news(
+        max_items=100
+    )
 
-# ============================================================
-# AI CONTEXT
-# ============================================================
+    # --------------------------------------------------------
+    # SEARCH CURRENT NEWS
+    # --------------------------------------------------------
 
-def build_ai_context(
-    items: List[NewsItem],
-    max_items: int = 20,
-) -> str:
+    matching_items = search_news(
+        fresh_items,
+        user_text,
+        limit=MAX_SEARCH_RESULTS,
+    )
 
-    selected = sort_news(
-        items
-    )[:max_items]
+    # --------------------------------------------------------
+    # PREVIOUS REPORT
+    # --------------------------------------------------------
 
-    if not selected:
-        return "لا توجد أخبار متاحة حاليًا."
-
-    lines = []
-
-    for index, item in enumerate(
-        selected,
-        start=1,
-    ):
-
-        date_text = ""
-
-        if item.published_at:
-            date_text = (
-                item.published_at
-                .astimezone()
-                .strftime("%Y-%m-%d %H:%M")
-            )
-
-        lines.append(
-            f"""
-[{index}]
-العنوان: {item.title}
-المصدر: {item.source}
-نوع المصدر: {item.source_type}
-الدولة: {item.country}
-التصنيف: {item.category}
-الوقت: {date_text}
-الرابط: {item.url}
-الملخص: {item.summary}
-""".strip()
-        )
-
-    return "\n\n".join(lines)
-
-
-# ============================================================
-# COMPACT TELEGRAM NEWS FORMAT
-# ============================================================
-
-def format_news_for_telegram(
-    items: List[NewsItem],
-    limit: int = 10,
-) -> str:
-
-    selected = sort_news(
-        items
-    )[:limit]
-
-    if not selected:
-        return "لا توجد أخبار متاحة حاليًا."
-
-    lines = [
-        "📰 آخر الأخبار",
+    current_report = context.user_data.get(
+        "current_report",
         "",
+    )
+
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
+
+    history = context.user_data.setdefault(
+        "chat_history",
+        [],
+    )
+
+    recent_history = history[
+        -MAX_HISTORY:
     ]
 
-    for item in selected:
+    conversation_text = ""
 
-        category_map = {
-            "security": "أمن",
-            "energy": "طاقة",
-            "economy": "اقتصاد",
-            "politics": "سياسة",
-            "foreign_affairs": "خارجية",
-            "general": "عام",
-        }
+    for item in recent_history:
 
-        category = category_map.get(
-            item.category,
-            "عام",
+        conversation_text += (
+            f"\nالمستخدم: {item['user']}\n"
+            f"المحلل: {item['assistant']}\n"
         )
 
-        lines.append(
-            f"• [{category}] {item.title}"
+    # --------------------------------------------------------
+    # BUILD CURRENT NEWS CONTEXT
+    # --------------------------------------------------------
+
+    if matching_items:
+
+        news_context = build_ai_context(
+            matching_items,
+            max_items=MAX_SEARCH_RESULTS,
         )
 
-        lines.append(
-            f"  المصدر: {item.source}"
+    elif fresh_items:
+
+        # لا يوجد تطابق قوي،
+        # لكن لا نعود للتقرير القديم وحده.
+        news_context = build_ai_context(
+            fresh_items,
+            max_items=12,
         )
 
-        if item.url:
-            lines.append(
-                f"  {item.url}"
-            )
+    else:
 
-        lines.append("")
+        news_context = (
+            "لم يتم الحصول على أخبار حديثة "
+            "من المصادر الحالية."
+        )
 
-    return "\n".join(lines).strip()
+    # --------------------------------------------------------
+    # AI PROMPT
+    # --------------------------------------------------------
+
+    prompt = f"""
+أنت مساعد رصد إخباري وتحليل سياسي واقتصادي.
+
+السؤال الحالي للمستخدم:
+
+{user_text}
+
+========================
+الأخبار الحديثة التي جرى جمعها الآن
+========================
+
+{news_context}
+
+========================
+التقرير السابق - إن وجد
+========================
+
+{current_report if current_report else "لا يوجد تقرير سابق."}
+
+========================
+المحادثة السابقة
+========================
+
+{conversation_text if conversation_text else "لا توجد محادثة سابقة."}
+
+========================
+قواعد الإجابة
+========================
+
+1. السؤال الحالي هو الأولوية.
+2. استخدم الأخبار الحديثة التي جُمعت الآن قبل التقرير السابق.
+3. لا تجعل التقرير السابق مصدراً وحيداً للمعلومة.
+4. إذا كان السؤال عن حدث جديد، أجب من الأخبار الحالية.
+5. إذا كان السؤال لا علاقة له بالتقرير السابق، لا تجبر الإجابة على استخدامه.
+6. إذا كان السؤال عن تصريح أو موقف رسمي:
+   - اذكر الجهة.
+   - اذكر المصدر.
+   - وضح أنه موقف رسمي إذا كان كذلك.
+7. إذا كان المصدر وكالة أنباء أو قناة:
+   - انسب المعلومة للمصدر.
+   - لا تقدمها كحقيقة رسمية إلا إذا كان هناك مصدر رسمي.
+8. لا تخترع أي معلومة.
+9. لا تملأ الفراغ بتخمين.
+10. إذا لم نجد معلومات كافية، قل:
+   "لم أجد في المصادر التي تم فحصها معلومات كافية للإجابة بدقة."
+11. إذا قدمت استنتاجاً، ضع بوضوح:
+   "استنتاج تحليلي:"
+12. لا تعيد التقرير السابق كاملاً.
+13. لا تكرر نفس الخبر.
+14. أجب بالعربية.
+15. كن مباشراً ومختصراً قدر الإمكان.
+
+أجب الآن عن سؤال المستخدم.
+"""
+
+    # --------------------------------------------------------
+    # GEMINI
+    # --------------------------------------------------------
+
+    try:
+
+        reply_text = await ask_gemini(
+            prompt
+        )
+
+        # Save history
+        history.append({
+            "user": user_text,
+            "assistant": reply_text,
+        })
+
+        context.user_data["chat_history"] = (
+            history[-MAX_HISTORY:]
+        )
+
+        # Keep latest fresh news in session
+        context.user_data["latest_news"] = (
+            matching_items
+            if matching_items
+            else fresh_items[:12]
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Gemini conversation error: %s",
+            exc,
+        )
+
+        reply_text = (
+            "حدث خطأ أثناء معالجة السؤال.\n\n"
+            f"التفاصيل التقنية:\n{str(exc)}"
+        )
+
+    # --------------------------------------------------------
+    # DELETE THINKING MESSAGE
+    # --------------------------------------------------------
+
+    try:
+
+        await thinking_message.delete()
+
+    except Exception:
+
+        pass
+
+    # --------------------------------------------------------
+    # SEND ANSWER
+    # --------------------------------------------------------
+
+    await send_long_message(
+        update,
+        reply_text,
+        keyboard=get_back_keyboard(),
+    )
 
 
 # ============================================================
-# TEST
+# ERROR HANDLER
 # ============================================================
 
-async def test():
+async def error_handler(
+    update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    print("=" * 60)
-    print("LIVE NEWS ENGINE TEST")
-    print("=" * 60)
-
-    items = await collect_news(
-        max_items=30
+    logger.error(
+        "Unhandled exception",
+        exc_info=context.error,
     )
 
-    print(
-        f"\nCollected: {len(items)} items\n"
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def main():
+
+    logger.info(
+        "Starting Live News Intelligence Bot..."
     )
 
-    for index, item in enumerate(
-        items[:20],
-        start=1,
-    ):
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
 
-        print(
-            f"{index}. "
-            f"[{item.source}] "
-            f"{item.title}"
+    # Commands
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start,
         )
+    )
 
-        print(
-            f"   Category: {item.category}"
+    app.add_handler(
+        CommandHandler(
+            "reset",
+            reset,
         )
+    )
 
-        print(
-            f"   Priority: "
-            f"{calculate_importance(item)}"
+    # Buttons
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler,
+            pattern=r"^(topic_|compare_all|back_to_menu)",
         )
+    )
 
-        print(
-            f"   URL: {item.url}"
+    # Direct questions
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_user_message,
         )
+    )
 
-        print("-" * 60)
+    # Errors
+    app.add_error_handler(
+        error_handler
+    )
 
+    logger.info(
+        "Live News Intelligence Bot is running."
+    )
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    main()

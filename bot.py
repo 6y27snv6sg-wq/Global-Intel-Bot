@@ -11,6 +11,8 @@ from telegram.ext import (
     ContextTypes,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 from google import genai
@@ -79,13 +81,19 @@ GLOBAL_FEEDS = {
 # جلب مصدر واحد
 # ============================================================
 
-async def fetch_single_feed(session, source_name, url, keywords_list):
+async def fetch_single_feed(
+    session,
+    source_name,
+    url,
+    keywords_list,
+):
 
     headers = {
         "User-Agent": "Mozilla/5.0"
     }
 
     try:
+
         async with session.get(
             url,
             headers=headers,
@@ -93,11 +101,13 @@ async def fetch_single_feed(session, source_name, url, keywords_list):
         ) as response:
 
             if response.status != 200:
+
                 logger.warning(
                     "Feed %s returned HTTP %s",
                     source_name,
                     response.status,
                 )
+
                 return ""
 
             content = await response.text()
@@ -108,10 +118,19 @@ async def fetch_single_feed(session, source_name, url, keywords_list):
 
             for entry in feed.entries[:6]:
 
-                title = entry.get("title", "").strip()
-                summary = entry.get("summary", "").strip()
+                title = entry.get(
+                    "title",
+                    "",
+                ).strip()
 
-                full_text = f"{title} {summary}".lower()
+                summary = entry.get(
+                    "summary",
+                    "",
+                ).strip()
+
+                full_text = (
+                    f"{title} {summary}"
+                ).lower()
 
                 if any(
                     word.lower() in full_text
@@ -128,15 +147,22 @@ async def fetch_single_feed(session, source_name, url, keywords_list):
             return "".join(extracted)
 
     except asyncio.TimeoutError:
-        logger.warning("Timeout while fetching %s", source_name)
+
+        logger.warning(
+            "Timeout while fetching %s",
+            source_name,
+        )
+
         return ""
 
     except Exception as e:
+
         logger.error(
             "Error fetching %s: %s",
             source_name,
             e,
         )
+
         return ""
 
 
@@ -178,8 +204,8 @@ async def fetch_all_news(keywords):
         return collected_text
 
     return (
-        "لم يتم العثور على تغطية مباشرة بالكلمات المفتاحية "
-        "المطلوبة في النشرات المتاحة."
+        "لم يتم العثور على تغطية مباشرة "
+        "بالكلمات المفتاحية المطلوبة."
     )
 
 
@@ -230,7 +256,10 @@ def get_main_keyboard():
 # تقسيم الرسائل الطويلة
 # ============================================================
 
-def split_text_safely(text, max_length=3900):
+def split_text_safely(
+    text,
+    max_length=3900,
+):
 
     if not text:
         return [""]
@@ -250,6 +279,7 @@ def split_text_safely(text, max_length=3900):
         )
 
         if len(candidate) <= max_length:
+
             current = candidate
             continue
 
@@ -257,10 +287,8 @@ def split_text_safely(text, max_length=3900):
             chunks.append(current)
             current = ""
 
-        # إذا كان السطر نفسه طويلًا جدًا
         while len(paragraph) > max_length:
 
-            # حاول القطع عند مسافة
             cut = paragraph.rfind(
                 " ",
                 0,
@@ -285,7 +313,7 @@ def split_text_safely(text, max_length=3900):
 
 
 # ============================================================
-# إرسال الرسائل
+# إرسال رسالة طويلة
 # ============================================================
 
 async def send_long_message(
@@ -301,12 +329,10 @@ async def send_long_message(
 
         if query:
 
-            # أول جزء يحل محل رسالة التحميل
             await query.edit_message_text(
                 text=chunks[0]
             )
 
-            # باقي الأجزاء
             for chunk in chunks[1:-1]:
 
                 await context_bot_send(
@@ -314,7 +340,6 @@ async def send_long_message(
                     chunk,
                 )
 
-            # لوحة التحكم على آخر جزء
             if len(chunks) > 1:
 
                 await context_bot_send(
@@ -323,32 +348,26 @@ async def send_long_message(
                     keyboard,
                 )
 
-            else:
+            elif keyboard:
 
-                if keyboard:
-
-                    try:
-                        await query.edit_message_reply_markup(
-                            reply_markup=keyboard
-                        )
-                    except Exception:
-                        await context_bot_send(
-                            update,
-                            chunks[0],
-                            keyboard,
-                        )
+                await query.edit_message_reply_markup(
+                    reply_markup=keyboard
+                )
 
         else:
 
             for index, chunk in enumerate(chunks):
 
                 if index == len(chunks) - 1:
+
                     await context_bot_send(
                         update,
                         chunk,
                         keyboard,
                     )
+
                 else:
+
                     await context_bot_send(
                         update,
                         chunk,
@@ -368,10 +387,8 @@ async def context_bot_send(
     keyboard=None,
 ):
 
-    chat_id = update.effective_chat.id
-
     await update.get_bot().send_message(
-        chat_id=chat_id,
+        chat_id=update.effective_chat.id,
         text=text,
         reply_markup=keyboard,
     )
@@ -385,6 +402,9 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
+    # تنظيف السياق عند بدء جلسة جديدة
+    context.user_data.clear()
 
     await update.message.reply_text(
         "مرحباً بك في نظام موجز الأحداث الدولية "
@@ -403,8 +423,93 @@ async def reset(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    context.user_data.clear()
+
     await update.message.reply_text(
-        "تمت إعادة ضبط الجلسة."
+        "تمت إعادة ضبط سياق المحادثة."
+    )
+
+
+# ============================================================
+# إنشاء تقرير
+# ============================================================
+
+async def generate_report(
+    raw_news,
+    report_type,
+):
+
+    if report_type == "normal":
+
+        prompt = f"""
+أنت محلل استخباري سياسي واقتصادي محترف.
+
+حلل الأخبار التالية الصادرة من مصادر عربية
+ودولية.
+
+المطلوب:
+
+1. تلخيص أهم المستجدات.
+2. تحديد الأطراف المعنية.
+3. توضيح المواقف الرسمية.
+4. التمييز بين الخبر المؤكد والتحليل.
+5. عدم اختلاق أي معلومات.
+6. إذا كانت البيانات غير كافية، وضح ذلك.
+
+الأخبار الخام:
+
+{raw_news}
+
+اكتب التقرير باللغة العربية بأسلوب مهني
+ومركز ومنظم بعناوين واضحة.
+"""
+
+    else:
+
+        prompt = f"""
+أنت محلل استخباري رفيع المستوى.
+
+أعد تقريراً بعنوان:
+
+تحليل مقارنة الروايات الإعلامية
+
+اعتمد فقط على الأخبار الموجودة أدناه.
+
+قارن بين تناول المصادر العربية
+والغربية والروسية والصينية.
+
+وضح:
+
+- نقاط الاتفاق.
+- نقاط الاختلاف.
+- اختلاف صياغة الأحداث.
+- المواقف الرسمية.
+- الحقائق المشتركة.
+- الروايات والتفسيرات المختلفة.
+- المعلومات غير المؤكدة.
+
+لا تخترع معلومات غير موجودة.
+
+الأخبار الخام:
+
+{raw_news}
+
+اكتب التقرير باللغة العربية
+بشكل مهني ومنظم.
+"""
+
+    response = await asyncio.to_thread(
+        ai_client.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+        ),
+    )
+
+    return response.text or (
+        "لم يُرجع نموذج الذكاء الاصطناعي "
+        "نصاً صالحاً."
     )
 
 
@@ -423,6 +528,10 @@ async def button_handler(
 
     data = query.data
 
+    # --------------------------------------------------------
+    # العودة للقائمة
+    # --------------------------------------------------------
+
     if data == "back_to_menu":
 
         await query.edit_message_text(
@@ -432,13 +541,17 @@ async def button_handler(
 
         return
 
+    # --------------------------------------------------------
+    # حالة التحميل
+    # --------------------------------------------------------
+
     await query.edit_message_text(
         text="📡 جاري مسح الشبكة الرصدية "
              "وسحب الأخبار بالتوازي..."
     )
 
     # --------------------------------------------------------
-    # تحديد التقرير
+    # الأخبار
     # --------------------------------------------------------
 
     if data.startswith("topic_"):
@@ -453,28 +566,7 @@ async def button_handler(
             keywords
         )
 
-        prompt = f"""
-أنت محلل استخباري سياسي واقتصادي محترف.
-
-حلل الأخبار التالية الصادرة من مصادر عربية
-ودولية.
-
-المطلوب:
-
-1. تلخيص أهم المستجدات.
-2. تحديد الأطراف المعنية.
-3. توضيح المواقف الرسمية.
-4. التمييز بين الخبر المؤكد والتحليل.
-5. تجنب اختلاق أي معلومات غير موجودة في البيانات.
-6. إذا كانت البيانات غير كافية، صرّح بذلك بوضوح.
-
-الأخبار الخام:
-
-{raw_news}
-
-اكتب التقرير باللغة العربية بأسلوب مهني
-ومركز ومنظم بعناوين واضحة.
-"""
+        report_type = "normal"
 
     elif data == "compare_all":
 
@@ -482,37 +574,7 @@ async def button_handler(
             "أزمة حرب اتفاق تصريح عقوبات"
         )
 
-        prompt = f"""
-أنت محلل استخباري رفيع المستوى.
-
-أعد تقريراً بعنوان:
-
-"تحليل مقارنة الروايات الإعلامية"
-
-اعتمد فقط على الأخبار الموجودة أدناه.
-
-قارن بين تناول المصادر العربية
-والغربية والروسية والصينية.
-
-وضح:
-
-- نقاط الاتفاق.
-- نقاط الاختلاف.
-- اختلاف صياغة الأحداث.
-- المواقف الرسمية.
-- ما يمكن اعتباره حقيقة مشتركة.
-- ما يمثل رواية أو تفسيراً من طرف معين.
-- الثغرات أو المعلومات غير المؤكدة.
-
-لا تخترع معلومات غير موجودة في البيانات.
-
-الأخبار الخام:
-
-{raw_news}
-
-اكتب التقرير باللغة العربية
-بشكل مهني ومنظم.
-"""
+        report_type = "compare"
 
     else:
         return
@@ -523,22 +585,10 @@ async def button_handler(
 
     try:
 
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-            ),
+        reply_text = await generate_report(
+            raw_news,
+            report_type,
         )
-
-        reply_text = response.text
-
-        if not reply_text:
-            reply_text = (
-                "لم يُرجع نموذج الذكاء الاصطناعي "
-                "نصاً صالحاً."
-            )
 
     except Exception as e:
 
@@ -547,10 +597,20 @@ async def button_handler(
         )
 
         reply_text = (
-            "عذراً، حدث خطأ أثناء تحليل البيانات "
-            "بواسطة Gemini.\n\n"
+            "عذراً، حدث خطأ أثناء تحليل "
+            "البيانات بواسطة Gemini.\n\n"
             f"تفاصيل الخطأ:\n{str(e)}"
         )
+
+    # --------------------------------------------------------
+    # حفظ التقرير في ذاكرة الجلسة
+    # --------------------------------------------------------
+
+    context.user_data["current_report"] = reply_text
+
+    context.user_data["chat_history"] = []
+
+    context.user_data["last_topic"] = data
 
     # --------------------------------------------------------
     # زر العودة
@@ -574,11 +634,186 @@ async def button_handler(
 
 
 # ============================================================
-# أخطاء التطبيق
+# المحادثة المباشرة
+# ============================================================
+
+async def handle_user_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user_text = (
+        update.message.text.strip()
+        if update.message
+        else ""
+    )
+
+    if not user_text:
+        return
+
+    # --------------------------------------------------------
+    # هل يوجد تقرير سابق؟
+    # --------------------------------------------------------
+
+    current_report = context.user_data.get(
+        "current_report"
+    )
+
+    if not current_report:
+
+        await update.message.reply_text(
+            "استخدم أحد الملفات الاستراتيجية أولاً، "
+            "ثم اكتب سؤالك وسأكمل معك التحليل."
+            ,
+            reply_markup=get_main_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # إظهار حالة التفكير
+    # --------------------------------------------------------
+
+    thinking_message = await update.message.reply_text(
+        "🧠 جاري تحليل سؤالك..."
+    )
+
+    # --------------------------------------------------------
+    # تاريخ المحادثة
+    # --------------------------------------------------------
+
+    history = context.user_data.setdefault(
+        "chat_history",
+        [],
+    )
+
+    # نحتفظ بآخر 6 رسائل فقط
+    recent_history = history[-6:]
+
+    conversation_text = ""
+
+    for item in recent_history:
+
+        conversation_text += (
+            f"\nالمستخدم: {item['user']}\n"
+            f"المحلل: {item['assistant']}\n"
+        )
+
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
+
+    prompt = f"""
+أنت محلل استخباري سياسي واقتصادي.
+
+أنت الآن في محادثة متابعة مع المستخدم.
+
+التقرير الأساسي الذي تم إنشاؤه سابقاً:
+
+---------------- REPORT ----------------
+
+{current_report}
+
+-------------- END REPORT --------------
+
+سجل المحادثة السابقة:
+
+{conversation_text}
+
+سؤال المستخدم الحالي:
+
+{user_text}
+
+المطلوب:
+
+- أجب مباشرة عن سؤال المستخدم.
+- استخدم التقرير السابق كسياق أساسي.
+- لا تعيد التقرير كاملاً إلا إذا طلب المستخدم ذلك.
+- إذا كان السؤال يحتاج استنتاجاً، وضح أنه استنتاج.
+- لا تختلق حقائق غير موجودة في التقرير.
+- إذا كانت المعلومة غير موجودة، قل بوضوح إنها غير متوفرة في البيانات الحالية.
+- اجعل الإجابة باللغة العربية.
+"""
+
+    # --------------------------------------------------------
+    # Gemini
+    # --------------------------------------------------------
+
+    try:
+
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+            ),
+        )
+
+        reply_text = response.text or (
+            "لم يتم الحصول على إجابة."
+        )
+
+        # حفظ المحادثة
+        history.append({
+            "user": user_text,
+            "assistant": reply_text,
+        })
+
+        # الاحتفاظ بآخر 6 تبادلات
+        context.user_data["chat_history"] = (
+            history[-6:]
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Gemini conversation error"
+        )
+
+        reply_text = (
+            "حدث خطأ أثناء معالجة سؤالك.\n\n"
+            f"{str(e)}"
+        )
+
+    # --------------------------------------------------------
+    # حذف رسالة التفكير
+    # --------------------------------------------------------
+
+    try:
+
+        await thinking_message.delete()
+
+    except Exception:
+
+        pass
+
+    # --------------------------------------------------------
+    # إرسال الإجابة
+    # --------------------------------------------------------
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 العودة للقائمة الرئيسية",
+                callback_data="back_to_menu",
+            )
+        ]
+    ])
+
+    await send_long_message(
+        update,
+        reply_text,
+        keyboard=keyboard,
+    )
+
+
+# ============================================================
+# معالج الأخطاء
 # ============================================================
 
 async def error_handler(
-    update: object,
+    update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
@@ -589,7 +824,7 @@ async def error_handler(
 
 
 # ============================================================
-# تشغيل البوت
+# التشغيل
 # ============================================================
 
 def main():
@@ -600,6 +835,7 @@ def main():
         .build()
     )
 
+    # الأوامر
     app.add_handler(
         CommandHandler(
             "start",
@@ -614,6 +850,7 @@ def main():
         )
     )
 
+    # الأزرار
     app.add_handler(
         CallbackQueryHandler(
             button_handler,
@@ -621,6 +858,15 @@ def main():
         )
     )
 
+    # الرسائل النصية العادية
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_user_message,
+        )
+    )
+
+    # الأخطاء
     app.add_error_handler(
         error_handler
     )

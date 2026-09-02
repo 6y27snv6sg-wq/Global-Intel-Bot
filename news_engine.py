@@ -18,20 +18,14 @@ import feedparser
 # الإعدادات
 # ============================================================
 
-# الحد الأقصى لطلب HTTP الواحد
 REQUEST_TIMEOUT = 6
-
-# الحد الأقصى للمصدر الواحد
 SOURCE_TIMEOUT = 4
-
-# الحد الأقصى للعملية الكاملة لجمع الأخبار
 GLOBAL_COLLECTION_TIMEOUT = 10
 
 MAX_ITEMS_PER_SOURCE = 15
 MAX_NEWS_ITEMS = 100
 MAX_SUMMARY_LENGTH = 650
 
-# حماية من تحميل صفحات ضخمة
 MAX_RSS_BYTES = 2 * 1024 * 1024
 MAX_HTML_BYTES = 1 * 1024 * 1024
 
@@ -242,6 +236,127 @@ CATEGORY_KEYWORDS = {
 
 
 # ============================================================
+# قاموس ربط المصطلحات
+# ============================================================
+
+QUERY_ALIASES = {
+    "السعوديه": [
+        "السعوديه",
+        "المملكه",
+        "المملكه العربيه السعوديه",
+        "الرياض",
+    ],
+    "المملكه": [
+        "السعوديه",
+        "المملكه",
+        "الرياض",
+    ],
+    "الرياض": [
+        "الرياض",
+        "السعوديه",
+        "المملكه",
+    ],
+    "الامارات": [
+        "الامارات",
+        "ابوظبي",
+        "دبي",
+    ],
+    "قطر": [
+        "قطر",
+        "الدوحه",
+    ],
+    "الكويت": [
+        "الكويت",
+    ],
+    "البحرين": [
+        "البحرين",
+        "المنامه",
+    ],
+    "عمان": [
+        "عمان",
+        "مسقط",
+    ],
+    "الخليج": [
+        "الخليج",
+        "السعوديه",
+        "الامارات",
+        "قطر",
+        "الكويت",
+        "البحرين",
+        "عمان",
+    ],
+    "امريكا": [
+        "امريكا",
+        "الولايات المتحده",
+        "واشنطن",
+    ],
+    "الولايات": [
+        "امريكا",
+        "الولايات المتحده",
+        "واشنطن",
+    ],
+    "بريطانيا": [
+        "بريطانيا",
+        "المملكه المتحده",
+        "لندن",
+    ],
+    "ايران": [
+        "ايران",
+        "طهران",
+    ],
+    "اسرائيل": [
+        "اسرائيل",
+        "تل ابيب",
+    ],
+    "فلسطين": [
+        "فلسطين",
+        "غزه",
+        "الضفه",
+    ],
+    "غزه": [
+        "غزه",
+        "فلسطين",
+    ],
+    "روسيا": [
+        "روسيا",
+        "موسكو",
+    ],
+    "اوكرانيا": [
+        "اوكرانيا",
+        "كييف",
+    ],
+    "نفط": [
+        "نفط",
+        "بترول",
+        "اسعار النفط",
+        "اسعار البترول",
+        "اوبك",
+    ],
+    "بترول": [
+        "نفط",
+        "بترول",
+        "اسعار النفط",
+        "اوبك",
+    ],
+    "اوبك": [
+        "اوبك",
+        "اوبك+",
+        "نفط",
+    ],
+    "غاز": [
+        "غاز",
+        "الغاز الطبيعي",
+        "الطاقه",
+    ],
+    "طاقة": [
+        "طاقه",
+        "نفط",
+        "غاز",
+    ],
+}
+
+
+# ============================================================
 # نموذج الخبر
 # ============================================================
 
@@ -284,7 +399,6 @@ def normalize_arabic(text: str) -> str:
     )
 
     text = text.replace("ى", "ي")
-
     text = text.replace("ة", "ه")
 
     text = re.sub(
@@ -305,6 +419,89 @@ def normalize_arabic(text: str) -> str:
 
 def normalize_for_hash(text: str) -> str:
     return normalize_arabic(text)
+
+
+# ============================================================
+# كلمات السؤال المهمة
+# ============================================================
+
+STOP_WORDS = {
+    "ما",
+    "ماذا",
+    "هل",
+    "كيف",
+    "متى",
+    "اين",
+    "وين",
+    "من",
+    "عن",
+    "الى",
+    "في",
+    "على",
+    "مع",
+    "هو",
+    "هي",
+    "هم",
+    "هذا",
+    "هذه",
+    "ذلك",
+    "تلك",
+    "اليوم",
+    "الان",
+    "اخر",
+    "آخر",
+    "اخبار",
+    "خبر",
+    "اخبارها",
+    "الجديد",
+    "الجديده",
+    "آخر",
+    "اخر",
+    "اليوم",
+    "حاليا",
+    "حاليًا",
+    "رجاء",
+    "فضلا",
+    "اعطني",
+    "اعطني",
+    "قل",
+    "اخبرني",
+}
+
+
+def extract_query_terms(query: str) -> List[str]:
+    normalized = normalize_arabic(query)
+
+    words = re.findall(
+        r"[\w\u0600-\u06FF]{2,}",
+        normalized,
+        flags=re.UNICODE,
+    )
+
+    terms = []
+
+    for word in words:
+
+        if word in STOP_WORDS:
+            continue
+
+        if word not in terms:
+            terms.append(word)
+
+        aliases = QUERY_ALIASES.get(word, [])
+
+        for alias in aliases:
+
+            alias_normalized = normalize_arabic(
+                alias
+            )
+
+            if alias_normalized not in terms:
+                terms.append(
+                    alias_normalized
+                )
+
+    return terms
 
 
 # ============================================================
@@ -403,6 +600,7 @@ def parse_datetime(value) -> Optional[datetime]:
         return None
 
     if isinstance(value, datetime):
+
         dt = value
 
         if dt.tzinfo is None:
@@ -410,28 +608,37 @@ def parse_datetime(value) -> Optional[datetime]:
                 tzinfo=timezone.utc
             )
 
-        return dt.astimezone(timezone.utc)
+        return dt.astimezone(
+            timezone.utc
+        )
 
     try:
+
         value = str(value).strip()
 
         if not value:
             return None
 
         try:
-            dt = parsedate_to_datetime(value)
+
+            dt = parsedate_to_datetime(
+                value
+            )
 
             if dt.tzinfo is None:
                 dt = dt.replace(
                     tzinfo=timezone.utc
                 )
 
-            return dt.astimezone(timezone.utc)
+            return dt.astimezone(
+                timezone.utc
+            )
 
         except Exception:
             pass
 
         try:
+
             dt = datetime.fromisoformat(
                 value.replace(
                     "Z",
@@ -444,7 +651,9 @@ def parse_datetime(value) -> Optional[datetime]:
                     tzinfo=timezone.utc
                 )
 
-            return dt.astimezone(timezone.utc)
+            return dt.astimezone(
+                timezone.utc
+            )
 
         except Exception:
             pass
@@ -458,7 +667,9 @@ def parse_datetime(value) -> Optional[datetime]:
         ]
 
         for fmt in formats:
+
             try:
+
                 dt = datetime.strptime(
                     value,
                     fmt,
@@ -477,17 +688,22 @@ def parse_datetime(value) -> Optional[datetime]:
     return None
 
 
-def parse_feed_entry_datetime(entry) -> Optional[datetime]:
+def parse_feed_entry_datetime(
+    entry,
+) -> Optional[datetime]:
 
     for field in (
         "published_parsed",
         "updated_parsed",
         "created_parsed",
     ):
+
         value = entry.get(field)
 
         if value:
+
             try:
+
                 return datetime(
                     value.tm_year,
                     value.tm_mon,
@@ -497,6 +713,7 @@ def parse_feed_entry_datetime(entry) -> Optional[datetime]:
                     value.tm_sec,
                     tzinfo=timezone.utc,
                 )
+
             except Exception:
                 pass
 
@@ -506,9 +723,14 @@ def parse_feed_entry_datetime(entry) -> Optional[datetime]:
         "created",
         "pubDate",
     ):
-        value = entry.get(field)
 
-        dt = parse_datetime(value)
+        value = entry.get(
+            field
+        )
+
+        dt = parse_datetime(
+            value
+        )
 
         if dt:
             return dt
@@ -529,8 +751,9 @@ def make_event_id(
         title
     )
 
-    raw = normalized_title or normalize_for_hash(
-        url
+    raw = (
+        normalized_title
+        or normalize_for_hash(url)
     )
 
     return hashlib.sha256(
@@ -559,7 +782,9 @@ def detect_category(
 
         for keyword in keywords:
 
-            if normalize_arabic(keyword) in text:
+            if normalize_arabic(
+                keyword
+            ) in text:
                 score += 1
 
         scores[category] = score
@@ -590,7 +815,9 @@ def is_breaking_news(
 
     for keyword in BREAKING_KEYWORDS:
 
-        if normalize_arabic(keyword) in text:
+        if normalize_arabic(
+            keyword
+        ) in text:
             return True
 
     return False
@@ -739,10 +966,12 @@ async def fetch_rss_source(
         )
 
     except asyncio.CancelledError:
+
         logger.info(
             "RSS cancelled: %s",
             source["name"],
         )
+
         raise
 
     except Exception as exc:
@@ -920,10 +1149,12 @@ async def fetch_html_source(
         )
 
     except asyncio.CancelledError:
+
         logger.info(
             "HTML cancelled: %s",
             source["name"],
         )
+
         raise
 
     except Exception as exc:
@@ -963,8 +1194,13 @@ def title_similarity(
     title_b: str,
 ) -> float:
 
-    a = similarity_key(title_a)
-    b = similarity_key(title_b)
+    a = similarity_key(
+        title_a
+    )
+
+    b = similarity_key(
+        title_b
+    )
 
     if not a or not b:
         return 0.0
@@ -1071,7 +1307,6 @@ def cluster_events(
                 break
 
         if not assigned:
-
             clusters.append(
                 [item]
             )
@@ -1208,12 +1443,7 @@ async def _collect_news_internal(
 ) -> List[NewsItem]:
 
     all_items = []
-
     tasks = []
-
-    # --------------------------------------------------------
-    # RSS
-    # --------------------------------------------------------
 
     for source in RSS_SOURCES:
 
@@ -1228,10 +1458,6 @@ async def _collect_news_internal(
         )
 
         tasks.append(task)
-
-    # --------------------------------------------------------
-    # HTML
-    # --------------------------------------------------------
 
     for source in HTML_SOURCES:
 
@@ -1255,10 +1481,6 @@ async def _collect_news_internal(
         len(tasks),
     )
 
-    # --------------------------------------------------------
-    # الانتظار بمهلة إجمالية
-    # --------------------------------------------------------
-
     done, pending = await asyncio.wait(
         tasks,
         timeout=GLOBAL_COLLECTION_TIMEOUT,
@@ -1270,10 +1492,6 @@ async def _collect_news_internal(
         len(done),
         len(pending),
     )
-
-    # --------------------------------------------------------
-    # قراءة المصادر التي انتهت
-    # --------------------------------------------------------
 
     for task in done:
 
@@ -1295,10 +1513,6 @@ async def _collect_news_internal(
                 "Completed source task failed: %s",
                 exc,
             )
-
-    # --------------------------------------------------------
-    # إلغاء المصادر التي ما زالت معلقة
-    # --------------------------------------------------------
 
     if pending:
 
@@ -1355,10 +1569,6 @@ async def collect_news(
             },
         ) as session:
 
-            # ------------------------------------------------
-            # حماية إضافية للعملية كاملة
-            # ------------------------------------------------
-
             try:
 
                 all_items = await asyncio.wait_for(
@@ -1385,10 +1595,6 @@ async def collect_news(
             "collect_news failed: %s",
             exc,
         )
-
-    # ========================================================
-    # المعالجة
-    # ========================================================
 
     logger.info(
         "Raw news items: %d",
@@ -1429,7 +1635,7 @@ async def collect_news(
 
 
 # ============================================================
-# البحث
+# بحث مخصص في الأخبار
 # ============================================================
 
 def search_news(
@@ -1445,83 +1651,153 @@ def search_news(
         query
     )
 
-    query_tokens = set(
-        query_normalized.split()
+    terms = extract_query_terms(
+        query
     )
 
-    if not query_tokens:
+    if not terms:
         return []
 
     scored = []
 
     for item in items:
 
-        title_normalized = normalize_arabic(
+        title = normalize_arabic(
             item.title
         )
 
-        summary_normalized = normalize_arabic(
+        summary = normalize_arabic(
             item.summary
         )
 
-        title_tokens = set(
-            title_normalized.split()
+        source = normalize_arabic(
+            item.source
         )
 
-        summary_tokens = set(
-            summary_normalized.split()
+        country = normalize_arabic(
+            item.country
         )
 
-        title_overlap = len(
-            query_tokens
-            & title_tokens
+        category = normalize_arabic(
+            item.category
         )
 
-        summary_overlap = len(
-            query_tokens
-            & summary_tokens
+        searchable_text = (
+            f"{title} "
+            f"{summary} "
+            f"{source} "
+            f"{country} "
+            f"{category}"
         )
 
-        score = (
-            title_overlap * 6
-            + summary_overlap * 2
-            + item.priority / 100
-        )
+        score = 0.0
+        matched_terms = 0
 
-        if query_normalized in title_normalized:
-            score += 8
+        for term in terms:
 
-        elif query_normalized in summary_normalized:
-            score += 3
+            if not term:
+                continue
 
+            if term in title:
+                score += 10
+                matched_terms += 1
+
+            elif term in summary:
+                score += 4
+                matched_terms += 1
+
+            elif term in country:
+                score += 8
+                matched_terms += 1
+
+            elif term in source:
+                score += 7
+                matched_terms += 1
+
+            elif term in category:
+                score += 3
+                matched_terms += 1
+
+            elif term in searchable_text:
+                score += 2
+                matched_terms += 1
+
+        # تطابق السؤال كاملًا
         if (
-            title_overlap > 0
-            or summary_overlap > 0
+            len(query_normalized) >= 4
+            and query_normalized in title
         ):
+            score += 15
+
+        # الخبر العاجل المرتبط بالسؤال
+        if matched_terms > 0 and is_breaking_news(
+            item.title,
+            item.summary,
+        ):
+            score += 4
+
+        # أهمية المصدر والخبر
+        if matched_terms > 0:
             score += (
                 calculate_importance(item)
                 / 100
             )
 
-        if score > 1:
+        if matched_terms > 0:
             scored.append(
                 (
                     score,
+                    matched_terms,
                     item,
                 )
             )
 
+    # --------------------------------------------------------
+    # ترتيب النتائج
+    # --------------------------------------------------------
+
     scored.sort(
-        key=lambda x: x[0],
+        key=lambda x: (
+            x[0],
+            x[1],
+        ),
         reverse=True,
     )
 
-    return [
-        item
-        for _, item in scored[
-            :max_results
-        ]
-    ]
+    # --------------------------------------------------------
+    # منع النتائج الضعيفة
+    # --------------------------------------------------------
+
+    results = []
+
+    for score, matched_terms, item in scored:
+
+        # إذا كان السؤال متعدد الكلمات،
+        # نطلب تطابقًا أقوى.
+        if len(terms) >= 3:
+
+            if (
+                matched_terms < 2
+                and score < 8
+            ):
+                continue
+
+        if score < 5:
+            continue
+
+        results.append(item)
+
+        if len(results) >= max_results:
+            break
+
+    logger.info(
+        "SEARCH: query='%s' terms=%s results=%d",
+        query,
+        terms,
+        len(results),
+    )
+
+    return results
 
 
 # ============================================================

@@ -3,6 +3,7 @@ import hashlib
 import html
 import logging
 import re
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -14,7 +15,7 @@ import feedparser
 
 
 # ============================================================
-# SETTINGS
+# الإعدادات
 # ============================================================
 
 REQUEST_TIMEOUT = 12
@@ -23,25 +24,14 @@ MAX_NEWS_ITEMS = 100
 MAX_SUMMARY_LENGTH = 650
 
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; LiveNewsBot/2.0; "
-    "+https://telegram.org)"
-)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    "Mozilla/5.0 (compatible; LiveNewsBot/3.0; +https://telegram.org)"
 )
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# SOURCE PRIORITY
+# أولوية المصادر
 # ============================================================
 
 SOURCE_PRIORITY = {
@@ -54,7 +44,195 @@ SOURCE_PRIORITY = {
 
 
 # ============================================================
-# NEWS MODEL
+# مصادر RSS
+# ============================================================
+
+RSS_SOURCES = [
+    {
+        "name": "وكالة الأنباء السعودية",
+        "url": "https://www.spa.gov.sa/rss",
+        "source_type": "official_agency",
+        "country": "السعودية",
+    },
+    {
+        "name": "France 24 Arabic",
+        "url": "https://www.france24.com/ar/rss",
+        "source_type": "news_channel",
+        "country": "فرنسا",
+    },
+    {
+        "name": "BBC Arabic",
+        "url": "https://feeds.bbci.co.uk/arabic/rss.xml",
+        "source_type": "news_channel",
+        "country": "بريطانيا",
+    },
+]
+
+
+# ============================================================
+# المصادر الرسمية HTML
+# ============================================================
+
+HTML_SOURCES = [
+    {
+        "name": "وزارة الخارجية السعودية",
+        "url": "https://www.mofa.gov.sa/en/ministry/news/Pages/default.aspx",
+        "source_type": "official",
+        "country": "السعودية",
+    },
+    {
+        "name": "وزارة الخارجية السعودية - البيانات",
+        "url": "https://www.mofa.gov.sa/en/ministry/statements/Pages/default.aspx",
+        "source_type": "official",
+        "country": "السعودية",
+    },
+    {
+        "name": "وزارة الخارجية القطرية",
+        "url": "https://mofa.gov.qa/en/all-mofa-news",
+        "source_type": "official",
+        "country": "قطر",
+    },
+    {
+        "name": "وزارة الخارجية الإماراتية",
+        "url": "https://www.mofa.gov.ae/en/mediahub/news",
+        "source_type": "official",
+        "country": "الإمارات",
+    },
+    {
+        "name": "وزارة الخارجية البريطانية",
+        "url": "https://www.gov.uk/government/organisations/foreign-commonwealth-development-office",
+        "source_type": "official",
+        "country": "بريطانيا",
+    },
+]
+
+
+# ============================================================
+# كلمات الأخبار العاجلة
+# ============================================================
+
+BREAKING_KEYWORDS = [
+    "عاجل",
+    "هجوم",
+    "هجمات",
+    "صاروخ",
+    "صواريخ",
+    "قصف",
+    "انفجار",
+    "انفجارات",
+    "حرب",
+    "اشتباك",
+    "اشتباكات",
+    "تصعيد",
+    "تصعيد عسكري",
+    "غارة",
+    "غارات",
+    "هدنة",
+    "وقف إطلاق النار",
+    "إطلاق النار",
+    "اغتيال",
+    "قتلى",
+    "إصابة",
+    "إصابات",
+    "عقوبات",
+    "اتفاق",
+    "أزمة",
+    "طوارئ",
+    "زلزال",
+    "فيضانات",
+    "إعصار",
+    "breaking",
+    "urgent",
+    "missile",
+    "attack",
+    "war",
+    "strike",
+    "explosion",
+    "ceasefire",
+    "sanctions",
+]
+
+
+# ============================================================
+# تصنيفات الأخبار
+# ============================================================
+
+CATEGORY_KEYWORDS = {
+    "security": [
+        "أمن",
+        "أمني",
+        "عسكري",
+        "جيش",
+        "هجوم",
+        "صاروخ",
+        "قصف",
+        "حرب",
+        "اشتباك",
+        "دفاع",
+        "طائرة",
+        "مسيرة",
+        "درون",
+        "غارة",
+        "حدود",
+    ],
+    "energy": [
+        "نفط",
+        "أوبك",
+        "أوبك+",
+        "غاز",
+        "طاقة",
+        "برميل",
+        "إنتاج النفط",
+        "أسعار النفط",
+        "الطاقة",
+        "الوقود",
+    ],
+    "economy": [
+        "اقتصاد",
+        "اقتصادية",
+        "أسواق",
+        "بورصة",
+        "سهم",
+        "أسهم",
+        "تجارة",
+        "استثمار",
+        "استثمارات",
+        "دولار",
+        "ريال",
+        "تضخم",
+        "فائدة",
+        "بنك",
+    ],
+    "politics": [
+        "سياسة",
+        "سياسي",
+        "انتخابات",
+        "حكومة",
+        "رئيس",
+        "برلمان",
+        "وزير",
+        "حزب",
+        "قرار",
+    ],
+    "foreign_affairs": [
+        "وزارة الخارجية",
+        "وزير الخارجية",
+        "سفير",
+        "سفارة",
+        "بيان",
+        "تصريح",
+        "مباحثات",
+        "مفاوضات",
+        "اتفاق",
+        "علاقات",
+        "دبلوماسي",
+        "دبلوماسية",
+    ],
+}
+
+
+# ============================================================
+# نموذج الخبر
 # ============================================================
 
 @dataclass
@@ -72,254 +250,79 @@ class NewsItem:
 
 
 # ============================================================
-# RSS SOURCES
+# أدوات تنظيف النص
 # ============================================================
 
-RSS_SOURCES = [
-    {
-        "name": "SPA",
-        "url": "https://www.spa.gov.sa/rss",
-        "type": "official_agency",
-        "country": "Saudi Arabia",
-    },
-    {
-        "name": "France24 Arabic",
-        "url": "https://www.france24.com/ar/rss",
-        "type": "news_channel",
-        "country": "France",
-    },
-    {
-        "name": "BBC Arabic",
-        "url": "https://feeds.bbci.co.uk/arabic/rss.xml",
-        "type": "news_channel",
-        "country": "United Kingdom",
-    },
-]
-
-
-# ============================================================
-# OFFICIAL HTML SOURCES
-# ============================================================
-
-HTML_SOURCES = [
-    {
-        "name": "Saudi MOFA News",
-        "url": "https://www.mofa.gov.sa/en/ministry/news/Pages/default.aspx",
-        "type": "official",
-        "country": "Saudi Arabia",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "Saudi MOFA Statements",
-        "url": "https://www.mofa.gov.sa/en/ministry/statements/Pages/default.aspx",
-        "type": "official",
-        "country": "Saudi Arabia",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "Qatar MOFA News",
-        "url": "https://mofa.gov.qa/en/all-mofa-news",
-        "type": "official",
-        "country": "Qatar",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "UAE MOFA News",
-        "url": "https://www.mofa.gov.ae/en/mediahub/news",
-        "type": "official",
-        "country": "United Arab Emirates",
-        "category": "foreign_affairs",
-    },
-    {
-        "name": "UK FCDO",
-        "url": "https://www.gov.uk/government/organisations/foreign-commonwealth-development-office",
-        "type": "official",
-        "country": "United Kingdom",
-        "category": "foreign_affairs",
-    },
-]
-
-
-# ============================================================
-# BREAKING KEYWORDS
-# ============================================================
-
-BREAKING_KEYWORDS = [
-    "عاجل",
-    "هجوم",
-    "هجوم مسلح",
-    "صاروخ",
-    "صواريخ",
-    "قصف",
-    "انفجار",
-    "حرب",
-    "هدنة",
-    "وقف إطلاق النار",
-    "اشتباكات",
-    "تصعيد",
-    "عقوبات",
-    "اتفاق",
-    "اتفاقية",
-    "أزمة",
-    "طوارئ",
-    "مقتل",
-    "قتلى",
-    "إصابة",
-    "إصابات",
-    "استهداف",
-    "ضربة",
-    "ضربات",
-    "breaking",
-    "attack",
-    "missile",
-    "missiles",
-    "strike",
-    "strikes",
-    "war",
-    "ceasefire",
-    "sanctions",
-    "agreement",
-    "explosion",
-    "conflict",
-]
-
-
-# ============================================================
-# CATEGORY KEYWORDS
-# ============================================================
-
-CATEGORY_KEYWORDS = {
-    "security": [
-        "هجوم",
-        "صاروخ",
-        "قصف",
-        "حرب",
-        "اشتباكات",
-        "عسكري",
-        "دفاع",
-        "أمن",
-        "attack",
-        "missile",
-        "war",
-        "military",
-        "defense",
-        "security",
-    ],
-    "energy": [
-        "نفط",
-        "النفط",
-        "أوبك",
-        "أوبك+",
-        "غاز",
-        "طاقة",
-        "خام",
-        "oil",
-        "opec",
-        "opec+",
-        "gas",
-        "energy",
-        "crude",
-    ],
-    "economy": [
-        "اقتصاد",
-        "اقتصادية",
-        "تجارة",
-        "استثمار",
-        "أسواق",
-        "بنك",
-        "فائدة",
-        "تضخم",
-        "عملة",
-        "economy",
-        "trade",
-        "investment",
-        "markets",
-        "bank",
-        "interest",
-        "inflation",
-        "currency",
-    ],
-    "politics": [
-        "انتخابات",
-        "رئيس",
-        "حكومة",
-        "برلمان",
-        "سياسة",
-        "سياسي",
-        "president",
-        "government",
-        "parliament",
-        "election",
-        "politics",
-    ],
-    "foreign_affairs": [
-        "وزارة الخارجية",
-        "وزير الخارجية",
-        "محادثات",
-        "مباحثات",
-        "اتصال",
-        "زيارة",
-        "بيان",
-        "تصريح",
-        "foreign ministry",
-        "foreign minister",
-        "talks",
-        "statement",
-        "diplomatic",
-    ],
-}
-
-
-# ============================================================
-# CLEAN HTML
-# ============================================================
-
-def clean_html(text: str) -> str:
+def normalize_arabic(text: str) -> str:
+    """
+    تطبيع النص العربي لتقليل اختلافات الكتابة أثناء البحث والمقارنة.
+    """
 
     if not text:
         return ""
 
-    text = html.unescape(text)
+    text = str(text)
+
+    # إزالة التشكيل
+    text = re.sub(r"[\u0610-\u061A\u064B-\u065F\u0670]", "", text)
+
+    # إزالة التطويل
+    text = text.replace("ـ", "")
+
+    # توحيد الألف
+    text = re.sub(r"[أإآا]", "ا", text)
+
+    # توحيد الياء والألف المقصورة
+    text = text.replace("ى", "ي")
+
+    # توحيد التاء المربوطة
+    text = text.replace("ة", "ه")
+
+    # إزالة علامات الترقيم
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+
+    # توحيد المسافات
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text.lower()
+
+
+def normalize_for_hash(text: str) -> str:
+    return normalize_arabic(text)
+
+
+def clean_html(text: str) -> str:
+    if not text:
+        return ""
+
+    text = html.unescape(str(text))
 
     text = re.sub(
-        r"<script.*?</script>",
+        r"<script\b[^>]*>.*?</script>",
         " ",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
 
     text = re.sub(
-        r"<style.*?</style>",
+        r"<style\b[^>]*>.*?</style>",
         " ",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    text = re.sub(
-        r"<[^>]+>",
-        " ",
-        text,
-    )
+    text = re.sub(r"<[^>]+>", " ", text)
 
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
+    text = re.sub(r"\s+", " ", text)
 
     return text.strip()
 
 
-# ============================================================
-# CLEAN TITLE
-# ============================================================
-
 def clean_title(title: str) -> str:
-
     title = clean_html(title)
 
     title = re.sub(
-        r"^\s*(عاجل|breaking)\s*[:\-|]\s*",
+        r"^\s*(عاجل|breaking)\s*[:\-–—]?\s*",
         "",
         title,
         flags=re.IGNORECASE,
@@ -328,30 +331,18 @@ def clean_title(title: str) -> str:
     return title.strip()
 
 
-# ============================================================
-# CLEAN SUMMARY
-# ============================================================
-
 def clean_summary(summary: str) -> str:
-
     summary = clean_html(summary)
-
-    if not summary:
-        return ""
 
     noise_patterns = [
         r"اقرأ المزيد",
         r"لمزيد من التفاصيل",
         r"تابعونا",
-        r"اشترك",
-        r"subscribe",
-        r"read more",
-        r"follow us",
-        r"share",
+        r"للمزيد",
+        r"المصدر:",
     ]
 
     for pattern in noise_patterns:
-
         summary = re.sub(
             pattern,
             " ",
@@ -359,147 +350,166 @@ def clean_summary(summary: str) -> str:
             flags=re.IGNORECASE,
         )
 
-    summary = re.sub(
-        r"\s+",
-        " ",
-        summary,
-    ).strip()
+    summary = re.sub(r"\s+", " ", summary).strip()
 
     if len(summary) > MAX_SUMMARY_LENGTH:
-
-        summary = (
-            summary[:MAX_SUMMARY_LENGTH]
-            .rsplit(" ", 1)[0]
-            + "..."
-        )
+        summary = summary[:MAX_SUMMARY_LENGTH].rsplit(" ", 1)[0]
+        summary += "..."
 
     return summary
 
 
 # ============================================================
-# DATE PARSER
+# التاريخ والوقت
 # ============================================================
 
 def parse_datetime(value) -> Optional[datetime]:
-
     if not value:
         return None
 
     if isinstance(value, datetime):
-
         dt = value
 
-    else:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
 
+        return dt.astimezone(timezone.utc)
+
+    try:
         value = str(value).strip()
 
-        dt = None
+        if not value:
+            return None
 
+        # RFC / RSS
         try:
             dt = parsedate_to_datetime(value)
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            return dt.astimezone(timezone.utc)
         except Exception:
             pass
 
-        if dt is None:
+        # ISO
+        iso_value = value.replace("Z", "+00:00")
 
-            formats = [
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d",
-            ]
+        try:
+            dt = datetime.fromisoformat(iso_value)
 
-            for fmt in formats:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
 
-                try:
-                    dt = datetime.strptime(
-                        value,
-                        fmt,
-                    )
-                    break
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
 
-                except Exception:
-                    continue
+        formats = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%d/%m/%Y %H:%M",
+            "%d/%m/%Y",
+        ]
 
-    if dt is None:
-        return None
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(value, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
 
-    if dt.tzinfo is None:
+    except Exception:
+        pass
 
-        dt = dt.replace(
-            tzinfo=timezone.utc
-        )
+    return None
 
-    return dt.astimezone(
-        timezone.utc
-    )
+
+def parse_feed_entry_datetime(entry) -> Optional[datetime]:
+    """
+    يحاول قراءة الوقت من الحقول المنظمة في RSS أولاً،
+    ثم ينتقل إلى النص.
+    """
+
+    for field in (
+        "published_parsed",
+        "updated_parsed",
+        "created_parsed",
+    ):
+        value = entry.get(field)
+
+        if value:
+            try:
+                return datetime(
+                    value.tm_year,
+                    value.tm_mon,
+                    value.tm_mday,
+                    value.tm_hour,
+                    value.tm_min,
+                    value.tm_sec,
+                    tzinfo=timezone.utc,
+                )
+            except Exception:
+                pass
+
+    for field in (
+        "published",
+        "updated",
+        "created",
+        "pubDate",
+    ):
+        value = entry.get(field)
+
+        dt = parse_datetime(value)
+
+        if dt:
+            return dt
+
+    return None
 
 
 # ============================================================
-# NORMALIZATION
+# معرف الحدث
 # ============================================================
 
-def normalize_for_hash(text: str) -> str:
+def make_event_id(title: str, url: str = "") -> str:
+    """
+    ينشئ معرفاً مستقراً للحدث اعتماداً على العنوان.
+    لا نعتمد على الرابط وحده حتى لا يصبح الخبر نفسه
+    حدثاً مختلفاً بسبب اختلاف رابط المصدر.
+    """
 
-    text = clean_html(text).lower()
+    normalized_title = normalize_for_hash(title)
 
-    text = re.sub(
-        r"[^\w\u0600-\u06ff\s]",
-        " ",
-        text,
-    )
+    raw = normalized_title
 
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    ).strip()
-
-    return text
-
-
-# ============================================================
-# EVENT ID
-# ============================================================
-
-def make_event_id(
-    title: str,
-    url: str = "",
-) -> str:
-
-    base = (
-        normalize_for_hash(title)
-        + "|"
-        + normalize_for_hash(url)
-    )
+    if not raw:
+        raw = normalize_for_hash(url)
 
     return hashlib.sha256(
-        base.encode("utf-8")
+        raw.encode("utf-8")
     ).hexdigest()[:24]
 
 
 # ============================================================
-# CATEGORY DETECTION
+# التصنيف
 # ============================================================
 
-def detect_category(
-    title: str,
-    summary: str,
-) -> str:
-
-    text = (
+def detect_category(title: str, summary: str = "") -> str:
+    text = normalize_arabic(
         f"{title} {summary}"
-    ).lower()
+    )
 
     scores = {}
 
     for category, keywords in CATEGORY_KEYWORDS.items():
-
         score = 0
 
         for keyword in keywords:
+            keyword_normalized = normalize_arabic(keyword)
 
-            if keyword.lower() in text:
+            if keyword_normalized in text:
                 score += 1
 
         scores[category] = score
@@ -516,7 +526,25 @@ def detect_category(
 
 
 # ============================================================
-# RSS FETCH
+# اكتشاف الأخبار العاجلة
+# ============================================================
+
+def is_breaking_news(title: str, summary: str = "") -> bool:
+    text = normalize_arabic(
+        f"{title} {summary}"
+    )
+
+    for keyword in BREAKING_KEYWORDS:
+        keyword_normalized = normalize_arabic(keyword)
+
+        if keyword_normalized in text:
+            return True
+
+    return False
+
+
+# ============================================================
+# RSS
 # ============================================================
 
 async def fetch_rss_source(
@@ -524,43 +552,32 @@ async def fetch_rss_source(
     source: dict,
 ) -> List[NewsItem]:
 
-    items = []
+    results = []
 
     try:
-
         async with session.get(
             source["url"],
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "User-Agent": USER_AGENT,
-            },
+            headers={"User-Agent": USER_AGENT},
         ) as response:
 
             if response.status != 200:
-
                 logger.warning(
-                    "RSS failed: %s -> HTTP %s",
-                    source["name"],
+                    "RSS source returned HTTP %s: %s",
                     response.status,
+                    source["name"],
                 )
-
                 return []
 
             content = await response.read()
 
-        feed = feedparser.parse(
-            content
-        )
+        feed = feedparser.parse(content)
 
-        for entry in feed.entries[
-            :MAX_ITEMS_PER_SOURCE
-        ]:
+        entries = feed.entries[:MAX_ITEMS_PER_SOURCE]
+
+        for entry in entries:
 
             title = clean_title(
-                entry.get(
-                    "title",
-                    "",
-                )
+                entry.get("title", "")
             )
 
             if not title:
@@ -569,26 +586,17 @@ async def fetch_rss_source(
             summary = clean_summary(
                 entry.get(
                     "summary",
-                    entry.get(
-                        "description",
-                        "",
-                    ),
+                    entry.get("description", ""),
                 )
             )
 
-            url = entry.get(
-                "link",
-                source["url"],
-            )
+            link = entry.get("link", "")
 
-            published_at = parse_datetime(
-                entry.get(
-                    "published",
-                    entry.get(
-                        "updated",
-                        None,
-                    ),
-                )
+            if not link:
+                continue
+
+            published_at = parse_feed_entry_datetime(
+                entry
             )
 
             category = detect_category(
@@ -597,149 +605,111 @@ async def fetch_rss_source(
             )
 
             priority = SOURCE_PRIORITY.get(
-                source["type"],
+                source["source_type"],
                 50,
             )
 
             event_id = make_event_id(
-                title,
-                url,
+                title
             )
 
-            items.append(
+            results.append(
                 NewsItem(
                     title=title,
                     summary=summary,
                     source=source["name"],
-                    source_type=source["type"],
+                    source_type=source["source_type"],
                     country=source["country"],
                     category=category,
-                    url=url,
+                    url=link,
                     published_at=published_at,
                     priority=priority,
                     event_id=event_id,
                 )
             )
 
-    except Exception as exc:
+    except asyncio.CancelledError:
+        raise
 
-        logger.exception(
-            "RSS error: %s: %s",
+    except Exception as exc:
+        logger.warning(
+            "RSS fetch failed for %s: %s",
             source["name"],
             exc,
         )
-
-    return items
-
-
-# ============================================================
-# HTML LINK EXTRACTION
-# ============================================================
-
-def extract_links_from_html(
-    html_text: str,
-    base_url: str,
-    source: dict,
-) -> List[NewsItem]:
-
-    results = []
-
-    pattern = re.compile(
-        r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    matches = pattern.findall(
-        html_text
-    )
-
-    seen_urls = set()
-
-    for href, raw_text in matches:
-
-        title = clean_title(
-            clean_html(raw_text)
-        )
-
-        if not title:
-            continue
-
-        if len(title) < 25:
-            continue
-
-        if len(title) > 300:
-            continue
-
-        url = urljoin(
-            base_url,
-            html.unescape(
-                href
-            ).strip(),
-        )
-
-        if url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-
-        lowered = url.lower()
-
-        looks_like_article = any(
-            token in lowered
-            for token in [
-                "/news/",
-                "/statement",
-                "/statements/",
-                "/mediahub/",
-                "/latest",
-                "/details/",
-                "/press",
-                "/article",
-            ]
-        )
-
-        if not looks_like_article:
-            continue
-
-        category = (
-            source.get("category")
-            or detect_category(
-                title,
-                "",
-            )
-        )
-
-        priority = SOURCE_PRIORITY.get(
-            source["type"],
-            50,
-        )
-
-        results.append(
-            NewsItem(
-                title=title,
-                summary="",
-                source=source["name"],
-                source_type=source["type"],
-                country=source["country"],
-                category=category,
-                url=url,
-                published_at=None,
-                priority=priority,
-                event_id=make_event_id(
-                    title,
-                    url,
-                ),
-            )
-        )
-
-        if len(results) >= MAX_ITEMS_PER_SOURCE:
-            break
 
     return results
 
 
 # ============================================================
-# HTML FETCH
+# استخراج روابط HTML
+# ============================================================
+
+def extract_links_from_html(
+    page_html: str,
+    base_url: str,
+) -> List[tuple]:
+
+    results = []
+
+    if not page_html:
+        return results
+
+    pattern = re.compile(
+        r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in pattern.finditer(page_html):
+
+        href = html.unescape(
+            match.group(1).strip()
+        )
+
+        raw_title = match.group(2)
+
+        title = clean_title(raw_title)
+
+        if not href or not title:
+            continue
+
+        if len(title) < 15:
+            continue
+
+        full_url = urljoin(
+            base_url,
+            href,
+        )
+
+        lowered_url = full_url.lower()
+
+        interesting_path = any(
+            token in lowered_url
+            for token in (
+                "/news/",
+                "/statement",
+                "/mediahub/",
+                "/press",
+                "/article",
+                "/story",
+            )
+        )
+
+        if not interesting_path:
+            continue
+
+        results.append(
+            (
+                title,
+                full_url,
+            )
+        )
+
+    return results
+
+
+# ============================================================
+# HTML Sources
 # ============================================================
 
 async def fetch_html_source(
@@ -747,92 +717,116 @@ async def fetch_html_source(
     source: dict,
 ) -> List[NewsItem]:
 
-    try:
+    results = []
 
+    try:
         async with session.get(
             source["url"],
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": (
-                    "text/html,"
-                    "application/xhtml+xml,"
-                    "application/xml;q=0.9,"
-                    "*/*;q=0.8"
-                ),
-            },
+            headers={"User-Agent": USER_AGENT},
         ) as response:
 
             if response.status != 200:
-
                 logger.warning(
-                    "HTML failed: %s -> HTTP %s",
-                    source["name"],
+                    "HTML source returned HTTP %s: %s",
                     response.status,
+                    source["name"],
                 )
-
                 return []
 
-            text = await response.text(
+            page_html = await response.text(
                 errors="ignore"
             )
 
-        return extract_links_from_html(
-            text,
+        links = extract_links_from_html(
+            page_html,
             source["url"],
-            source,
         )
 
-    except Exception as exc:
+        seen_urls = set()
 
-        logger.exception(
-            "HTML error: %s: %s",
+        for title, link in links:
+
+            if link in seen_urls:
+                continue
+
+            seen_urls.add(link)
+
+            summary = ""
+
+            category = detect_category(
+                title,
+                summary,
+            )
+
+            priority = SOURCE_PRIORITY.get(
+                source["source_type"],
+                50,
+            )
+
+            event_id = make_event_id(
+                title
+            )
+
+            results.append(
+                NewsItem(
+                    title=title,
+                    summary=summary,
+                    source=source["name"],
+                    source_type=source["source_type"],
+                    country=source["country"],
+                    category=category,
+                    url=link,
+                    published_at=None,
+                    priority=priority,
+                    event_id=event_id,
+                )
+            )
+
+            if len(results) >= MAX_ITEMS_PER_SOURCE:
+                break
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+        logger.warning(
+            "HTML fetch failed for %s: %s",
             source["name"],
             exc,
         )
 
-        return []
+    return results
 
 
 # ============================================================
-# TITLE SIMILARITY
+# مقارنة العناوين
 # ============================================================
 
-def similarity_key(
-    title: str,
-) -> set:
+def similarity_key(text: str) -> set:
+    normalized = normalize_arabic(text)
 
-    normalized = normalize_for_hash(
-        title
+    words = re.findall(
+        r"\b[\w\u0600-\u06FF]{3,}\b",
+        normalized,
+        flags=re.UNICODE,
     )
 
-    words = normalized.split()
-
-    return {
-        word
-        for word in words
-        if len(word) >= 3
-    }
+    return set(words)
 
 
 def title_similarity(
-    first: str,
-    second: str,
+    title_a: str,
+    title_b: str,
 ) -> float:
 
-    a = similarity_key(first)
-    b = similarity_key(second)
+    a = similarity_key(title_a)
+    b = similarity_key(title_b)
 
     if not a or not b:
         return 0.0
 
-    intersection = len(
-        a & b
-    )
-
-    union = len(
-        a | b
-    )
+    intersection = len(a & b)
+    union = len(a | b)
 
     if union == 0:
         return 0.0
@@ -841,19 +835,24 @@ def title_similarity(
 
 
 # ============================================================
-# DEDUPLICATION
+# إزالة التكرار
 # ============================================================
 
 def deduplicate_news(
     items: List[NewsItem],
 ) -> List[NewsItem]:
 
-    items = sorted(
+    if not items:
+        return []
+
+    # ترتيب أولي حتى نحافظ على المصدر الأقوى
+    # عند وجود نسخة مطابقة فعلاً.
+    sorted_items = sorted(
         items,
-        key=lambda item: (
-            item.priority,
-            item.published_at.timestamp()
-            if item.published_at
+        key=lambda x: (
+            x.priority,
+            x.published_at.timestamp()
+            if x.published_at
             else 0,
         ),
         reverse=True,
@@ -861,68 +860,108 @@ def deduplicate_news(
 
     result = []
 
-    seen_ids = set()
+    seen_urls = set()
+    seen_exact_titles = set()
 
-    for item in items:
+    for item in sorted_items:
 
-        if item.event_id in seen_ids:
-            continue
-
-        duplicate = False
-
-        for existing in result:
-
-            similarity = title_similarity(
-                item.title,
-                existing.title,
-            )
-
-            if similarity >= 0.72:
-
-                duplicate = True
-                break
-
-        if duplicate:
-            continue
-
-        seen_ids.add(
-            item.event_id
+        normalized_title = normalize_for_hash(
+            item.title
         )
+
+        normalized_url = item.url.strip().lower()
+
+        # نفس الرابط = نفس الخبر
+        if normalized_url in seen_urls:
+            continue
+
+        # نفس العنوان حرفياً تقريباً = نسخة مكررة
+        if normalized_title in seen_exact_titles:
+            continue
+
+        seen_urls.add(normalized_url)
+        seen_exact_titles.add(normalized_title)
 
         result.append(item)
 
+    # لا نحذف الأخبار المختلفة فقط لأنها تتحدث
+    # عن نفس الحدث؛ نريد أن تبقى لدينا مصادر متعددة
+    # ليستطيع Gemini المقارنة بينها.
     return result
 
 
 # ============================================================
-# IMPORTANCE
+# ربط الأخبار المتشابهة بالحدث نفسه
+# ============================================================
+
+def cluster_events(
+    items: List[NewsItem],
+) -> List[NewsItem]:
+
+    if not items:
+        return []
+
+    clusters = []
+
+    for item in items:
+
+        assigned = False
+
+        for cluster in clusters:
+
+            representative = cluster[0]
+
+            similarity = title_similarity(
+                item.title,
+                representative.title,
+            )
+
+            # عتبة مرتفعة حتى لا ندمج أخباراً
+            # مختلفة بالخطأ.
+            if similarity >= 0.82:
+
+                item.event_id = representative.event_id
+                cluster.append(item)
+                assigned = True
+                break
+
+        if not assigned:
+            clusters.append([item])
+
+    return items
+
+
+# ============================================================
+# أهمية الخبر
 # ============================================================
 
 def calculate_importance(
     item: NewsItem,
-) -> int:
+) -> float:
 
-    score = item.priority
+    score = float(item.priority)
 
-    text = (
-        item.title
-        + " "
-        + item.summary
-    ).lower()
+    text = f"{item.title} {item.summary}"
 
-    for keyword in BREAKING_KEYWORDS:
-
-        if keyword.lower() in text:
-
-            score += 25
-            break
+    if is_breaking_news(text):
+        score += 25
 
     if item.published_at:
 
-        age_hours = (
-            datetime.now(timezone.utc)
-            - item.published_at
-        ).total_seconds() / 3600
+        now = datetime.now(timezone.utc)
+
+        age_seconds = (
+            now - item.published_at
+        ).total_seconds()
+
+        # خبر مستقبلي بسبب خطأ مصدر الوقت
+        # لا نعاقبه.
+        age_seconds = max(
+            0,
+            age_seconds,
+        )
+
+        age_hours = age_seconds / 3600
 
         if age_hours <= 1:
             score += 25
@@ -936,11 +975,22 @@ def calculate_importance(
         elif age_hours <= 72:
             score += 3
 
-    return score
+        else:
+            # الأخبار القديمة جداً لا تختفي،
+            # لكن تحصل على وزن أقل.
+            score -= min(
+                20,
+                (age_hours - 72) / 24,
+            )
+
+    return max(
+        0,
+        score,
+    )
 
 
 # ============================================================
-# SORT
+# ترتيب الأخبار
 # ============================================================
 
 def sort_news(
@@ -960,7 +1010,7 @@ def sort_news(
 
 
 # ============================================================
-# COLLECT ALL NEWS
+# جمع الأخبار
 # ============================================================
 
 async def collect_news(
@@ -968,327 +1018,332 @@ async def collect_news(
 ) -> List[NewsItem]:
 
     timeout = aiohttp.ClientTimeout(
-        total=REQUEST_TIMEOUT
+        total=REQUEST_TIMEOUT,
+        connect=5,
+        sock_read=REQUEST_TIMEOUT,
     )
 
     connector = aiohttp.TCPConnector(
         limit=15,
-        ssl=False,
     )
 
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-    ) as session:
+    all_items = []
 
-        tasks = []
+    try:
 
-        for source in RSS_SOURCES:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                "User-Agent": USER_AGENT,
+            },
+        ) as session:
 
-            tasks.append(
+            rss_tasks = [
                 fetch_rss_source(
                     session,
                     source,
                 )
-            )
+                for source in RSS_SOURCES
+            ]
 
-        for source in HTML_SOURCES:
-
-            tasks.append(
+            html_tasks = [
                 fetch_html_source(
                     session,
                     source,
                 )
+                for source in HTML_SOURCES
+            ]
+
+            results = await asyncio.gather(
+                *(rss_tasks + html_tasks),
+                return_exceptions=True,
             )
 
-        results = await asyncio.gather(
-            *tasks,
-            return_exceptions=True,
+            for result in results:
+
+                if isinstance(
+                    result,
+                    Exception,
+                ):
+                    logger.warning(
+                        "Source task failed: %s",
+                        result,
+                    )
+                    continue
+
+                if result:
+                    all_items.extend(result)
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "News collection failed: %s",
+            exc,
         )
 
-    all_items = []
-
-    for result in results:
-
-        if isinstance(
-            result,
-            Exception,
-        ):
-
-            logger.error(
-                "Collector task failed: %s",
-                result,
-            )
-
-            continue
-
-        all_items.extend(
-            result
-        )
-
-    logger.info(
-        "Collected raw items: %s",
-        len(all_items),
-    )
-
+    # إزالة النسخ المتطابقة
     all_items = deduplicate_news(
         all_items
     )
 
+    # ربط الأخبار المتشابهة بالحدث نفسه
+    # مع الإبقاء على كل المصادر.
+    all_items = cluster_events(
+        all_items
+    )
+
+    # ترتيب حسب الأهمية والحداثة
     all_items = sort_news(
         all_items
     )
 
-    all_items = all_items[
-        :max_items
-    ]
-
-    logger.info(
-        "Final news items: %s",
-        len(all_items),
-    )
-
-    return all_items
+    return all_items[:max_items]
 
 
 # ============================================================
-# SEARCH
+# البحث في الأخبار
 # ============================================================
 
 def search_news(
     items: List[NewsItem],
     query: str,
-    limit: int = 15,
+    max_results: int = 15,
 ) -> List[NewsItem]:
 
-    query_words = similarity_key(
+    if not items or not query:
+        return []
+
+    query_normalized = normalize_arabic(
         query
     )
 
-    if not query_words:
-        return items[:limit]
+    query_tokens = set(
+        query_normalized.split()
+    )
+
+    if not query_tokens:
+        return []
 
     scored = []
 
     for item in items:
 
-        title_words = similarity_key(
+        title_normalized = normalize_arabic(
             item.title
         )
 
-        summary_words = similarity_key(
+        summary_normalized = normalize_arabic(
             item.summary
         )
 
-        title_matches = len(
-            query_words
-            & title_words
+        title_tokens = set(
+            title_normalized.split()
         )
 
-        summary_matches = len(
-            query_words
-            & summary_words
+        summary_tokens = set(
+            summary_normalized.split()
+        )
+
+        title_overlap = len(
+            query_tokens & title_tokens
+        )
+
+        summary_overlap = len(
+            query_tokens & summary_tokens
         )
 
         score = (
-            title_matches * 5
-            + summary_matches * 2
+            title_overlap * 6
+            + summary_overlap * 2
             + item.priority / 100
         )
 
-        if score > 1:
+        # تطابق العبارة كاملة
+        if query_normalized in title_normalized:
+            score += 8
 
+        elif query_normalized in summary_normalized:
+            score += 3
+
+        # البحث عن تطابق جزئي مهم
+        if title_overlap > 0 or summary_overlap > 0:
+            score += calculate_importance(item) / 100
+
+        if score > 1:
             scored.append(
                 (
                     score,
-                    calculate_importance(
-                        item
-                    ),
                     item,
                 )
             )
 
     scored.sort(
-        key=lambda x: (
-            x[0],
-            x[1],
-        ),
+        key=lambda pair: pair[0],
         reverse=True,
     )
 
     return [
         item
-        for _, _, item
-        in scored[:limit]
+        for _, item in scored[:max_results]
     ]
 
 
 # ============================================================
-# AI CONTEXT
+# بناء سياق Gemini
 # ============================================================
 
 def build_ai_context(
-    items: List[NewsItem],
+    news_items: List[NewsItem],
     max_items: int = 20,
 ) -> str:
 
-    selected = sort_news(
-        items
-    )[:max_items]
+    if not news_items:
+        return "لا توجد أخبار متاحة حالياً."
 
-    if not selected:
+    selected = news_items[:max_items]
 
-        return (
-            "لا توجد أخبار متاحة حاليًا."
-        )
-
-    lines = []
+    chunks = []
 
     for index, item in enumerate(
         selected,
         start=1,
     ):
 
-        date_text = ""
-
         if item.published_at:
-
-            date_text = (
-                item.published_at
-                .astimezone()
-                .strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+            published = item.published_at.strftime(
+                "%Y-%m-%d %H:%M UTC"
             )
+        else:
+            published = "غير محدد"
 
-        lines.append(
-            (
-                f"[{index}]\n"
-                f"العنوان: {item.title}\n"
-                f"المصدر: {item.source}\n"
-                f"نوع المصدر: {item.source_type}\n"
-                f"الدولة: {item.country}\n"
-                f"التصنيف: {item.category}\n"
-                f"الوقت: {date_text}\n"
-                f"الرابط: {item.url}\n"
-                f"الملخص: {item.summary}"
-            )
+        chunk = (
+            f"الخبر {index}\n"
+            f"العنوان: {item.title}\n"
+            f"المصدر: {item.source}\n"
+            f"نوع المصدر: {item.source_type}\n"
+            f"الدولة: {item.country}\n"
+            f"التصنيف: {item.category}\n"
+            f"وقت النشر: {published}\n"
+            f"معرف الحدث: {item.event_id}\n"
+            f"الرابط: {item.url}\n"
+            f"الملخص: {item.summary or 'لا يوجد ملخص'}"
         )
 
-    return "\n\n".join(
-        lines
-    )
+        chunks.append(chunk)
+
+    return "\n\n".join(chunks)
 
 
 # ============================================================
-# TELEGRAM FORMAT
+# تنسيق الأخبار لتليجرام
 # ============================================================
 
 def format_news_for_telegram(
     items: List[NewsItem],
-    limit: int = 10,
+    max_items: int = 10,
 ) -> str:
 
-    selected = sort_news(
-        items
-    )[:limit]
+    if not items:
+        return "لا توجد أخبار متاحة حالياً."
 
-    if not selected:
-
-        return (
-            "لا توجد أخبار متاحة حاليًا."
-        )
-
-    lines = [
-        "📰 آخر الأخبار",
-        "",
-    ]
-
-    category_map = {
-        "security": "أمن",
-        "energy": "طاقة",
-        "economy": "اقتصاد",
-        "politics": "سياسة",
-        "foreign_affairs": "خارجية",
-        "general": "عام",
-    }
-
-    for item in selected:
-
-        category = category_map.get(
-            item.category,
-            "عام",
-        )
-
-        lines.append(
-            f"• [{category}] {item.title}"
-        )
-
-        lines.append(
-            f"  المصدر: {item.source}"
-        )
-
-        if item.url:
-
-            lines.append(
-                f"  {item.url}"
-            )
-
-        lines.append("")
-
-    return "\n".join(
-        lines
-    ).strip()
-
-
-# ============================================================
-# TEST
-# ============================================================
-
-async def test():
-
-    print("=" * 60)
-    print("LIVE NEWS ENGINE TEST")
-    print("=" * 60)
-
-    items = await collect_news(
-        max_items=30
-    )
-
-    print(
-        f"\nCollected: {len(items)} items\n"
-    )
+    chunks = []
 
     for index, item in enumerate(
-        items[:20],
+        items[:max_items],
         start=1,
     ):
 
-        print(
-            f"{index}. "
-            f"[{item.source}] "
-            f"{item.title}"
+        if item.published_at:
+            published = item.published_at.strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+        else:
+            published = "غير محدد"
+
+        breaking = (
+            "عاجل"
+            if is_breaking_news(
+                item.title,
+                item.summary,
+            )
+            else ""
         )
 
-        print(
-            f"   Category: {item.category}"
+        header = (
+            f"{index}. {item.title}"
         )
 
-        print(
-            f"   Priority: "
-            f"{calculate_importance(item)}"
+        if breaking:
+            header = f"🚨 {breaking}: {header}"
+
+        chunks.append(
+            "\n".join(
+                [
+                    header,
+                    f"المصدر: {item.source}",
+                    f"التصنيف: {item.category}",
+                    f"الوقت: {published}",
+                    (
+                        f"الملخص: {item.summary}"
+                        if item.summary
+                        else ""
+                    ),
+                    f"الرابط: {item.url}",
+                ]
+            )
         )
 
-        print(
-            f"   URL: {item.url}"
-        )
-
-        print("-" * 60)
+    return "\n\n".join(chunks)
 
 
 # ============================================================
-# DIRECT TEST
+# اختبار المحرك
+# ============================================================
+
+async def test_news_engine():
+    logger.info(
+        "Starting news engine test..."
+    )
+
+    items = await collect_news(
+        max_items=20
+    )
+
+    logger.info(
+        "Collected %d news items.",
+        len(items),
+    )
+
+    if items:
+        logger.info(
+            "\n%s",
+            format_news_for_telegram(
+                items,
+                max_items=5,
+            ),
+        )
+
+    return items
+
+
+# ============================================================
+# تشغيل مباشر للاختبار
 # ============================================================
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(name)s | "
+            "%(message)s"
+        ),
+    )
+
+    asyncio.run(
+        test_news_engine()
+    )

@@ -1,26 +1,42 @@
-import asyncio, logging, os, re
+import asyncio
+import logging
+import os
+import re
 from typing import Dict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler,
-    CallbackQueryHandler, MessageHandler, filters,
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 from google import genai
 from google.genai import types
 
-from news_engine import collect_news, search_news, build_ai_context
+from news_engine import (
+    collect_news,
+    search_news,
+    build_ai_context,
+)
 
 
 # ============================================================
-# CONFIG
+# SETTINGS
 # ============================================================
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
+
 log = logging.getLogger("news_bot")
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -32,15 +48,27 @@ NEWS_COLLECTION_TIMEOUT = 20
 GEMINI_TIMEOUT = 45
 MAX_SEARCH_RESULTS = 15
 
+
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing")
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# قفل مستقل لكل مستخدم
+# ============================================================
+# GEMINI
+# ============================================================
+
+ai_client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+
+# ============================================================
+# USER LOCKS
+# ============================================================
+
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
 
 
@@ -49,35 +77,63 @@ USER_LOCKS: Dict[int, asyncio.Lock] = {}
 # ============================================================
 
 TOPICS = {
-    "urgent": ("🚨 عاجل", "عاجل آخر الأخبار والتطورات"),
-    "world": ("🌍 العالم", "أهم أخبار العالم"),
-    "gulf": ("🇸🇦 الخليج", "أخبار الخليج"),
-    "america": ("🇺🇸 أمريكا", "أخبار الولايات المتحدة"),
-    "europe": ("🇪🇺 أوروبا", "أخبار أوروبا"),
-    "asia": ("🌏 آسيا", "أخبار آسيا"),
-    "energy": ("⚡ الطاقة", "أخبار النفط والطاقة"),
-    "security": ("🛡 الأمن", "أخبار الأمن والدفاع"),
-    "foreign": ("🌐 السياسة", "السياسة والعلاقات الدولية"),
+    "urgent": (
+        "🚨 عاجل",
+        "عاجل آخر الأخبار والتطورات",
+    ),
+    "world": (
+        "🌍 العالم",
+        "أهم أخبار العالم",
+    ),
+    "gulf": (
+        "🇸🇦 الخليج",
+        "أخبار الخليج",
+    ),
+    "america": (
+        "🇺🇸 أمريكا",
+        "أخبار الولايات المتحدة",
+    ),
+    "europe": (
+        "🇪🇺 أوروبا",
+        "أخبار أوروبا",
+    ),
+    "asia": (
+        "🌏 آسيا",
+        "أخبار آسيا",
+    ),
+    "energy": (
+        "⚡ الطاقة",
+        "أخبار النفط والطاقة",
+    ),
+    "security": (
+        "🛡 الأمن",
+        "أخبار الأمن والدفاع",
+    ),
+    "foreign": (
+        "🌐 السياسة",
+        "السياسة والعلاقات الدولية",
+    ),
 }
 
 
 def main_keyboard():
+    rows = []
     items = list(TOPICS.items())
 
-    return InlineKeyboardMarkup([
-        [
+    for i in range(0, len(items), 2):
+        rows.append([
             InlineKeyboardButton(
                 label,
                 callback_data=f"topic:{key}",
             )
             for key, (label, _) in items[i:i + 2]
-        ]
-        for i in range(0, len(items), 2)
-    ])
+        ])
+
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
-# INTENT GATE
+# GREETING DETECTION
 # ============================================================
 
 GREETING_RE = re.compile(
@@ -95,50 +151,114 @@ GREETING_RE = re.compile(
     re.IGNORECASE,
 )
 
-NEWS_TERMS = {
-    "خبر", "أخبار", "اخبار", "عاجل",
-    "آخر الأخبار", "اخر الاخبار",
-    "اليوم", "الآن", "الان",
-    "حدث", "أحداث", "احداث",
-    "الوضع", "تطورات", "مستجدات",
-    "سياسة", "سياسي",
-    "حرب", "هجوم", "ضربة", "قصف",
-    "صراع", "أزمة", "ازمة",
-    "روسيا", "أوكرانيا", "امريكا", "أمريكا",
-    "الصين", "آسيا",
-    "إيران", "ايران",
-    "إسرائيل", "اسرائيل",
-    "غزة",
-    "السعودية", "الخليج",
-    "الإمارات", "الامارات",
-    "قطر", "الكويت", "البحرين", "عمان",
-    "تركيا", "بريطانيا",
-    "أوروبا", "اوروبا",
-    "النفط", "الطاقة",
-    "أوبك", "اوبك",
-    "اقتصاد", "اقتصادية",
-    "دولار", "أسواق", "اسواق",
-    "أمن", "امن",
-    "دفاع", "عسكري", "عسكرية",
-    "مفاوضات", "اجتماع",
-    "رئيس", "وزير", "وزارة",
-    "تصريح", "بيان",
-    "انتخابات", "برلمان",
-    "news", "breaking", "latest", "world",
-    "russia", "ukraine", "usa", "america",
-    "china", "iran", "israel",
-    "gulf", "oil", "energy",
-}
-
 
 def is_greeting(text: str) -> bool:
-    return bool(GREETING_RE.match(text.strip()))
+    return bool(
+        GREETING_RE.match(
+            text.strip()
+        )
+    )
+
+
+# ============================================================
+# NEWS QUERY DETECTION
+# ============================================================
+
+NEWS_TERMS = {
+    "خبر",
+    "أخبار",
+    "اخبار",
+    "عاجل",
+    "آخر الأخبار",
+    "اخر الاخبار",
+    "اليوم",
+    "الآن",
+    "الان",
+    "حدث",
+    "أحداث",
+    "احداث",
+    "الوضع",
+    "تطورات",
+    "مستجدات",
+    "سياسة",
+    "سياسي",
+    "حرب",
+    "هجوم",
+    "ضربة",
+    "قصف",
+    "صراع",
+    "أزمة",
+    "ازمة",
+    "روسيا",
+    "أوكرانيا",
+    "امريكا",
+    "أمريكا",
+    "الصين",
+    "آسيا",
+    "إيران",
+    "ايران",
+    "إسرائيل",
+    "اسرائيل",
+    "غزة",
+    "السعودية",
+    "الخليج",
+    "الإمارات",
+    "الامارات",
+    "قطر",
+    "الكويت",
+    "البحرين",
+    "عمان",
+    "تركيا",
+    "بريطانيا",
+    "أوروبا",
+    "اوروبا",
+    "النفط",
+    "الطاقة",
+    "أوبك",
+    "اوبك",
+    "اقتصاد",
+    "اقتصادية",
+    "دولار",
+    "أسواق",
+    "اسواق",
+    "أمن",
+    "امن",
+    "دفاع",
+    "عسكري",
+    "عسكرية",
+    "مفاوضات",
+    "اجتماع",
+    "رئيس",
+    "وزير",
+    "وزارة",
+    "تصريح",
+    "بيان",
+    "انتخابات",
+    "برلمان",
+    "news",
+    "breaking",
+    "latest",
+    "world",
+    "russia",
+    "ukraine",
+    "usa",
+    "america",
+    "china",
+    "iran",
+    "israel",
+    "gulf",
+    "oil",
+    "energy",
+}
 
 
 def is_news_query(text: str) -> bool:
     t = text.strip().lower()
 
-    if any(term.lower() in t for term in NEWS_TERMS):
+    if any(
+        term.lower() in t
+        for term in NEWS_TERMS
+    ):
         return True
 
     patterns = (
@@ -160,11 +280,18 @@ def is_news_query(text: str) -> bool:
         r"\bbreaking news\b",
     )
 
-    return any(re.search(pattern, t, re.I) for pattern in patterns)
+    return any(
+        re.search(
+            pattern,
+            t,
+            re.I,
+        )
+        for pattern in patterns
+    )
 
 
 # ============================================================
-# GEMINI
+# GEMINI REQUEST
 # ============================================================
 
 async def ask_gemini(prompt: str) -> str:
@@ -183,7 +310,16 @@ async def ask_gemini(prompt: str) -> str:
             timeout=GEMINI_TIMEOUT,
         )
 
-        return (getattr(response, "text", None) or "").strip()
+        text = (
+            getattr(
+                response,
+                "text",
+                None,
+            )
+            or ""
+        ).strip()
+
+        return text or "تعذر إنشاء التحليل حالياً."
 
     except asyncio.TimeoutError:
         log.warning("Gemini timeout")
@@ -195,29 +331,43 @@ async def ask_gemini(prompt: str) -> str:
 
 
 # ============================================================
-# NEWS
+# NEWS COLLECTION
 # ============================================================
 
 async def get_fresh_news():
+    """
+    collect_news() في news_engine.py هي async.
+    لذلك يجب استدعاؤها مباشرة باستخدام await.
+    """
+
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(
-                collect_news,
-                max_items=100,
+            collect_news(
+                max_items=100
             ),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
 
     except asyncio.TimeoutError:
-        log.warning("News collection timeout")
+        log.warning(
+            "News collection timeout"
+        )
         return []
 
     except Exception:
-        log.exception("News collection error")
+        log.exception(
+            "News collection error"
+        )
         return []
 
 
-async def search_user_news(text: str):
+# ============================================================
+# USER NEWS SEARCH
+# ============================================================
+
+async def search_user_news(
+    text: str,
+):
     items = await get_fresh_news()
 
     if not items:
@@ -231,63 +381,63 @@ async def search_user_news(text: str):
         )
 
     except Exception:
-        log.exception("News search error")
+        log.exception(
+            "News search error"
+        )
         return []
 
 
 # ============================================================
-# REPORT
+# AI REPORT
 # ============================================================
 
 REPORT_PROMPT = """
 أنت محلل أخبار دقيق ومختصر.
 
-حلل الأخبار الموجودة في البيانات فقط.
+مهمتك تحليل الأخبار التي يرسلها محرك الأخبار فقط.
 
-القواعد:
-1. لا تخترع أي معلومة.
-2. لا تضف معلومات من خارج البيانات.
-3. لا تستخدم أخباراً غير مرتبطة بالسؤال.
-4. لا تكرر الخبر نفسه.
-5. لا تضع مقدمات أو حشواً.
-6. أعط الأولوية للأحدث والأكثر أهمية.
-7. أعط الأولوية للمصادر الموثوقة.
-8. إذا اختلفت المصادر، اذكر ذلك باختصار.
-9. فرّق بين الحقيقة والاستنتاج.
-10. إذا لم توجد معلومات كافية، قل ذلك بوضوح.
-11. استخدم العربية المباشرة.
-12. لا تطل التقرير دون حاجة.
+القواعد الصارمة:
 
-الصيغة:
+1. لا تخترع أي معلومة غير موجودة في البيانات.
+2. لا تعتبر الاستنتاج حقيقة.
+3. لا تكرر الخبر نفسه.
+4. لا تضع حشواً أو مقدمات طويلة.
+5. إذا كانت الأخبار غير كافية للإجابة، قل بوضوح إن المعلومات المتاحة غير كافية.
+6. إذا لم توجد أخبار مرتبطة بالسؤال، لا تستخدم أخباراً عشوائية.
+7. أعط الأولوية للأحدث والأكثر أهمية والمصادر الأكثر موثوقية.
+8. عند وجود اختلاف بين المصادر، اذكر الاختلاف باختصار.
+9. استخدم العربية الواضحة والمباشرة.
+10. لا تكتب تحليلاً مطولاً إلا إذا كان السؤال يحتاج ذلك.
 
-🚨 الخلاصة
+صيغة الإجابة:
+
+🚨 العنوان أو الخلاصة
 
 • أهم نقطة
 • أهم نقطة
 • أهم نقطة
 
 📌 المصادر:
-- المصدر: الرابط
+- اسم المصدر: الرابط
 
 لا تذكر إلا المعلومات المرتبطة بالسؤال.
 """
 
 
-async def generate_report(question: str, items) -> str:
+async def generate_report(
+    question: str,
+    items,
+) -> str:
+
     if not items:
         return (
-            "🔎 لم أجد أخباراً مرتبطة مباشرة بسؤالك "
-            "ضمن المصادر المتاحة حالياً."
+            "🔎 لم أجد أخباراً مرتبطة مباشرة "
+            "بسؤالك ضمن المصادر المتاحة حالياً."
         )
 
-    try:
-        context = build_ai_context(items)
-    except Exception:
-        log.exception("Context building error")
-        context = ""
-
-    if not context:
-        return fallback_report(items)
+    context = build_ai_context(
+        items
+    )
 
     prompt = f"""
 {REPORT_PROMPT}
@@ -299,69 +449,97 @@ async def generate_report(question: str, items) -> str:
 {context}
 """
 
-    result = await ask_gemini(prompt)
+    result = await ask_gemini(
+        prompt
+    )
 
     if result:
         return result
 
-    log.warning("Using fallback report")
-    return fallback_report(items)
-
-
-def fallback_report(items) -> str:
-    lines = ["📰 أبرز الأخبار المرتبطة:\n"]
+    lines = [
+        "📰 أبرز الأخبار المرتبطة بسؤالك:\n"
+    ]
 
     for item in items[:8]:
-        title = getattr(item, "title", "") or ""
-        source = getattr(item, "source", "") or ""
-        url = getattr(item, "url", "") or ""
 
-        if not title:
-            continue
+        title = (
+            getattr(
+                item,
+                "title",
+                "",
+            )
+            or ""
+        )
 
-        lines.append(f"• {title}")
+        source = (
+            getattr(
+                item,
+                "source",
+                "",
+            )
+            or ""
+        )
 
-        if source:
-            lines.append(f"  المصدر: {source}")
+        url = (
+            getattr(
+                item,
+                "url",
+                "",
+            )
+            or ""
+        )
 
-        if url:
-            lines.append(f"  {url}")
+        if title:
+            lines.append(
+                f"• {title}"
+            )
 
-    return "\n".join(lines)
+            if source:
+                lines.append(
+                    f"  المصدر: {source}"
+                )
+
+            if url:
+                lines.append(
+                    f"  {url}"
+                )
+
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
-# MESSAGE HELPERS
+# LONG TELEGRAM MESSAGE
 # ============================================================
 
-async def send_long_message(update: Update, text: str):
+async def send_long_message(
+    update: Update,
+    text: str,
+):
+
     if not text:
         return
 
-    for i in range(0, len(text), 3900):
+    for i in range(
+        0,
+        len(text),
+        3900,
+    ):
         await update.message.reply_text(
             text[i:i + 3900]
         )
 
 
-async def send_callback_message(query, text: str):
-    if not text:
-        return
-
-    for i in range(0, len(text), 3900):
-        await query.message.reply_text(
-            text[i:i + 3900]
-        )
-
-
 # ============================================================
-# START
+# /START
 # ============================================================
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     await update.message.reply_text(
         "📰 مرحباً بك في بوت الأخبار.\n\n"
         "اختر مجالاً من الأزرار أو اكتب سؤالك مباشرة.",
@@ -377,28 +555,25 @@ async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
-    try:
-        await query.answer()
-    except Exception:
-        log.exception("Callback answer error")
+    await query.answer()
 
-    data = query.data or ""
-
-    if not data.startswith("topic:"):
-        log.warning("Unknown callback: %s", data)
-        return
-
-    key = data.split(":", 1)[1]
+    key = query.data.split(
+        ":",
+        1,
+    )[1]
 
     if key not in TOPICS:
-        log.warning("Unknown topic key: %s", key)
         return
 
     _, topic_text = TOPICS[key]
 
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
+
     lock = USER_LOCKS.setdefault(
         user_id,
         asyncio.Lock(),
@@ -406,27 +581,27 @@ async def button_handler(
 
     if lock.locked():
         await query.message.reply_text(
-            "⏳ يوجد طلب قيد المعالجة. انتظر اكتماله."
+            "⏳ يوجد طلب قيد المعالجة. "
+            "انتظر اكتماله."
         )
         return
 
-    # استجابة فورية للزر
-    try:
-        await query.edit_message_text(
-            f"📡 جاري البحث عن:\n"
-            f"{topic_text}\n\n"
-            f"قد يستغرق جمع الأخبار بضع ثوانٍ..."
-        )
-    except Exception:
-        log.exception("Callback status error")
-
     async with lock:
+
+        status = await query.message.reply_text(
+            "📡 جاري البحث عن الأخبار..."
+        )
+
         try:
+
+            # FIX:
+            # collect_news() async
             items = await get_fresh_news()
 
             if not items:
-                await query.message.reply_text(
-                    "⚠️ تعذر الوصول إلى مصادر الأخبار حالياً."
+                await status.edit_text(
+                    "⚠️ تعذر الوصول إلى "
+                    "مصادر الأخبار حالياً."
                 )
                 return
 
@@ -437,9 +612,9 @@ async def button_handler(
             )
 
             if not results:
-                await query.message.reply_text(
-                    f"🔎 لا توجد أخبار مرتبطة بـ "
-                    f"{topic_text} حالياً."
+                await status.edit_text(
+                    "🔎 لا توجد أخبار مرتبطة "
+                    "بهذا المجال حالياً."
                 )
                 return
 
@@ -448,46 +623,47 @@ async def button_handler(
                 results,
             )
 
-            await send_callback_message(
-                query,
-                report,
-            )
+            await status.delete()
 
-        except asyncio.CancelledError:
-            raise
+            await query.message.reply_text(
+                report
+            )
 
         except Exception:
+
             log.exception(
-                "Button handler error | user=%s | topic=%s",
-                user_id,
-                key,
+                "Button handler error"
             )
 
-            try:
-                await query.message.reply_text(
-                    "⚠️ حدث خطأ مؤقت أثناء معالجة الطلب."
-                )
-            except Exception:
-                log.exception(
-                    "Button error message failed"
-                )
+            await status.edit_text(
+                "⚠️ حدث خطأ مؤقت أثناء "
+                "معالجة الطلب."
+            )
 
 
 # ============================================================
-# USER MESSAGE
+# USER MESSAGE HANDLER
 # ============================================================
 
 async def handle_user_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    text = (update.message.text or "").strip()
+
+    text = (
+        update.message.text
+        or ""
+    ).strip()
 
     if not text:
         return
 
-    # تحية = رد مباشر
+    # --------------------------------------------------------
+    # Greeting
+    # --------------------------------------------------------
+
     if is_greeting(text):
+
         if "السلام" in text:
             message = (
                 "وعليكم السلام، أهلاً بك.\n"
@@ -503,23 +679,34 @@ async def handle_user_message(
             message,
             reply_markup=main_keyboard(),
         )
+
         return
 
-    # ليس طلب أخبار
+    # --------------------------------------------------------
+    # Non-news message
+    # --------------------------------------------------------
+
     if not is_news_query(text):
+
         await update.message.reply_text(
-            "أنا مخصص للأخبار والتحليل الإخباري.\n\n"
-            "اكتب مثلاً:\n"
+            "أنا مخصص للأخبار والتحليل الإخباري.\n"
+            "اكتب مثلاً:\n\n"
             "• آخر أخبار روسيا؟\n"
             "• ماذا يحدث في آسيا؟\n"
             "• أهم أخبار الخليج اليوم؟\n"
             "• هل هناك تطورات جديدة في إيران؟",
             reply_markup=main_keyboard(),
         )
+
         return
 
-    # طلب أخبار
-    user_id = update.effective_user.id
+    # --------------------------------------------------------
+    # User lock
+    # --------------------------------------------------------
+
+    user_id = (
+        update.effective_user.id
+    )
 
     lock = USER_LOCKS.setdefault(
         user_id,
@@ -527,24 +714,34 @@ async def handle_user_message(
     )
 
     if lock.locked():
+
         await update.message.reply_text(
-            "⏳ يوجد طلب قيد المعالجة. انتظر اكتماله."
+            "⏳ يوجد طلب قيد المعالجة. "
+            "انتظر اكتماله."
         )
+
         return
 
     async with lock:
+
         status = await update.message.reply_text(
             "📡 جاري البحث عن أخبار مرتبطة بسؤالك..."
         )
 
         try:
-            results = await search_user_news(text)
+
+            results = await search_user_news(
+                text
+            )
 
             if not results:
+
                 await status.edit_text(
-                    "🔎 لم أجد أخباراً مرتبطة مباشرة بسؤالك "
-                    "ضمن المصادر المتاحة حالياً."
+                    "🔎 لم أجد أخباراً مرتبطة "
+                    "مباشرة بسؤالك ضمن المصادر "
+                    "المتاحة حالياً."
                 )
+
                 return
 
             report = await generate_report(
@@ -552,45 +749,47 @@ async def handle_user_message(
                 results,
             )
 
-            try:
-                await status.delete()
-            except Exception:
-                pass
+            await status.delete()
 
             await send_long_message(
                 update,
                 report,
             )
 
-        except asyncio.CancelledError:
-            raise
-
         except Exception:
+
             log.exception(
                 "User message handler error"
             )
 
-            try:
-                await status.edit_text(
-                    "⚠️ حدث خطأ مؤقت أثناء معالجة الطلب."
-                )
-            except Exception:
-                pass
+            await status.edit_text(
+                "⚠️ حدث خطأ مؤقت أثناء "
+                "معالجة الطلب."
+            )
 
 
 # ============================================================
-# STARTUP
+# POST INIT
 # ============================================================
 
-async def post_init(application):
+async def post_init(
+    application,
+):
+
     me = await application.bot.get_me()
+
     log.info(
         "Telegram connected: @%s",
         me.username,
     )
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -608,7 +807,7 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             button_handler,
-            pattern=r"^topic:[a-z_]+$",
+            pattern=r"^topic:",
         )
     )
 
@@ -619,7 +818,9 @@ def main():
         )
     )
 
-    log.info("Bot starting...")
+    log.info(
+        "Bot starting..."
+    )
 
     app.run_polling(
         drop_pending_updates=True

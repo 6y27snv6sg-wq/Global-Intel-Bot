@@ -52,7 +52,7 @@ MAX_SEARCH_RESULTS = 25
 CACHE_TTL = 300
 
 if not BOT_TOKEN or not GEMINI_API_KEY:
-    raise RuntimeError("Missing Tokens/Keys")
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or GEMINI_API_KEY")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -87,7 +87,7 @@ MUTED_USERS: Set[int] = set()
 
 
 # ============================================================
-# LINK SANITIZER
+# LINK SANITIZER (منع تشوه الشاشة واستبدال الروابط المعطلة)
 # ============================================================
 
 def build_safe_link(title: str, source: str, raw_url: str) -> str:
@@ -100,18 +100,20 @@ def build_safe_link(title: str, source: str, raw_url: str) -> str:
 
 
 # ============================================================
-# TOPICS (تحديث الفلترة الاقتصادية الصارمة)
+# TOPICS & KEYBOARDS (دمج الاقتصاد والطاقة + مرونة الوزارات)
 # ============================================================
 
 TOPICS = {
-    "urgent": ("🚨 عاجل وبيانات رسمية", "تصريح رسمي عاجل بيانات وزارة الخارجية"),
-    # تنقية قسم الاقتصاد للتركيز الحصري على الأسواق والأسهم والمعادن والفيدرالي
-    "economy": ("📈 الأسواق والمالية", "أسهم بورصة الذهب معادن الفيدرالي الفائدة عملات رقمية بيتكوين تداول أسواق المال"),
-    "foreign": ("🏛 الخارجية والدبلوماسية", "وزارة الخارجية تصريح بيان رسمي دبلوماسي"),
-    "gulf": ("🇸🇦 الخليج والشرق الأوسط", "أخبار الخليج العربي الخارجية السعودية الإمارات"),
-    "energy": ("⚡ النفط والطاقة", "أخبار النفط أوبك بلس وزارة الطاقة أسواق الخام"),
-    "world": ("🌍 العالم والسياسة", "أخبار العالم التصريحات الدولية القمة"),
-    "security": ("🛡 الدفاع والأمن", "أخبار الدفاع الأمن العسكري الاتفاقيات الأمنية"),
+    # 1. فلترة شاملة لكافة الوزارات والدول
+    "foreign": ("🏛 البيانات والتصريحات الوزارية", 'وزارة OR وزير OR المتحدث OR "بيان رسمي" OR "تصريح رسمي" OR "بيان صحفي" OR "مصدر مسؤول" OR "رئاسة الوزراء" OR "الديوان"'),
+    
+    # 2. دمج الاقتصاد مع النفط والطاقة والأسواق
+    "economy_energy": ("📈 الاقتصاد والطاقة والأسواق", 'أسهم OR بورصة OR الذهب OR معادن OR الفيدرالي OR الفائدة OR "عملات رقمية" OR بيتكوين OR تداول OR النفط OR أوبك OR "أوبك بلس" OR "وزارة الطاقة" OR "أسواق الخام"'),
+    
+    "urgent": ("🚨 عاجل وبيانات طارئة", '"عاجل" OR "بيان هام" OR "تصريح عاجل" OR "مصدر مسؤول"'),
+    "gulf": ("🇸🇦 الخليج والشرق الأوسط", 'الخليج OR السعودية OR الإمارات OR قطر OR الكويت OR البحرين OR عمان'),
+    "world": ("🌍 العالم والسياسة", 'دولية OR قمة OR أمريكا OR أوروبا OR الصين OR روسيا'),
+    "security": ("🛡 الدفاع والأمن", '"وزارة الدفاع" OR "الأمن القومي" OR "صفقة تسليح" OR "مناورات عسكرية"'),
 }
 
 
@@ -119,10 +121,12 @@ def main_keyboard(user_id: int):
     rows = []
     items = list(TOPICS.items())
 
+    # عرض الأزرار في صفوف ثنائية
     for i in range(0, len(items), 2):
         row = [InlineKeyboardButton(label, callback_data=f"topic:{key}:1") for key, (label, _) in items[i:i + 2]]
         rows.append(row)
 
+    # زر التنبيهات العاجلة وزر التحديث
     is_muted = user_id in MUTED_USERS
     alert_btn_text = "🔔 تفعيل التنبيهات المنبثقة" if is_muted else "🔕 إيقاف التنبيهات المنبثقة"
     alert_action = "unmute_alerts" if is_muted else "mute_alerts"
@@ -137,12 +141,12 @@ def main_keyboard(user_id: int):
 # ============================================================
 
 ANALYSIS_PROMPT = """
-أنت محلل أسواق وأخبار تنفيذي.
-قم بتقديم تحليل مالي/سياسي مقتضب جداً لأهم التطورات المذكورة:
+أنت محرر ومحلل إخباري تنفيذي.
+قم بتقديم تحليل مقتضب ودقيق جداً لأبرز النقاط المذكورة:
 
-🎯 **الموجز التنفيذي:**
-• [التحليل والمؤشر الرئيسي]
-• [التأثير المباشر على الأسواق/القطاع]
+🎯 **التحليل والموجز التنفيذي:**
+• [النقاط الجوهرية والتطورات الرئيسية]
+• [التأثير المباشر والأبعاد المستقبلية]
 
 ⚠️ اقتصر على 80 كلمة فقط.
 """
@@ -194,12 +198,11 @@ async def get_fresh_news():
 
 
 def generate_base_report(items, page: int = 1, per_page: int = 5):
-    """عرض الأخبار النقية بدون حشو أو تشوه"""
     start_idx = (page - 1) * per_page
     end_idx = start_idx + per_page
     page_items = items[start_idx:end_idx]
 
-    lines = ["📰 **أبرز التغطيات والبيانات المتخصصة:**\n"]
+    lines = ["📰 **أبرز التغطيات والبيانات الصادرة:**\n"]
 
     for item in page_items:
         title = getattr(item, "title", "") or getattr(item, "caption", "") or ""
@@ -209,7 +212,7 @@ def generate_base_report(items, page: int = 1, per_page: int = 5):
         safe_url = build_safe_link(title, source, raw_url)
 
         if title:
-            entry = f"• **{title}**\n  📍 *المصدر:* `{source}` | [🔗 قراءة الخبر]({safe_url})"
+            entry = f"• **{title}**\n  📍 *المصدر:* `{source}` | [🔗 قراءة التغطية]({safe_url})"
             lines.append(entry + "\n")
 
     return "\n".join(lines)
@@ -233,7 +236,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
 
-    # إشعار علوي منبثق عند الكتم أو التفعيل (Popup Toast)
+    # التعامل مع أزرار التنبيهات المنبثقة (Toast Popup)
     if query.data == "mute_alerts":
         MUTED_USERS.add(user_id)
         await query.answer(text="🔕 تم إيقاف التنبيهات المنبثقة العلويّة", show_alert=True)
@@ -254,10 +257,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "refresh":
         NEWS_CACHE.set("all_news", None)
-        await query.answer(text="🔄 تم تحديث موجز الأخبار بنجاح!", show_alert=True)
+        await query.answer(text="🔄 تم تحديث التغطية والبيانات بنجاح!", show_alert=True)
         return
 
-    # تحليل عند الطلب عبر Gemini
+    # زر تحليل Gemini عند الطلب لتوفير التوكنز
     if query.data.startswith("analyze:"):
         key = query.data.split(":")[1]
         status = await query.message.reply_text("🧠 جاري إرسال البيانات للتحليل...")
@@ -273,7 +276,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("⚠️ لا توجد بيانات كافية للتحليل.")
         return
 
-    # التصفح العادي للأخبار
+    # التصفح والتنقل
     parts = query.data.split(":")
     if len(parts) < 3 or parts[0] != "topic":
         return
@@ -290,19 +293,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with lock:
-        status = await query.message.reply_text("📡 جاري فرز الأخبار المالية والتصريحات...")
+        status = await query.message.reply_text("📡 جاري فرز الأخبار والبيانات...")
 
         try:
             items = await get_fresh_news()
             results = search_news(items, topic_text, max_results=MAX_SEARCH_RESULTS) if items else []
 
-            # إذا وُجد خبر عاجل جداً والمستخدم لم يكتم التنبيهات، نرسل إشعاراً علوياً ينبثق فوق الشاشة
+            # التنبيه المنبثق العلوي عند وجود خبر عاجل
             if key == "urgent" and results and user_id not in MUTED_USERS:
                 top_news = getattr(results[0], "title", "خبر عاجل جديد!")
                 await query.answer(text=f"🚨 عاجل: {top_news[:100]}", show_alert=True)
 
             if not results:
-                await status.edit_text("🔎 لا توجد أخبار جديدة في هذا القطاع حالياً.")
+                await status.edit_text("🔎 لا توجد أخبار أو بيانات جديدة في هذا القسم حالياً.")
                 return
 
             report = generate_base_report(results, page=page, per_page=5)
@@ -313,9 +316,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if page < total_pages:
                 nav_buttons.append(InlineKeyboardButton("➕ إضافية", callback_data=f"topic:{key}:{page+1}"))
             
-            nav_buttons.append(InlineKeyboardButton("🧠 تحليل Gemini", callback_data=f"analyze:{key}"))
+            nav_buttons.append(InlineKeyboardButton("🧠 تحليل البيانات", callback_data=f"analyze:{key}"))
 
-            rows = [nav_buttons, [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="home")]]
+            # التنسيق الجديد للأزرار: زر القائمة الرئيسية في المنتصف على سطر منفرد
+            rows = [
+                nav_buttons,
+                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="home")]  # زر ممتد في المنتصف
+            ]
 
             await status.edit_text(
                 report,
@@ -326,7 +333,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception:
             log.exception("Button Handler Exception")
-            await status.edit_text("⚠️ حدث خطأ أثناء عرض التقرير.")
+            await status.edit_text("⚠️ حدث خطأ أثناء عرض البيانات.")
 
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -354,6 +361,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             report = generate_base_report(results, page=1, per_page=5)
             
+            # زر القائمة الرئيسية في المنتصف
             await status.edit_text(
                 report,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="home")]]),
@@ -375,7 +383,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(topic:|home|refresh|mute_alerts|unmute_alerts|analyze:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message))
 
-    log.info("Pro Bot Launched Successfully...")
+    log.info("Pro News Bot Launched...")
     app.run_polling(drop_pending_updates=True)
 
 

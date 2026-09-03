@@ -103,23 +103,23 @@ def escape_markdown(text: str) -> str:
 
 
 # ============================================================
-# TOPICS (المناطق والأقسام المحدثة)
+# TOPICS (المناطق والقطاعات الرسمية)
 # ============================================================
 
 TOPICS = {
-    "urgent": ("🚨 عاجل", "عاجل آخر الأخبار والتطورات"),
-    "world": ("🌍 العالم", "أهم أخبار العالم"),
-    "gulf": ("🇸🇦 الخليج", "أخبار الخليج العربي"),
-    "america": ("🇺🇸 أمريكا", "أخبار الولايات المتحدة"),
-    "canada": ("🇨🇦 كندا", "أخبار كندا"),
+    "urgent": ("🚨 عاجل ورسمي", "تصريح رسمي عاجل بيانات وزارة الخارجية"),
+    "foreign": ("🏛 الخارجية والبيانات", "وزارة الخارجية تصريح بيان رسمي"),
+    "gulf": ("🇸🇦 الخليج والرؤية", "أخبار الخليج العربي الخارجية والبيانات الرسمية"),
+    "world": ("🌍 العالم والدبلوماسية", "أخبار العالم التصريحات الدبلوماسية"),
+    "america": ("🇺🇸 أمريكا", "أخبار الولايات المتحدة الخارجية الأمريكية"),
+    "canada": ("🇨🇦 كندا", "أخبار كندا الخارجية الكندية"),
     "latin": ("🇧🇷 أمريكا الجنوبية", "أخبار أمريكا اللاتينية والجنوبية"),
-    "europe": ("🇪🇺 أوروبا", "أخبار أوروبا"),
-    "asia": ("🌏 آسيا", "أخبار آسيا"),
+    "europe": ("🇪🇺 أوروبا", "أخبار أوروبا الاتحاد الأوروبي"),
+    "asia": ("🌏 آسيا", "أخبار آسيا الخارجية"),
     "africa": ("🌍 أفريقيا", "أخبار القارة الأفريقية"),
     "australia": ("🇦🇺 أستراليا", "أخبار أستراليا ونيوزيلندا"),
-    "energy": ("⚡ الطاقة", "أخبار النفط والطاقة"),
-    "security": ("🛡 الأمن", "أخبار الأمن والدفاع"),
-    "foreign": ("🌐 السياسة", "السياسة والعلاقات الدولية"),
+    "energy": ("⚡ النفط والطاقة", "أخبار النفط أوبك وزارة الطاقة"),
+    "security": ("🛡 الأمن والدفاع", "أخبار الأمن والدفاع وزارة الدفاع"),
 }
 
 
@@ -165,12 +165,12 @@ NEWS_TERMS = {
     "الكويت", "البحرين", "عمان", "تركيا", "بريطانيا", "أوروبا",
     "اوروبا", "النفط", "الطاقة", "أوبك", "اوبك", "اقتصاد", "اقتصادية",
     "دولار", "أسواق", "اسواق", "أمن", "امن", "دفاع", "عسكري",
-    "عسكرية", "مفاوضات", "اجتماع", "رئيس", "وزير", "وزارة",
+    "عسكرية", "مفاوضات", "اجتماع", "رئيس", "وزير", "وزارة", "الخارجية",
     "تصريح", "بيان", "انتخابات", "برلمان", "أفريقيا", "افريقيا",
     "كندا", "أستراليا", "استراليا", "أمريكا الجنوبية", "امريكا الجنوبية",
     "البرازيل", "الأرجنتين", "news", "breaking", "latest", "world",
     "russia", "ukraine", "usa", "america", "china", "iran", "israel",
-    "gulf", "oil", "energy", "africa", "canada", "australia",
+    "gulf", "oil", "energy", "africa", "canada", "australia", "statement",
 }
 
 
@@ -251,41 +251,42 @@ async def search_user_news(text: str):
 
 
 # ============================================================
-# REPORT GENERATION & PAGINATION (تصفح الأخبار)
+# REPORT GENERATION (تأنيق الروابط وتقسيم الصفحات)
 # ============================================================
 
 REPORT_PROMPT = """
 أنت محلل أخبار دقيق ومختصر.
-مهمتك تحليل الأخبار المتاحة فقط بدون زيادة أو اختراع.
+مهمتك تحليل الأخبار والبيانات الرسمية المتاحة فقط.
 
 صيغة الإجابة:
-🚨 الخلاصة أو العنوان الرئيسي
+🚨 الخلاصة أو التصريح الرئيسي
 
 • أهم نقطة
 • أهم نقطة
 
-📌 المصادر:
-- اسم المصدر: الرابط
+📌 المصادر والبيانات الرسمية:
+- اسم المصدر: [🔗 المصدر](الرابط)
 """
 
 
 def generate_fallback_report(items, page: int = 1, per_page: int = 5):
-    """التقرير الاحتياطي مع دعم تقسيم الصفحة (Pagination)"""
+    """التقرير البديل مع إخفاء الروابط الطويلة خلف نص تفاعلي أنيق"""
     start_idx = (page - 1) * per_page
     end_idx = start_idx + per_page
     page_items = items[start_idx:end_idx]
 
-    lines = ["📰 **أبرز الأخبار المتاحة:**\n"]
+    lines = ["📰 **أبرز الأخبار والتصريحات الرسمية:**\n"]
 
     for item in page_items:
         title = getattr(item, "title", "") or getattr(item, "caption", "") or ""
-        source = getattr(item, "source", "") or "مصدر إخباري"
+        source = getattr(item, "source", "") or "مصدر إخباري/رسمي"
         url = getattr(item, "url", "") or getattr(item, "link", "") or ""
 
         if title:
             entry = f"• **{title}**\n  📍 *{source}*"
+            # إخفاء الرابط الطويل خلف كلمة [🔗 تفاصيل الخبر]
             if url:
-                entry += f" | [🔗 رابط الخبر]({url})"
+                entry += f" | [🔗 تفاصيل الخبر]({url})"
             lines.append(entry + "\n")
 
     return "\n".join(lines)
@@ -293,22 +294,19 @@ def generate_fallback_report(items, page: int = 1, per_page: int = 5):
 
 async def generate_report(question: str, items, page: int = 1, per_page: int = 5) -> str:
     if not items:
-        return "🔎 لم أجد أخباراً مرتبطة مباشرة بسؤالك ضمن المصادر المتاحة حالياً."
+        return "🔎 لم أجد أخباراً أو تصريحات مرتبطة بسؤالك ضمن المصادر المتاحة حالياً."
 
-    # محاولة استخدام الذكاء الاصطناعي في الصفحة الأولى
     if page == 1:
         context = build_ai_context(items[:10])
-        prompt = f"{REPORT_PROMPT}\nالسؤال: {question}\nالأخبار المتاحة:\n{context}"
+        prompt = f"{REPORT_PROMPT}\nالسؤال: {question}\nالأخبار والبيانات المتاحة:\n{context}"
         ai_result = await ask_gemini(prompt)
         if ai_result:
             return ai_result
 
-    # الانتقال إلى العرض البديل الذكي تلقائياً عند توقف Gemini أو عند الانتقال للصفحة 2+
     return generate_fallback_report(items, page=page, per_page=per_page)
 
 
 def build_pagination_keyboard(key: str, current_page: int, total_items: int, per_page: int = 5):
-    """إنشاء زر التصفح للتنقل بين الأخبار"""
     buttons = []
     total_pages = (total_items + per_page - 1) // per_page
 
@@ -339,7 +337,6 @@ async def send_long_message(message_or_query, text: str, reply_markup=None):
     sender = getattr(message_or_query, "message", message_or_query)
 
     try:
-        # المحاولة الأولى مع التنسيق المعياري
         for i in range(0, len(text), 3900):
             chunk = text[i:i + 3900]
             await sender.reply_text(
@@ -349,7 +346,6 @@ async def send_long_message(message_or_query, text: str, reply_markup=None):
                 parse_mode="Markdown"
             )
     except Exception:
-        # Fail-Soft protection: إزالة التنسيق في حال وجود رموز ضارة
         clean_text = text.replace("*", "").replace("_", "").replace("`", "")
         for i in range(0, len(clean_text), 3900):
             chunk = clean_text[i:i + 3900]
@@ -366,8 +362,8 @@ async def send_long_message(message_or_query, text: str, reply_markup=None):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📰 مرحباً بك في بوت الأخبار العالمي الشامل.\n\n"
-        "اختر القطاع أو المنطقة الجغرافية، أو اكتب سؤالك الإخباري مباشرة:",
+        "📰 مرحباً بك في بوت الأخبار والتصريحات الرسمية الشامل.\n\n"
+        "اختر القطاع أو اكتب سؤالك/اسم الجهة التي تود البحث عنها مباشرة:",
         reply_markup=main_keyboard(),
     )
 
@@ -402,13 +398,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with lock:
-        status = await query.message.reply_text("📡 جاري تحديث الأخبار...")
+        status = await query.message.reply_text("📡 جاري تحديث الأخبار والتصريحات الرسمية...")
 
         try:
             items = await get_fresh_news()
 
             if not items:
-                await status.edit_text("⚠️ تعذر الوصول إلى مصادر الأخبار حالياً.")
+                await status.edit_text("⚠️ تعذر الوصول إلى المصادر حالياً.")
                 return
 
             results = search_news(items, topic_text, max_results=MAX_SEARCH_RESULTS)
@@ -430,7 +426,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("Button Handler Exception")
             try:
-                await status.edit_text("⚠️ تعذر جلب التقرير حالياً. يرجى المحاولة لاحقاً.")
+                await status.edit_text("⚠️ تعذر جلب التقرير حالياً.")
             except Exception:
                 await query.message.reply_text("⚠️ تعذر جلب التقرير حالياً.")
 
@@ -443,15 +439,15 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_greeting(text):
         reply = "وعليكم السلام ورحمة الله وبركاته، أهلاً بك!" if "السلام" in text else "أهلاً بك!"
         await update.message.reply_text(
-            f"{reply}\nاختر قسماً أو اكتب سؤالك الإخباري:",
+            f"{reply}\nاختر قسماً أو اكتب استفسارك:",
             reply_markup=main_keyboard()
         )
         return
 
     if not is_news_query(text):
         await update.message.reply_text(
-            "أنا مخصص لمتابعة وتلخيص الأخبار العالمية.\n"
-            "يمكنك اختيار قسم من الأزرار أعلاه أو كتابة استفسار إخباري (مثال: أخبار كندا، أستراليا، النفط).",
+            "أنا مخصص لمتابعة وتلخيص الأخبار والتصريحات الرسمية.\n"
+            "يمكنك اختيار قسم من الأزرار أو كتابة استفسار (مثال: بيان الخارجية السعودية، أخبار كندا، النفط).",
             reply_markup=main_keyboard()
         )
         return
@@ -464,7 +460,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     async with lock:
-        status = await update.message.reply_text("📡 جاري البحث في كافة الوكالات...")
+        status = await update.message.reply_text("📡 جاري البحث في كافة الوكالات والمصادر الرسمية...")
 
         try:
             results = await search_user_news(text)

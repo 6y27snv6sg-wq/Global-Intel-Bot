@@ -1,91 +1,36 @@
 import asyncio
 import logging
 import os
-from typing import Dict
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-)
-
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 from google import genai
 from google.genai import types
-
-from news_engine import (
-    collect_news,
-    search_news,
-    build_ai_context,
-)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+from news_engine import collect_news, search_news, build_ai_context
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-
 logger = logging.getLogger("LiveNewsBot")
 
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
+BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 GEMINI_MODEL = "gemini-3.5-flash"
-
 NEWS_COLLECTION_TIMEOUT = 20
 MAX_SEARCH_RESULTS = 15
 
-
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN or TELEGRAM_BOT_TOKEN is missing."
-    )
-
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is missing."
-    )
+    raise RuntimeError("GEMINI_API_KEY is missing.")
 
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+USER_LOCKS = {}
 
-# ============================================================
-# GEMINI
-# ============================================================
-
-ai_client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
-
-
-# ============================================================
-# USER LOCKS
-# ============================================================
-
-USER_LOCKS: Dict[int, asyncio.Lock] = {}
-
-
-def get_user_lock(user_id: int) -> asyncio.Lock:
-
+def get_user_lock(user_id):
     if user_id not in USER_LOCKS:
         USER_LOCKS[user_id] = asyncio.Lock()
-
     return USER_LOCKS[user_id]
-
-
-# ============================================================
-# TOPICS
-# ============================================================
 
 TOPICS = {
     "urgent": "الأخبار العاجلة والتطورات المهمة الآن",
@@ -99,241 +44,96 @@ TOPICS = {
     "foreign": "السياسة الخارجية والعلاقات الدولية",
 }
 
-
-# ============================================================
-# KEYBOARDS
-# ============================================================
-
-def main_keyboard() -> InlineKeyboardMarkup:
-
-    keyboard = [
+def main_keyboard():
+    k = [
         [
-            InlineKeyboardButton(
-                "🚨 عاجل",
-                callback_data="topic:urgent",
-            ),
-            InlineKeyboardButton(
-                "🌍 العالم",
-                callback_data="topic:world",
-            ),
+            InlineKeyboardButton("🚨 عاجل", callback_data="topic:urgent"),
+            InlineKeyboardButton("🌍 العالم", callback_data="topic:world"),
         ],
         [
-            InlineKeyboardButton(
-                "🇸🇦 الخليج",
-                callback_data="topic:gulf",
-            ),
-            InlineKeyboardButton(
-                "🇺🇸 أمريكا",
-                callback_data="topic:america",
-            ),
+            InlineKeyboardButton("🇸🇦 الخليج", callback_data="topic:gulf"),
+            InlineKeyboardButton("🇺🇸 أمريكا", callback_data="topic:america"),
         ],
         [
-            InlineKeyboardButton(
-                "🇪🇺 أوروبا",
-                callback_data="topic:europe",
-            ),
-            InlineKeyboardButton(
-                "🌏 آسيا",
-                callback_data="topic:asia",
-            ),
+            InlineKeyboardButton("🇪🇺 أوروبا", callback_data="topic:europe"),
+            InlineKeyboardButton("🌏 آسيا", callback_data="topic:asia"),
         ],
         [
-            InlineKeyboardButton(
-                "⛽ الطاقة",
-                callback_data="topic:energy",
-            ),
-            InlineKeyboardButton(
-                "🛡 الأمن",
-                callback_data="topic:security",
-            ),
+            InlineKeyboardButton("⛽ الطاقة", callback_data="topic:energy"),
+            InlineKeyboardButton("🛡 الأمن", callback_data="topic:security"),
         ],
-        [
-            InlineKeyboardButton(
-                "🌐 السياسة الخارجية",
-                callback_data="topic:foreign",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🔄 مقارنة",
-                callback_data="compare",
-            ),
-        ],
+        [InlineKeyboardButton("🌐 السياسة الخارجية", callback_data="topic:foreign")],
+        [InlineKeyboardButton("🔄 مقارنة", callback_data="compare")],
     ]
+    return InlineKeyboardMarkup(k)
 
-    return InlineKeyboardMarkup(
-        keyboard
-    )
-
-
-def back_keyboard() -> InlineKeyboardMarkup:
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "⬅️ رجوع",
-                    callback_data="back",
-                )
-            ]
-        ]
-    )
-
-
-# ============================================================
-# GEMINI
-# ============================================================
-
-async def ask_gemini(
-    prompt: str,
-) -> str:
-
-    logger.info(
-        "Starting Gemini request..."
-    )
-
-    try:
-
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="low"
-                )
-            ),
-        )
-
-        text = getattr(
-            response,
-            "text",
-            None,
-        )
-
-        if not text:
-
-            logger.warning(
-                "Gemini returned an empty response."
-            )
-
-            return (
-                "لم توجد إجابة كافية من البيانات المتاحة."
-            )
-
-        logger.info(
-            "Gemini request completed."
-        )
-
-        return text.strip()
-
-    except Exception as exc:
-
-        logger.exception(
-            "Gemini request failed: %s",
-            exc,
-        )
-
-        return (
-            "حدث خطأ أثناء تحليل الأخبار بواسطة الذكاء الاصطناعي."
-        )
-
-
-# ============================================================
-# NEWS COLLECTION
-# ============================================================
-
-async def get_fresh_news():
-
-    logger.info(
-        "Starting fresh news collection..."
-    )
-
-    try:
-
-        news = await asyncio.wait_for(
-            collect_news(
-                max_items=100
-            ),
-            timeout=NEWS_COLLECTION_TIMEOUT,
-        )
-
-        logger.info(
-            "Fresh news collection completed: %d items",
-            len(news),
-        )
-
-        return news
-
-    except asyncio.TimeoutError:
-
-        logger.error(
-            "Fresh news collection timed out after %s seconds.",
-            NEWS_COLLECTION_TIMEOUT,
-        )
-
-        return []
-
-    except Exception as exc:
-
-        logger.exception(
-            "Fresh news collection failed: %s",
-            exc,
-        )
-
-        return []
-
-
-# ============================================================
-# أسلوب Gemini
-# ============================================================
+def back_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="back")]
+    ])
 
 REPORT_STYLE_RULES = """
 قواعد الأسلوب:
-
-- اكتب كمحلل أخبار محترف.
 - ابدأ بالمعلومة مباشرة.
 - كن مختصرًا ودقيقًا.
-- لا تستخدم مقدمات إنشائية.
-- لا تستخدم عبارات فلسفية أو عامة.
-- لا تكرر المعلومة.
-- لا تشرح ما هو واضح.
-- لا تضف كلامًا لزيادة طول الإجابة.
+- لا تستخدم مقدمات إنشائية أو عبارات فلسفية.
+- لا تكرر المعلومات.
+- لا تضف كلامًا لزيادة الطول.
 - لا تختلق معلومات أو مصادر أو أرقامًا.
 - لا تحول الاحتمال إلى حقيقة.
-- لا تقدم رأيًا شخصيًا.
-- لا تتنبأ من عندك.
-- التحليل يكون فقط إذا كان مدعومًا بالمعلومات.
-- كل نقطة يجب أن تضيف معلومة جديدة.
-- إذا لم توجد معلومات كافية، قل ذلك بوضوح.
-- لا تستخدم عبارات مثل:
-  "في ظل التطورات المتسارعة"
-  أو "مما لا شك فيه"
-  أو "الأيام القادمة ستكشف".
+- لا تقدم رأيًا شخصيًا أو توقعات غير مدعومة.
+- التحليل فقط إذا كان مدعومًا بالمعلومات.
+- إذا لم تكفِ المعلومات، قل ذلك بوضوح.
+- لا تستخدم عبارات مثل: في ظل التطورات المتسارعة، مما لا شك فيه، الأيام القادمة ستكشف.
 - لا تختم بعبارات إنشائية.
-- التقرير يجب أن يكون قابلًا للقراءة بسرعة.
 """
 
-
-# ============================================================
-# REPORT
-# ============================================================
-
-async def generate_report(
-    topic: str,
-    news_items,
-) -> str:
-
-    if not news_items:
-
-        return (
-            "لا توجد أخبار حديثة كافية لإعداد التقرير."
+async def ask_gemini(prompt):
+    logger.info("Starting Gemini request...")
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                ai_client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_level="low")
+                ),
+            ),
+            timeout=45,
         )
+        text = getattr(response, "text", None)
+        if not text:
+            return "لم توجد إجابة كافية من البيانات المتاحة."
+        logger.info("Gemini request completed.")
+        return text.strip()
+    except asyncio.TimeoutError:
+        logger.error("Gemini request timed out.")
+        return "تعذر إكمال التحليل الذكي حاليًا بسبب بطء خدمة التحليل."
+    except Exception as exc:
+        logger.exception("Gemini request failed: %s", exc)
+        return "تعذر تحليل الأخبار بالذكاء الاصطناعي حاليًا."
 
-    context = build_ai_context(
-        news_items
-    )
+async def get_fresh_news():
+    logger.info("Starting news collection...")
+    try:
+        news = await asyncio.wait_for(
+            collect_news(max_items=100),
+            timeout=NEWS_COLLECTION_TIMEOUT,
+        )
+        logger.info("News collection completed: %d items", len(news))
+        return news
+    except asyncio.TimeoutError:
+        logger.error("News collection timed out after %s seconds.", NEWS_COLLECTION_TIMEOUT)
+    except Exception as exc:
+        logger.exception("News collection failed: %s", exc)
+    return []
 
+async def generate_report(topic, news_items):
+    if not news_items:
+        return "لا توجد أخبار حديثة كافية لإعداد التقرير."
+
+    context = build_ai_context(news_items)
     prompt = f"""
 أنت محلل أخبار واستخبارات مفتوحة المصدر.
 
@@ -366,259 +166,100 @@ async def generate_report(
 السياق:
 {context}
 """
+    return await ask_gemini(prompt)
 
-    return await ask_gemini(
-        prompt
-    )
-
-
-# ============================================================
-# SEND LONG MESSAGE
-# ============================================================
-
-async def send_long_message(
-    update: Update,
-    text: str,
-    reply_markup=None,
-):
-
-    if not text:
-        text = "لم يتم إنشاء محتوى."
-
-    chunks = [
-        text[i:i + 3900]
-        for i in range(
-            0,
-            len(text),
-            3900,
-        )
-    ]
-
-    if not chunks:
-        chunks = [
-            "لم يتم إنشاء محتوى."
-        ]
-
-    for index, chunk in enumerate(
-        chunks
-    ):
-
-        markup = (
-            reply_markup
-            if index == len(chunks) - 1
-            else None
-        )
-
+async def send_long_message(update, text, reply_markup=None):
+    text = text or "لم يتم إنشاء محتوى."
+    chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or ["لم يتم إنشاء محتوى."]
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if i == len(chunks) - 1 else None
         if update.callback_query:
-
-            await update.callback_query.message.reply_text(
-                chunk,
-                reply_markup=markup,
-            )
-
+            await update.callback_query.message.reply_text(chunk, reply_markup=markup)
         elif update.message:
+            await update.message.reply_text(chunk, reply_markup=markup)
 
-            await update.message.reply_text(
-                chunk,
-                reply_markup=markup,
-            )
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(
+            "مرحبًا بك في نظام استخبارات الأخبار.\n\nاختر المجال الذي تريد تحليله:",
+            reply_markup=main_keyboard(),
+        )
 
-
-# ============================================================
-# START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    await update.message.reply_text(
-        "مرحبًا بك في نظام استخبارات الأخبار.\n\n"
-        "اختر المجال الذي تريد تحليله:",
-        reply_markup=main_keyboard(),
-    )
-
-
-# ============================================================
-# BUTTON HANDLER
-# ============================================================
-
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
     if not query:
         return
 
     await query.answer()
-
     user_id = query.from_user.id
-    callback_data = query.data
-
-    lock = get_user_lock(
-        user_id
-    )
+    data = query.data
+    lock = get_user_lock(user_id)
 
     if lock.locked():
-
-        await query.answer(
-            "يوجد تحليل جارٍ بالفعل، انتظر قليلًا.",
-            show_alert=True,
-        )
-
+        await query.answer("يوجد تحليل جارٍ بالفعل، انتظر قليلًا.", show_alert=True)
         return
 
     async with lock:
-
-        # ----------------------------------------------------
-        # BACK
-        # ----------------------------------------------------
-
-        if callback_data == "back":
-
+        if data == "back":
             await query.edit_message_text(
                 "اختر المجال الذي تريد تحليله:",
                 reply_markup=main_keyboard(),
             )
-
             return
 
-        # ----------------------------------------------------
-        # COMPARE
-        # ----------------------------------------------------
-
-        if callback_data == "compare":
-
+        if data == "compare":
             await query.edit_message_text(
                 "أرسل موضوعين أو حدثين للمقارنة بينهما.\n\n"
-                "مثال:\n"
-                "قارن بين تطورات الطاقة في الخليج وأوروبا.",
+                "مثال:\nقارن بين تطورات الطاقة في الخليج وأوروبا.",
                 reply_markup=back_keyboard(),
             )
-
             return
 
-        # ----------------------------------------------------
-        # TOPIC
-        # ----------------------------------------------------
-
-        if not callback_data.startswith(
-            "topic:"
-        ):
+        if not data.startswith("topic:"):
             return
 
-        topic_key = callback_data.split(
-            ":",
-            1,
-        )[1]
-
-        topic = TOPICS.get(
-            topic_key
-        )
+        topic_key = data.split(":", 1)[1]
+        topic = TOPICS.get(topic_key)
 
         if not topic:
-
             await query.edit_message_text(
                 "الموضوع غير معروف.",
                 reply_markup=back_keyboard(),
             )
-
             return
 
-        await query.edit_message_text(
-            "📡 جاري فحص الأخبار الحديثة ثم تحليلها..."
-        )
-
-        logger.info(
-            "BUTTON: collecting news for user %s",
-            user_id,
-        )
-
-        fresh_items = await get_fresh_news()
-
-        logger.info(
-            "BUTTON: collection returned %d items",
-            len(fresh_items),
-        )
+        await query.edit_message_text("📡 جاري فحص الأخبار الحديثة ثم تحليلها...")
+        fresh = await get_fresh_news()
 
         try:
-
-            selected_items = search_news(
-                fresh_items,
+            selected = search_news(
+                fresh,
                 topic,
                 max_results=MAX_SEARCH_RESULTS,
             )
-
         except Exception as exc:
+            logger.exception("Topic search failed: %s", exc)
+            selected = []
 
-            logger.exception(
-                "BUTTON: search_news failed: %s",
-                exc,
-            )
-
-            selected_items = []
-
-        # ----------------------------------------------------
-        # زر المجال يمكنه استخدام الأخبار العامة
-        # ----------------------------------------------------
-
-        if len(selected_items) < 3:
-
-            selected_items = sorted(
-                fresh_items,
-                key=lambda item: getattr(
-                    item,
-                    "importance",
-                    0,
-                ),
+        if len(selected) < 3:
+            selected = sorted(
+                fresh,
+                key=lambda x: getattr(x, "importance", 0),
                 reverse=True,
             )[:MAX_SEARCH_RESULTS]
 
-        logger.info(
-            "BUTTON: selected %d news items",
-            len(selected_items),
-        )
-
-        if not selected_items:
-
+        if not selected:
             await query.edit_message_text(
                 "لا توجد أخبار كافية حاليًا.",
                 reply_markup=back_keyboard(),
             )
-
             return
 
-        await query.edit_message_text(
-            "🧠 تم جمع الأخبار.\n\n"
-            "جاري التحليل المختصر..."
-        )
-
-        logger.info(
-            "BUTTON: starting Gemini report..."
-        )
-
-        report = await generate_report(
-            topic,
-            selected_items,
-        )
-
-        logger.info(
-            "BUTTON: Gemini report completed."
-        )
+        await query.edit_message_text("🧠 تم جمع الأخبار.\n\nجاري التحليل المختصر...")
+        report = await generate_report(topic, selected)
 
         try:
-
-            await query.edit_message_text(
-                "📊 تم إعداد التقرير."
-            )
-
+            await query.edit_message_text("📊 تم إعداد التقرير.")
         except Exception:
             pass
 
@@ -628,108 +269,52 @@ async def button_handler(
             reply_markup=back_keyboard(),
         )
 
-
-# ============================================================
-# DIRECT QUESTION
-# ============================================================
-
-async def handle_user_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    if not update.message.text:
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
         return
 
     user_id = update.effective_user.id
     user_text = update.message.text.strip()
-
     if not user_text:
         return
 
-    lock = get_user_lock(
-        user_id
-    )
+    lock = get_user_lock(user_id)
 
     if lock.locked():
-
-        await update.message.reply_text(
-            "يوجد تحليل جارٍ بالفعل، انتظر حتى يكتمل."
-        )
-
+        await update.message.reply_text("يوجد تحليل جارٍ بالفعل، انتظر حتى يكتمل.")
         return
 
     async with lock:
-
-        status_message = await update.message.reply_text(
+        status = await update.message.reply_text(
             "📡 جاري البحث عن أخبار مرتبطة بسؤالك..."
         )
 
-        logger.info(
-            "MESSAGE: collecting news for user %s",
-            user_id,
-        )
-
-        fresh_items = await get_fresh_news()
-
-        logger.info(
-            "MESSAGE: collection returned %d items",
-            len(fresh_items),
-        )
-
-        # ----------------------------------------------------
-        # بحث مخصص للسؤال
-        # ----------------------------------------------------
+        fresh = await get_fresh_news()
 
         try:
-
-            selected_items = search_news(
-                fresh_items,
+            selected = search_news(
+                fresh,
                 user_text,
                 max_results=MAX_SEARCH_RESULTS,
             )
-
         except Exception as exc:
-
-            logger.exception(
-                "MESSAGE: search_news failed: %s",
-                exc,
-            )
-
-            selected_items = []
+            logger.exception("Question search failed: %s", exc)
+            selected = []
 
         logger.info(
-            "MESSAGE: selected %d relevant items for query '%s'",
-            len(selected_items),
+            "Selected %d relevant items for query '%s'",
+            len(selected),
             user_text,
         )
 
-        # ----------------------------------------------------
-        # مهم:
-        # لا نستخدم الأخبار العامة كـ fallback هنا.
-        # ----------------------------------------------------
-
-        if not selected_items:
-
-            await status_message.edit_text(
-                "لم أجد في الأخبار الحالية معلومات مرتبطة "
-                "بموضوع سؤالك.\n\n"
-                "لن أخلط أخبارًا غير مرتبطة بالسؤال "
-                "لإعطاء إجابة مصطنعة."
+        if not selected:
+            await status.edit_text(
+                "لم أجد في الأخبار الحالية معلومات مرتبطة بموضوع سؤالك.\n\n"
+                "لن أخلط أخبارًا غير مرتبطة بالسؤال لإعطاء إجابة مصطنعة."
             )
-
             return
 
-        # ----------------------------------------------------
-        # Gemini
-        # ----------------------------------------------------
-
-        context_text = build_ai_context(
-            selected_items
-        )
+        context_text = build_ai_context(selected)
 
         prompt = f"""
 أنت محلل أخبار واستخبارات مفتوحة المصدر.
@@ -737,54 +322,44 @@ async def handle_user_message(
 سؤال المستخدم:
 {user_text}
 
-تم اختيار الأخبار التالية لأنها مرتبطة بالسؤال.
+استخدم الأخبار المرتبطة بالسؤال فقط.
 
-مهم جدًا:
+مهم:
 - لا تستخدم أخبارًا خارج السياق.
 - لا تخترع معلومات.
-- لا تفترض أن كل خبر في السياق يجيب عن السؤال.
-- استخدم فقط الأخبار التي لها علاقة مباشرة بالسؤال.
-- إذا كانت المعلومات لا تكفي للإجابة الكاملة، قل ذلك بوضوح.
+- لا تفترض أن كل خبر يجيب عن السؤال.
+- إذا لم تكفِ المعلومات، قل ذلك بوضوح.
 - لا تحول التحليل إلى توقعات غير مدعومة.
-- لا تكرر الخبر عدة مرات.
+- لا تكرر الخبر.
 
 {REPORT_STYLE_RULES}
 
 ابدأ بالإجابة المباشرة.
 
-استخدم هذا الهيكل عند الحاجة:
-
 الخلاصة:
-الإجابة المباشرة في 2 إلى 3 جمل.
+2 إلى 3 جمل.
 
 أهم ما ورد:
-• النقطة الأولى.
-• النقطة الثانية.
-• النقطة الثالثة.
+• نقاط مختصرة.
 
 التحليل:
-نقاط مختصرة فقط إذا كان هناك تحليل مفيد.
+فقط إذا كان مفيدًا ومدعومًا.
 
 ملاحظة:
-فقط إذا كان هناك نقص أو عدم تأكد مهم.
+فقط عند وجود نقص أو عدم تأكد مهم.
 
-الأخبار المرتبطة بالسؤال:
+الأخبار:
 {context_text}
 """
 
-        await status_message.edit_text(
-            "🧠 وجدت أخبارًا مرتبطة بالسؤال.\n\n"
-            "جاري تحليلها باختصار..."
+        await status.edit_text(
+            "🧠 وجدت أخبارًا مرتبطة بالسؤال.\n\nجاري تحليلها باختصار..."
         )
 
-        answer = await ask_gemini(
-            prompt
-        )
+        answer = await ask_gemini(prompt)
 
         try:
-
-            await status_message.delete()
-
+            await status.delete()
         except Exception:
             pass
 
@@ -794,51 +369,13 @@ async def handle_user_message(
             reply_markup=back_keyboard(),
         )
 
-
-# ============================================================
-# POST INIT
-# ============================================================
-
-async def post_init(
-    application,
-):
-
-    logger.info(
-        "Verifying Telegram connection..."
-    )
-
-    try:
-
-        bot_info = await application.bot.get_me()
-
-        logger.info(
-            "Telegram connection verified successfully."
-        )
-
-        logger.info(
-            "Bot username: @%s",
-            bot_info.username,
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Telegram connection verification failed: %s",
-            exc,
-        )
-
-        raise
-
-
-# ============================================================
-# MAIN
-# ============================================================
+async def post_init(application):
+    logger.info("Verifying Telegram connection...")
+    bot_info = await application.bot.get_me()
+    logger.info("Telegram connection verified: @%s", bot_info.username)
 
 def main():
-
-    logger.info(
-        "Starting Live News Intelligence Bot..."
-    )
+    logger.info("Starting Live News Intelligence Bot...")
 
     app = (
         ApplicationBuilder()
@@ -847,20 +384,13 @@ def main():
         .build()
     )
 
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
-    )
-
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(
         CallbackQueryHandler(
             button_handler,
             pattern=r"^(topic:|compare$|back$)",
         )
     )
-
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -868,18 +398,8 @@ def main():
         )
     )
 
-    logger.info(
-        "Starting Telegram polling..."
-    )
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
+    logger.info("Starting Telegram polling...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

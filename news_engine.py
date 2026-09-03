@@ -1,105 +1,187 @@
-import asyncio,re,html,urllib.parse,aiohttp
-from bs4 import BeautifulSoup,SoupStrainer
-from datetime import datetime,timedelta
-from typing import List,Dict,Tuple
+import asyncio
+import logging
+import re
+import urllib.parse
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import aiohttp
+import feedparser
 
-USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-MAX_CONCURRENT_REQUESTS,REQUEST_TIMEOUT,MAX_CONTENT_LENGTH,DEFAULT_DAYS_AGO=10,15,1000000,7
+# ============================================================
+# LOGGING & CONFIGURATION
+# ============================================================
 
-MONTH_TRANSLATIONS={'يناير':'January','فبراير':'February','مارس':'March','أبريل':'April','مايو':'May','يونيو':'June','يوليو':'July','أغسطس':'August','سبتمبر':'September','أكتوبر':'October','نوفمبر':'November','ديسمبر':'December','january':'January','february':'February','march':'March','april':'April','may':'May','june':'June','july':'July','august':'August','september':'September','october':'October','november':'November','december':'December','jan':'January','feb':'February','mar':'March','apr':'April','jun':'June','jul':'July','aug':'August','sep':'September','oct':'October','nov':'November','dec':'December'}
-ARABIC_INDIC_DIGITS={'٠':'0','١':'1','٢':'2','٣':'3','٤':'4','٥':'5','٦':'6','٧':'7','٨':'8','٩':'9'}
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("news_engine")
 
-SEARCH_PROVIDERS={"Bing":{"url":"https://www.bing.com/news/search?q={query}&qft=interval%3d\"{days}d\"","selector":"a.title, a.news-item-heading, h2 a, a[href*='http']","date_patterns":[r'(\d{1,2})\s+([أ-يa-zA-Z]+)\s+(20\d{2})',r'(20\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])']},"Google":{"url":"https://www.google.com/search?q={query}&tbm=nws&tbs=qdr:d{days}","selector":"a[href*='/url?q='], a[aria-label]","date_patterns":[r'(\d{1,2})\s+([أ-يa-zA-Z]+)\s+(20\d{2})',r'(20\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])']}}
+# وقت الانتظار الأقصى لكل جلب (بالثواني)
+FETCH_TIMEOUT = 8
 
-QUERY_ALIASES={
-"الصين":["الصين","China","الجمهورية الشعبية","بكين","Beijing","الحزب الشيوعي الصيني"],
-"أمريكا":["أمريكا","الولايات المتحدة","USA","United States","واشنطن","Washington"],
-"روسيا":["روسيا","Russia","موسكو","Moscow","الكرملين","Kremlin"],
-"إيران":["إيران","Iran","طهران","Tehran"],
-"تركيا":["تركيا","Turkey","أنقرة","Ankara"],
-"السعودية":["السعودية","KSA","Riyadh","الرياض"],
-"مصر":["مصر","Egypt","القاهرة","Cairo"],
-"الإمارات":["الإمارات","UAE","أبوظبي","Abu Dhabi","دبي","Dubai"],
-"إسرائيل":["إسرائيل","Israel","تل أبيب","Tel Aviv"],
-"النفط":["النفط","أسعار النفط","برنت","OPEC","أوبك","Crude Oil"],
-"الذهب":["الذهب","Gold","أسعار الذهب"],
-"الفائدة":["سعر الفائدة","الفيدرالي","Federal Reserve","البنك المركزي","Interest Rates"],
-"التضخم":["التضخم","Inflation","مؤشر أسعار المستهلكين","CPI"]
+# ============================================================
+# RELIABLE SOURCES & RSS FEEDS (المصادر الموثوقة والقنوات)
+# ============================================================
+
+TRUSTED_FEEDS = {
+    # 📺 القنوات الإخبارية والتلفزيونية (للعاجل والتغطيات الحية)
+    "alarabiya_urgent": "https://www.alarabiya.net/.well-known/rss/urgent.xml",
+    "aljazeera_urgent": "https://www.aljazeera.net/aljazeerarss/a7c1866f-6829-4883-8441-358d731800bc/43316f44-8e12-4320-b4c2-a22f6654b321",
+    "skynews_breaking": "https://www.skynewsarabia.com/rss/v1/news.xml",
+    "asharq_news": "https://asharq.com/rss/",
+    "cnbc_arabia": "https://www.cnbcarabia.com/rss.xml",
+
+    # 📈 أسواق المال، الاقتصاد، والعملات الرقمية
+    "bloomberg_asharq": "https://economy.asharq.com/rss/",
+    "investing_arabic": "https://sa.investing.com/rss/news.rss",
+    
+    # 🏛 وكالات الأنباء الرسمية
+    "spa_official": "https://www.spa.gov.sa/rss.xml",
 }
 
-def clean_text(t:str)->str:
-    if not t:return ""
-    t=html.unescape(t)
-    for a,b in ARABIC_INDIC_DIGITS.items():t=t.replace(a,b)
-    return re.sub(r'\s+',' ',t).strip()
+# محركات Google News المخصصة للتخصصات الدقيقة
+GOOGLE_NEWS_BASE = "https://news.google.com/rss/search?q={query}&hl=ar&gl=SA&ceid=SA:ar"
 
-def parse_date(d_str:str)->datetime:
-    if not d_str:return None
-    d_str=clean_text(d_str)
-    for ar,en in MONTH_TRANSLATIONS.items():
-        if ar in d_str.lower():d_str=re.sub(re.escape(ar),en,d_str,flags=re.IGNORECASE)
-    for fmt in ('%d %B %Y','%Y-%m-%d','%d/%m/%Y','%Y/%m/%d','%b %d, %Y','%d %b %Y'):
-        try:return datetime.strptime(d_str,fmt)
-        except:pass
-    m=re.search(r'(\d{1,2})\s+([A-Za-z]+)\s+(20\d{2})',d_str)
-    if m:
-        try:return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}",'%d %B %Y')
-        except:pass
-    m=re.search(r'(20\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])',d_str)
-    if m:
-        try:return datetime(int(m.group(1)),int(m.group(2)),int(m.group(3)))
-        except:pass
-    return None
 
-def extract_links(html_content:str,provider:str,base_url:str)->List[Dict]:
-    results,pdata=[],SEARCH_PROVIDERS.get(provider,{})
-    soup=BeautifulSoup(html_content,'html.parser',parse_only=SoupStrainer('a'))
-    for tag in soup.find_all('a',href=True):
-        href,title=tag['href'],clean_text(tag.get_text())
-        if href.startswith('/url?q='):href=urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get('q',[''])[0]
-        elif href.startswith('/'):href=urllib.parse.urljoin(base_url,href)
-        if not href.startswith('http') or any(x in href for x in ['google.com','bing.com','youtube.com','facebook.com']):continue
-        context=clean_text(tag.parent.get_text() if tag.parent else title)
-        dt=None
-        for pat in pdata.get('date_patterns',[]):
-            m=re.search(pat,context)
-            if m:
-                dt=parse_date(m.group(0))
-                if dt:break
-        results.append({'title':title or href,'url':href,'date':dt,'provider':provider})
-    return results
+# ============================================================
+# DATA MODEL (هيكلة البيانات الموحدة)
+# ============================================================
 
-async def fetch_provider(session:aiohttp.ClientSession,provider:str,query:str,days:int,sem:asyncio.Semaphore)->List[Dict]:
-    async with sem:
-        pconfig=SEARCH_PROVIDERS.get(provider)
-        if not pconfig:return []
-        url=pconfig['url'].format(query=urllib.parse.quote(query),days=days)
-        try:
-            async with session.get(url,headers={'User-Agent':USER_AGENT},timeout=REQUEST_TIMEOUT) as resp:
-                if resp.status==200:
-                    text=await resp.text()
-                    return extract_links(text[:MAX_CONTENT_LENGTH],provider,url)
-        except Exception:pass
-        return []
+class NewsItem:
+    def __init__(self, title: str, source: str, url: str, published_at: str = "", category: str = "general"):
+        self.title = self.clean_text(title)
+        self.source = source
+        self.url = url
+        self.published_at = published_at
+        self.category = category
 
-async def collect_news(keywords:List[str],days:int=DEFAULT_DAYS_AGO)->List[Dict]:
-    sem=asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    expanded_queries=set()
-    for kw in keywords:
-        expanded_queries.add(kw)
-        for main_key,aliases in QUERY_ALIASES.items():
-            if kw.lower() in [main_key.lower()]+[a.lower() for a in aliases]:
-                expanded_queries.update(aliases)
-    async with aiohttp.ClientSession() as session:
-        tasks=[fetch_provider(session,prov,q,days,sem) for prov in SEARCH_PROVIDERS for q in expanded_queries]
-        res=await asyncio.gather(*tasks,return_exceptions=True)
-    all_articles,seen=[],set()
-    min_date=datetime.now()-timedelta(days=days)
-    for r in res:
-        if isinstance(r,list):
-            for item in r:
-                if item['url'] not in seen:
-                    seen.add(item['url'])
-                    if not item['date'] or item['date']>=min_date:
-                        all_articles.append(item)
-    return sorted(all_articles,key=lambda x:x['date'] or datetime.min,reverse=True)
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """تنظيف النصوص من أوسمة HTML والتنسيقات الزائدة"""
+        if not text:
+            return ""
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def __repr__(self):
+        return f"<NewsItem title='{self.title[:30]}...' source='{self.source}'>"
+
+
+# ============================================================
+# ASYNC FETCHERS (محركات الجلب المتوازية السريعة)
+# ============================================================
+
+async def fetch_rss_feed(session: aiohttp.ClientSession, source_name: str, url: str) -> List[NewsItem]:
+    """جلب وتحليل خلاصات RSS المباشرة بسرعة فائقة"""
+    items = []
+    try:
+        async with session.get(url, timeout=FETCH_TIMEOUT) as response:
+            if response.status == 200:
+                content = await response.text()
+                parsed = feedparser.parse(content)
+                for entry in parsed.entries[:15]:
+                    title = entry.get("title", "")
+                    link = entry.get("link", "")
+                    pub_date = entry.get("published", "") or entry.get("updated", "")
+                    
+                    if title and link:
+                        items.append(NewsItem(
+                            title=title,
+                            source=source_name,
+                            url=link,
+                            published_at=pub_date
+                        ))
+    except Exception as e:
+        log.warning(f"Error fetching RSS [{source_name}]: {e}")
+    return items
+
+
+async def fetch_google_news_topic(session: aiohttp.ClientSession, query: str, category: str) -> List[NewsItem]:
+    """جلب مستهدف من Google News يضمن أحدث التغطيات في الأسواق والتصريحات"""
+    encoded_query = urllib.parse.quote(query)
+    target_url = GOOGLE_NEWS_BASE.format(query=encoded_query)
+    items = []
+    
+    try:
+        async with session.get(target_url, timeout=FETCH_TIMEOUT) as response:
+            if response.status == 200:
+                content = await response.text()
+                parsed = feedparser.parse(content)
+                for entry in parsed.entries[:20]:
+                    title = entry.get("title", "")
+                    link = entry.get("link", "")
+                    source = entry.get("source", {}).get("title", "تغطية إخبارية")
+                    
+                    # تنظيف عنوان الخبر من اسم المصدر المكرر في Google News
+                    if " - " in title:
+                        title = title.rsplit(" - ", 1)[0]
+
+                    if title and link:
+                        items.append(NewsItem(
+                            title=title,
+                            source=source,
+                            url=link,
+                            category=category
+                        ))
+    except Exception as e:
+        log.warning(f"Error fetching Google News for [{query}]: {e}")
+    return items
+
+
+# ============================================================
+# CORE ENGINE API (الواجهة الرئيسية للتجميع والفرز)
+# ============================================================
+
+async def collect_news(max_items: int = 100) -> List[NewsItem]:
+    """تجميع الأخبار المباشرة من كافة القنوات والمصادر مع منع التكرار"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    all_news: List[NewsItem] = []
+    seen_titles = set()
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = []
+
+        # 1. جلب خلاصات RSS للقنوات والمصادر الموثوقة
+        for src_name, url in TRUSTED_FEEDS.items():
+            tasks.append(fetch_rss_feed(session, src_name, url))
+
+        # 2. جلب مخصص ومباشر لأسواق المال والعملات والوزارات
+        custom_queries = [
+            ("أسهم OR بورصة OR "داو جونز" OR "ناسداك" OR "نيكاي" OR "تداول" OR "الأسواق الأمريكية" OR "الأسواق الأوروبية" OR "الأسواق الآسيوية"", "markets"),
+            ("بيتكوين OR "عملات رقمية" OR "كريبتو" OR "إيثريوم"", "crypto"),
+            ("وزارة OR وزير OR "تصريح رسمي" OR "بيان صحفي" OR "مصدر مسؤول"", "official_statements"),
+            ("النفط OR أوبك OR برنت OR "وزارة الطاقة"", "energy")
+        ]
+
+        for query, cat in custom_queries:
+            tasks.append(fetch_google_news_topic(session, query, cat))
+
+        # تنفيذ كافة مهام الجلب بالتوازي
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, list):
+                for item in res:
+                    # إزالة التكرار بناءً على تشابه أول 30 حرفاً من العنوان
+                    normalized_title = item.title[:30].strip().lower()
+                    if normalized_title not in seen_titles:
+                        seen_titles.add(normalized_title)
+                        all_news.append(item)
+
+    log.info(f"Successfully collected {len(all_news)} unique news items.")
+    return all_news[:max_items]
+
+
+def search_news(items: List[NewsItem], keywords: List[str], max_results: int = 25) -> List[NewsItem]:
+    """دالة البحث والتصفية الصارمة للتخصصات"""
+    filtered = []
+    for item in items:
+        title = item.title.lower()
+        if any(kw.lower() in title for kw in keywords):
+            filtered.append(item)
+    return filtered[:max_results]
+
+
+def build_ai_context(items: List[NewsItem], limit: int = 6) -> str:
+    """تجهيز سياق الأخبار لنماذج الذكاء الاصطناعي مثل Gemini"""
+    context_lines = [f"- {item.title} [{item.source}]" for item in items[:limit]]
+    return "\n".join(context_lines)

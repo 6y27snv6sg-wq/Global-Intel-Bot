@@ -93,7 +93,8 @@ def build_safe_link(title: str, source: str, raw_url: str) -> str:
     if raw_url and "news.google.com" not in raw_url and raw_url.startswith("http"):
         return raw_url
     
-    query = f"{title} {source}"
+    clean_title = re.sub(r'[^\w\s]', '', title).strip()
+    query = f"{clean_title} {source}".strip()
     encoded_query = urllib.parse.quote_plus(query)
     return f"https://www.google.com/search?q={encoded_query}"
 
@@ -113,42 +114,31 @@ def strict_search_news(items: list, keywords_list: list, max_results: int = 25) 
 
 
 # ============================================================
-# TOPICS CONFIGURATION (تحديد الكلمات بدقة متناهية)
+# TOPICS CONFIGURATION (تم استخدام مفاتيح قصيرة لتجنب حدود 64 بايت)
 # ============================================================
 
 TOPICS = {
-    # 1. الاقتصاد والطاقة: كلمات مالية ومحسوبة بدقة
-    "economy_energy": (
+    "econ": (
         "📈 الاقتصاد والطاقة والأسواق", 
         ["أسهم", "بورصة", "الذهب", "معادن", "الفيدرالي", "فائدة", "عملات رقمية", "بيتكوين", "تداول", "النفط", "أوبك", "خام", "تضخم", "أسواق المال", "برنت"]
     ),
-    
-    # 2. البيانات الوزارية والرسمية
-    "foreign": (
+    "forg": (
         "🏛 البيانات والتصريحات الوزارية", 
         ["وزارة", "وزير", "المتحدث", "بيان رسمي", "تصريح رسمي", "بيان صحفي", "مصدر مسؤول", "رئاسة الوزراء", "الديوان"]
     ),
-    
-    # 3. العاجل والطارئ
-    "urgent": (
+    "urg": (
         "🚨 عاجل وبيانات طارئة", 
         ["عاجل", "بيان هام", "تصريح عاجل", "طارئ"]
     ),
-    
-    # 4. الخليج والشرق الأوسط
     "gulf": (
         "🇸🇦 الخليج والشرق الأوسط", 
         ["الخليج", "السعودية", "الإمارات", "قطر", "الكويت", "البحرين", "عمان", "الرياض", "أبوظبي"]
     ),
-    
-    # 5. العالم والسياسة
-    "world": (
+    "wrld": (
         "🌍 العالم والسياسة", 
         ["دولية", "قمة", "أمريكا", "أوروبا", "الصين", "روسيا", "واشنطن", "بكين"]
     ),
-    
-    # 6. الدفاع والأمن
-    "security": (
+    "secu": (
         "🛡 الدفاع والأمن", 
         ["الدفاع", "الأمن القومي", "تسليح", "مناورات", "عسكري", "جيش"]
     )
@@ -159,12 +149,11 @@ def main_keyboard(user_id: int):
     rows = []
     items = list(TOPICS.items())
 
-    # عرض أزرار التخصصات في صفوف ثنائية
+    # عرض أزرار التخصصات في صفوف ثنائية مع استخدام المفتاح القصير في الـ callback_data
     for i in range(0, len(items), 2):
-        row = [InlineKeyboardButton(label, callback_data=f"topic:{key}:1") for key, (label, _) in items[i:i + 2]]
+        row = [InlineKeyboardButton(label, callback_data=f"t:{key}:1") for key, (label, _) in items[i:i + 2]]
         rows.append(row)
 
-    # زر إيقاف/تفعيل الإشعارات وزر التحديث
     is_muted = user_id in MUTED_USERS
     alert_btn_text = "🔔 تفعيل التنبيهات المنبثقة" if is_muted else "🔕 إيقاف التنبيهات المنبثقة"
     alert_action = "unmute_alerts" if is_muted else "mute_alerts"
@@ -313,7 +302,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     parts = query.data.split(":")
-    if len(parts) < 3 or parts[0] != "topic":
+    if len(parts) < 3 or parts[0] != "t":
         return
 
     key, page = parts[1], int(parts[2])
@@ -332,10 +321,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             items = await get_fresh_news()
-            # استخدام الفرز الصارم بناءً على قائمة الكلمات
             results = strict_search_news(items, keywords, max_results=MAX_SEARCH_RESULTS) if items else []
 
-            if key == "urgent" and results and user_id not in MUTED_USERS:
+            if key == "urg" and results and user_id not in MUTED_USERS:
                 top_news = getattr(results[0], "title", "خبر عاجل جديد!")
                 await query.answer(text=f"🚨 عاجل: {top_news[:100]}", show_alert=True)
 
@@ -349,11 +337,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nav_buttons = []
             
             if page < total_pages:
-                nav_buttons.append(InlineKeyboardButton("➕ إضافية", callback_data=f"topic:{key}:{page+1}"))
+                nav_buttons.append(InlineKeyboardButton("➕ إضافية", callback_data=f"t:{key}:{page+1}"))
             
             nav_buttons.append(InlineKeyboardButton("🧠 تحليل البيانات", callback_data=f"analyze:{key}"))
 
-            # تنسيق الأزرار: زر القائمة الرئيسية في المنتصف بسطر مستقل
             rows = [
                 nav_buttons,
                 [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="home")]
@@ -414,7 +401,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(topic:|home|refresh|mute_alerts|unmute_alerts|analyze:)"))
+    # تحديث النمط (Pattern) ليتوافق مع الاختصارات الجديدة (t:...)
+    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(t:.*|home|refresh|mute_alerts|unmute_alerts|analyze:.*)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message))
 
     log.info("Pro News Bot Launched Successfully...")

@@ -1,56 +1,123 @@
+# ============================================================
+# news_engine.py
+# Global News Intelligence Engine
+# ============================================================
+
 import asyncio
 import html
 import logging
 import re
 import urllib.parse
-from typing import List, Dict, Tuple
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
 
 import aiohttp
 import feedparser
 
 
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("news_engine")
-
-FETCH_TIMEOUT = 8
-MAX_PER_FEED = 20
-
-GOOGLE_NEWS_BASE = (
-    "https://news.google.com/rss/search?"
-    "q={query}&hl=ar&gl=SA&ceid=SA:ar"
-)
 
 
 # ============================================================
-# المصادر المباشرة
+# SETTINGS
+# ============================================================
+
+FETCH_TIMEOUT = 10
+MAX_FEED_ITEMS = 20
+MAX_ONLINE_QUERIES = 4
+
+
+# ============================================================
+# TRUSTED DIRECT RSS SOURCES
 # ============================================================
 
 TRUSTED_FEEDS: Dict[str, str] = {
-    "العربية": "https://www.alarabiya.net/.well-known/rss/urgent.xml",
+
+    # --------------------------------------------------------
+    # Middle East / Arabic
+    # --------------------------------------------------------
+
+    "العربية": (
+        "https://www.alarabiya.net/.well-known/rss/urgent.xml"
+    ),
+
     "الجزيرة": (
         "https://www.aljazeera.net/aljazeerarss/"
         "a7c1866f-6829-4883-8441-358d731800bc/"
         "43316f44-8e12-4320-b4c2-a22f6654b321"
     ),
+
     "سكاي نيوز عربية": (
         "https://www.skynewsarabia.com/rss/v1/news.xml"
     ),
-    "الشرق": "https://asharq.com/rss/",
-    "CNBC عربية": "https://www.cnbcarabia.com/rss.xml",
-    "الشرق اقتصاد": "https://economy.asharq.com/rss/",
-    "Investing": "https://sa.investing.com/rss/news.rss",
-    "واس": "https://www.spa.gov.sa/rss.xml",
-    "BBC Arabic": "https://feeds.bbci.co.uk/arabic/rss.xml",
-    "DW Arabic": "https://rss.dw.com/xml/rss-ar-all",
-    "France24 Arabic": "https://www.france24.com/ar/rss",
-    "EIA": "https://www.eia.gov/rss/todayinenergy.xml",
+
+    "الشرق": (
+        "https://asharq.com/rss/"
+    ),
+
+    "CNBC عربية": (
+        "https://www.cnbcarabia.com/rss.xml"
+    ),
+
+    "الشرق اقتصاد": (
+        "https://economy.asharq.com/rss/"
+    ),
+
+    "Investing": (
+        "https://sa.investing.com/rss/news.rss"
+    ),
+
+    "وكالة الأنباء السعودية": (
+        "https://www.spa.gov.sa/rss.xml"
+    ),
+
+    # --------------------------------------------------------
+    # International
+    # --------------------------------------------------------
+
+    "BBC عربي": (
+        "https://feeds.bbci.co.uk/arabic/rss.xml"
+    ),
+
+    "DW عربي": (
+        "https://rss.dw.com/rdf/rss-ar-all"
+    ),
+
+    "France24 عربي": (
+        "https://www.france24.com/ar/rss"
+    ),
+
+    # --------------------------------------------------------
+    # Energy
+    # --------------------------------------------------------
+
+    "EIA": (
+        "https://www.eia.gov/rss/todayinenergy.xml"
+    ),
 }
 
 
 # ============================================================
-# المناطق العالمية
+# GOOGLE NEWS
+# ============================================================
+
+GOOGLE_NEWS_BASE = (
+    "https://news.google.com/rss/search"
+    "?q={query}&hl=ar&gl=SA&ceid=SA:ar"
+)
+
+
+# ============================================================
+# GLOBAL REGIONS
 # ============================================================
 
 REGIONS: Dict[str, List[str]] = {
+
     "آسيا": [
         "الصين",
         "اليابان",
@@ -66,10 +133,8 @@ REGIONS: Dict[str, List[str]] = {
         "باكستان",
         "بنغلاديش",
         "تايوان",
-        "هونغ كونغ",
-        "كازاخستان",
-        "أوزبكستان",
-        "آسيا",
+        "أفغانستان",
+        "منغوليا",
     ],
 
     "الشرق الأوسط": [
@@ -79,17 +144,16 @@ REGIONS: Dict[str, List[str]] = {
         "الكويت",
         "البحرين",
         "عمان",
-        "العراق",
-        "الأردن",
-        "لبنان",
-        "سوريا",
         "اليمن",
-        "مصر",
+        "العراق",
         "إيران",
-        "تركيا",
-        "إسرائيل",
+        "سوريا",
+        "لبنان",
+        "الأردن",
         "فلسطين",
-        "الشرق الأوسط",
+        "إسرائيل",
+        "مصر",
+        "تركيا",
     ],
 
     "أفريقيا": [
@@ -105,13 +169,16 @@ REGIONS: Dict[str, List[str]] = {
         "جنوب أفريقيا",
         "غانا",
         "تنزانيا",
-        "السنغال",
         "الصومال",
-        "أفريقيا",
+        "السنغال",
+        "أنغولا",
+        "زيمبابوي",
+        "زامبيا",
     ],
 
     "أوروبا": [
         "بريطانيا",
+        "المملكة المتحدة",
         "فرنسا",
         "ألمانيا",
         "إيطاليا",
@@ -122,26 +189,26 @@ REGIONS: Dict[str, List[str]] = {
         "سويسرا",
         "النمسا",
         "بولندا",
-        "اليونان",
-        "النرويج",
-        "السويد",
-        "الدنمارك",
-        "فنلندا",
         "أوكرانيا",
         "روسيا",
-        "أيرلندا",
+        "السويد",
+        "النرويج",
+        "الدنمارك",
+        "فنلندا",
+        "اليونان",
         "رومانيا",
         "التشيك",
-        "الاتحاد الأوروبي",
-        "أوروبا",
+        "المجر",
+        "أيرلندا",
     ],
 
     "أستراليا والمحيط الهادئ": [
         "أستراليا",
         "نيوزيلندا",
-        "بابوا غينيا الجديدة",
         "فيجي",
-        "المحيط الهادئ",
+        "بابوا غينيا الجديدة",
+        "جزر سليمان",
+        "ساموا",
     ],
 
     "أمريكا الشمالية": [
@@ -149,11 +216,6 @@ REGIONS: Dict[str, List[str]] = {
         "أمريكا",
         "كندا",
         "المكسيك",
-        "بنما",
-        "كوبا",
-        "جامايكا",
-        "الكاريبي",
-        "أمريكا الشمالية",
     ],
 
     "أمريكا الجنوبية": [
@@ -162,60 +224,60 @@ REGIONS: Dict[str, List[str]] = {
         "تشيلي",
         "كولومبيا",
         "بيرو",
-        "بوليفيا",
+        "فنزويلا",
         "الإكوادور",
+        "بوليفيا",
         "أوروغواي",
         "باراغواي",
-        "فنزويلا",
-        "أمريكا الجنوبية",
     ],
 }
 
 
 # ============================================================
-# الاستعلامات العامة
+# GLOBAL SEARCH QUERIES
 # ============================================================
 
 GLOBAL_QUERIES: List[Tuple[str, str]] = [
+
+    # Official / governments
     (
-        'وزارة الخارجية OR "وزارة الخارجية" OR '
-        '"Ministry of Foreign Affairs" OR "Foreign Ministry"',
-        "official",
+        '"وزارة" OR "حكومة" OR "رئاسة الوزراء" '
+        'OR "وزارة الخارجية" OR "وزارة الدفاع" '
+        'OR "بيان رسمي"',
+        "official"
     ),
+
+    # Economy + energy = ONE category
     (
-        'حكومة OR "بيان رسمي" OR "تصريح رسمي" OR '
-        '"Government statement" OR "official statement"',
-        "official",
+        '"اقتصاد" OR "أسواق" OR "أسهم" OR "بورصة" '
+        'OR "نفط" OR "أوبك" OR "برنت" OR "غاز" '
+        'OR "ذهب" OR "تضخم" OR "فائدة" '
+        'OR "بنك مركزي" OR "بيتكوين" OR "عملات رقمية"',
+        "economy_energy"
     ),
+
+    # Security
     (
-        'أسهم OR بورصة OR تداول OR "داو جونز" OR '
-        '"ناسداك" OR "S&P 500" OR أسواق',
-        "economy",
+        '"دفاع" OR "أمن" OR "عسكري" OR "جيش" '
+        'OR "مناورات" OR "أمن قومي"',
+        "security"
     ),
+
+    # Breaking
     (
-        'بيتكوين OR إيثريوم OR كريبتو OR "عملات رقمية"',
-        "crypto",
-    ),
-    (
-        'النفط OR أوبك OR برنت OR غاز OR طاقة',
-        "energy",
-    ),
-    (
-        'تضخم OR فائدة OR "بنك مركزي" OR اقتصاد OR عملات',
-        "economy",
-    ),
-    (
-        'عاجل OR "بيان عاجل" OR "خبر عاجل"',
-        "urgent",
+        '"عاجل" OR "طارئ" OR "بيان عاجل" '
+        'OR "تطورات عاجلة"',
+        "urgent"
     ),
 ]
 
 
 # ============================================================
-# نموذج الخبر
+# NEWS ITEM
 # ============================================================
 
 class NewsItem:
+
     def __init__(
         self,
         title: str,
@@ -228,88 +290,112 @@ class NewsItem:
     ):
         self.title = self.clean_text(title)
         self.source = self.clean_text(source)
-        self.url = str(url or "").strip()
+        self.url = url.strip() if url else ""
         self.published_at = self.clean_text(published_at)
         self.category = category
         self.summary = self.clean_text(summary)
-        self.region = self.clean_text(region)
+        self.region = region
+
+        self.search_text = " ".join(
+            part for part in [
+                self.title,
+                self.summary,
+                self.source,
+                self.region,
+                self.category,
+            ]
+            if part
+        ).lower()
 
     @staticmethod
     def clean_text(text: str) -> str:
+
         if not text:
             return ""
 
         text = html.unescape(str(text))
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text)
+
+        text = re.sub(
+            r"<script.*?</script>",
+            " ",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        text = re.sub(
+            r"<style.*?</style>",
+            " ",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        text = re.sub(
+            r"<[^>]+>",
+            " ",
+            text,
+        )
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text,
+        )
 
         return text.strip()
 
-    def search_text(self) -> str:
-        return " ".join(
-            [
-                self.title,
-                self.source,
-                self.summary,
-                self.region,
-            ]
-        ).lower()
+    def __repr__(self):
+
+        return (
+            f"<NewsItem "
+            f"title='{self.title[:50]}...' "
+            f"source='{self.source}'>"
+        )
 
 
 # ============================================================
-# أدوات التطبيع
+# REGION DETECTION
 # ============================================================
 
-def normalize_text(text: str) -> str:
-    text = str(text or "").lower()
+def detect_region(text: str) -> str:
 
-    # توحيد بعض الحروف العربية
-    replacements = {
-        "أ": "ا",
-        "إ": "ا",
-        "آ": "ا",
-        "ى": "ي",
-        "ة": "ه",
-    }
+    if not text:
+        return ""
 
-    for old, new in replacements.items():
-        text = text.replace(old, new)
+    lowered = text.lower()
 
-    text = re.sub(
-        r"[^\w\s\u0600-\u06FF-]",
-        " ",
-        text,
-    )
+    for region, countries in REGIONS.items():
 
-    return re.sub(
-        r"\s+",
-        " ",
-        text,
-    ).strip()
+        for country in countries:
 
+            if country.lower() in lowered:
+                return region
 
-def title_key(title: str) -> str:
-    return normalize_text(title)[:180]
-
-
-def deduplicate(items: List[NewsItem]) -> List[NewsItem]:
-    output = []
-    seen = set()
-
-    for item in items:
-        key = title_key(item.title)
-
-        if not key or key in seen:
-            continue
-
-        seen.add(key)
-        output.append(item)
-
-    return output
+    return ""
 
 
 # ============================================================
-# جلب RSS
+# URL VALIDATION
+# ============================================================
+
+def is_valid_http_url(url: str) -> bool:
+
+    if not url:
+        return False
+
+    url = url.strip()
+
+    if not re.match(
+        r"^https?://",
+        url,
+        flags=re.IGNORECASE,
+    ):
+        return False
+
+    return True
+
+
+# ============================================================
+# FETCH RSS
 # ============================================================
 
 async def fetch_rss_feed(
@@ -318,25 +404,26 @@ async def fetch_rss_feed(
     url: str,
 ) -> List[NewsItem]:
 
-    items = []
+    items: List[NewsItem] = []
 
     try:
-        timeout = aiohttp.ClientTimeout(
-            total=FETCH_TIMEOUT
-        )
 
         async with session.get(
             url,
-            timeout=timeout,
+            timeout=aiohttp.ClientTimeout(
+                total=FETCH_TIMEOUT
+            ),
             allow_redirects=True,
         ) as response:
 
             if response.status != 200:
+
                 log.warning(
-                    "RSS %s -> HTTP %s",
+                    "RSS [%s] returned HTTP %s",
                     source_name,
                     response.status,
                 )
+
                 return items
 
             content = await response.text(
@@ -346,44 +433,36 @@ async def fetch_rss_feed(
             parsed = feedparser.parse(content)
 
             for entry in parsed.entries[
-                :MAX_PER_FEED
+                :MAX_FEED_ITEMS
             ]:
 
-                title = entry.get(
-                    "title",
-                    "",
+                title = (
+                    entry.get("title", "")
+                    or ""
                 )
 
-                link = entry.get(
-                    "link",
-                    "",
+                link = (
+                    entry.get("link", "")
+                    or ""
                 )
-
-                if not title or not link:
-                    continue
 
                 published = (
-                    entry.get(
-                        "published",
-                        "",
-                    )
-                    or entry.get(
-                        "updated",
-                        "",
-                    )
+                    entry.get("published", "")
+                    or entry.get("updated", "")
                     or ""
                 )
 
                 summary = (
-                    entry.get(
-                        "summary",
-                        "",
-                    )
-                    or entry.get(
-                        "description",
-                        "",
-                    )
+                    entry.get("summary", "")
+                    or entry.get("description", "")
                     or ""
+                )
+
+                if not title:
+                    continue
+
+                region = detect_region(
+                    f"{title} {summary}"
                 )
 
                 items.append(
@@ -392,13 +471,20 @@ async def fetch_rss_feed(
                         source=source_name,
                         url=link,
                         published_at=published,
+                        category="direct",
                         summary=summary,
+                        region=region,
                     )
                 )
 
+    except asyncio.CancelledError:
+
+        raise
+
     except Exception as exc:
+
         log.warning(
-            "RSS error [%s]: %s",
+            "Error fetching RSS [%s]: %s",
             source_name,
             exc,
         )
@@ -407,7 +493,7 @@ async def fetch_rss_feed(
 
 
 # ============================================================
-# Google News RSS
+# GOOGLE NEWS RSS
 # ============================================================
 
 async def fetch_google_news_topic(
@@ -415,35 +501,36 @@ async def fetch_google_news_topic(
     query: str,
     category: str = "general",
     region: str = "",
-    limit: int = 20,
 ) -> List[NewsItem]:
 
-    items = []
+    items: List[NewsItem] = []
 
-    encoded = urllib.parse.quote_plus(
+    encoded_query = urllib.parse.quote_plus(
         query
     )
 
-    url = GOOGLE_NEWS_BASE.format(
-        query=encoded
+    target_url = GOOGLE_NEWS_BASE.format(
+        query=encoded_query
     )
 
     try:
-        timeout = aiohttp.ClientTimeout(
-            total=FETCH_TIMEOUT
-        )
 
         async with session.get(
-            url,
-            timeout=timeout,
+            target_url,
+            timeout=aiohttp.ClientTimeout(
+                total=FETCH_TIMEOUT
+            ),
             allow_redirects=True,
         ) as response:
 
             if response.status != 200:
+
                 log.warning(
-                    "Google News -> HTTP %s",
+                    "Google News [%s] returned HTTP %s",
+                    query[:80],
                     response.status,
                 )
+
                 return items
 
             content = await response.text(
@@ -453,74 +540,88 @@ async def fetch_google_news_topic(
             parsed = feedparser.parse(content)
 
             for entry in parsed.entries[
-                :limit
+                :MAX_FEED_ITEMS
             ]:
 
-                title = entry.get(
-                    "title",
-                    "",
+                title = (
+                    entry.get("title", "")
+                    or ""
                 )
 
-                link = entry.get(
-                    "link",
-                    "",
+                link = (
+                    entry.get("link", "")
+                    or ""
                 )
 
-                if not title or not link:
-                    continue
+                published = (
+                    entry.get("published", "")
+                    or entry.get("updated", "")
+                    or ""
+                )
+
+                summary = (
+                    entry.get("summary", "")
+                    or entry.get("description", "")
+                    or ""
+                )
+
+                source = "تغطية إخبارية"
 
                 source_data = entry.get(
-                    "source",
-                    {},
+                    "source"
                 )
 
-                source = ""
-
-                if hasattr(
+                if isinstance(
                     source_data,
-                    "get",
+                    dict,
                 ):
                     source = (
                         source_data.get(
                             "title",
-                            "",
+                            source,
                         )
-                        or ""
+                        or source
                     )
 
-                published = (
-                    entry.get(
-                        "published",
-                        "",
-                    )
-                    or entry.get(
-                        "updated",
-                        "",
-                    )
-                    or ""
-                )
-
+                # Google News frequently appends:
+                # " - Source Name"
                 if " - " in title:
+
                     title = title.rsplit(
                         " - ",
                         1,
-                    )[0]
+                    )[0].strip()
 
-                items.append(
-                    NewsItem(
-                        title=title,
-                        source=source or "Google News",
-                        url=link,
-                        published_at=published,
-                        category=category,
-                        region=region,
+                detected_region = (
+                    region
+                    or detect_region(
+                        f"{title} {summary}"
                     )
                 )
 
+                if title:
+
+                    items.append(
+                        NewsItem(
+                            title=title,
+                            source=source,
+                            url=link,
+                            published_at=published,
+                            category=category,
+                            summary=summary,
+                            region=detected_region,
+                        )
+                    )
+
+    except asyncio.CancelledError:
+
+        raise
+
     except Exception as exc:
+
         log.warning(
-            "Google News error [%s]: %s",
-            query,
+            "Error fetching Google News [%s]: %s",
+            query[:80],
             exc,
         )
 
@@ -528,7 +629,61 @@ async def fetch_google_news_topic(
 
 
 # ============================================================
-# التجميع العام
+# DEDUPLICATION
+# ============================================================
+
+def normalize_title(title: str) -> str:
+
+    title = (
+        title
+        or ""
+    ).lower()
+
+    title = re.sub(
+        r"[^\w\u0600-\u06ff\s]",
+        " ",
+        title,
+    )
+
+    title = re.sub(
+        r"\s+",
+        " ",
+        title,
+    ).strip()
+
+    # Use enough of the title to avoid
+    # duplicate articles while not merging
+    # unrelated stories.
+    return title[:120]
+
+
+def deduplicate_news(
+    items: List[NewsItem],
+) -> List[NewsItem]:
+
+    unique: List[NewsItem] = []
+    seen = set()
+
+    for item in items:
+
+        key = normalize_title(
+            item.title
+        )
+
+        if not key:
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(item)
+
+    return unique
+
+
+# ============================================================
+# GLOBAL COLLECTION
 # ============================================================
 
 async def collect_news(
@@ -538,20 +693,31 @@ async def collect_news(
     headers = {
         "User-Agent": (
             "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "Chrome/120 Safari/537.36"
-        )
+            "(compatible; GlobalIntelBot/1.0)"
+        ),
+        "Accept": (
+            "application/rss+xml, "
+            "application/xml, "
+            "text/xml, "
+            "text/html;q=0.9, "
+            "*/*;q=0.8"
+        ),
     }
 
-    tasks = []
+    all_news: List[NewsItem] = []
 
     async with aiohttp.ClientSession(
         headers=headers
     ) as session:
 
-        # المصادر المباشرة
+        tasks = []
+
+        # ----------------------------------------------------
+        # Direct trusted feeds
+        # ----------------------------------------------------
+
         for source_name, url in TRUSTED_FEEDS.items():
+
             tasks.append(
                 fetch_rss_feed(
                     session,
@@ -560,8 +726,12 @@ async def collect_news(
                 )
             )
 
-        # الاستعلامات العامة
+        # ----------------------------------------------------
+        # Global topic queries
+        # ----------------------------------------------------
+
         for query, category in GLOBAL_QUERIES:
+
             tasks.append(
                 fetch_google_news_topic(
                     session,
@@ -570,21 +740,31 @@ async def collect_news(
                 )
             )
 
-        # التغطية الإقليمية
+        # ----------------------------------------------------
+        # Regional queries
+        # ----------------------------------------------------
+
         for region, countries in REGIONS.items():
 
-            query = " OR ".join(
+            # Use a representative set of countries
+            # to maintain global coverage without
+            # creating an excessive number of requests.
+            selected = countries[:8]
+
+            if not selected:
+                continue
+
+            region_query = " OR ".join(
                 f'"{country}"'
-                for country in countries
+                for country in selected
             )
 
             tasks.append(
                 fetch_google_news_topic(
                     session,
-                    query,
+                    region_query,
                     "regional",
                     region,
-                    limit=20,
                 )
             )
 
@@ -593,18 +773,23 @@ async def collect_news(
             return_exceptions=True,
         )
 
-    all_news = []
+        for result in results:
 
-    for result in results:
-        if isinstance(result, list):
-            all_news.extend(result)
+            if isinstance(
+                result,
+                list,
+            ):
 
-    all_news = deduplicate(
+                all_news.extend(
+                    result
+                )
+
+    all_news = deduplicate_news(
         all_news
     )
 
     log.info(
-        "Collected %s unique global news items.",
+        "Successfully collected %s unique news items.",
         len(all_news),
     )
 
@@ -612,7 +797,181 @@ async def collect_news(
 
 
 # ============================================================
-# البحث داخل الأخبار الموجودة
+# SEARCH TOKENIZATION
+# ============================================================
+
+ARABIC_STOPWORDS = {
+    "في",
+    "من",
+    "على",
+    "إلى",
+    "عن",
+    "مع",
+    "هذا",
+    "هذه",
+    "ذلك",
+    "تلك",
+    "هو",
+    "هي",
+    "و",
+    "أو",
+    "ثم",
+    "بعد",
+    "قبل",
+    "ما",
+    "ماذا",
+    "هل",
+    "أن",
+    "إن",
+    "كان",
+    "كانت",
+    "لـ",
+    "له",
+    "لها",
+    "التي",
+    "الذي",
+    "هناك",
+}
+
+
+def normalize_search_text(
+    text: str,
+) -> str:
+
+    text = (
+        text
+        or ""
+    ).lower()
+
+    # Remove punctuation while keeping
+    # Arabic characters.
+    text = re.sub(
+        r"[^\w\u0600-\u06ff\s]",
+        " ",
+        text,
+    )
+
+    # Normalize common Arabic variants.
+    replacements = {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ى": "ي",
+        "ة": "ه",
+    }
+
+    for old, new in replacements.items():
+
+        text = text.replace(
+            old,
+            new,
+        )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    return text
+
+
+def tokenize_query(
+    query: str,
+) -> List[str]:
+
+    normalized = normalize_search_text(
+        query
+    )
+
+    tokens = []
+
+    for token in normalized.split():
+
+        if len(token) < 2:
+            continue
+
+        if token in ARABIC_STOPWORDS:
+            continue
+
+        tokens.append(token)
+
+    return list(
+        dict.fromkeys(tokens)
+    )
+
+
+# ============================================================
+# SEARCH SCORING
+# ============================================================
+
+def score_news_item(
+    item: NewsItem,
+    query_tokens: List[str],
+) -> int:
+
+    if not query_tokens:
+        return 0
+
+    title = normalize_search_text(
+        item.title
+    )
+
+    summary = normalize_search_text(
+        item.summary
+    )
+
+    source = normalize_search_text(
+        item.source
+    )
+
+    region = normalize_search_text(
+        item.region
+    )
+
+    score = 0
+
+    for token in query_tokens:
+
+        # Strongest match: title
+        if token in title:
+
+            score += 10
+
+        # Useful match: summary
+        if token in summary:
+
+            score += 4
+
+        # Source / region
+        if token in source:
+
+            score += 2
+
+        if token in region:
+
+            score += 2
+
+    # Bonus when ALL tokens appear somewhere
+    searchable = (
+        f"{title} "
+        f"{summary} "
+        f"{source} "
+        f"{region}"
+    )
+
+    if all(
+        token in searchable
+        for token in query_tokens
+    ):
+
+        score += 8
+
+    return score
+
+
+# ============================================================
+# LOCAL SEARCH
 # ============================================================
 
 def search_news(
@@ -621,65 +980,69 @@ def search_news(
     max_results: int = 25,
 ) -> List[NewsItem]:
 
-    if not items or not keywords:
+    if not items:
         return []
 
-    query_words = [
-        normalize_text(word)
-        for word in keywords
-        if normalize_text(word)
-    ]
+    if not keywords:
+        return []
 
-    if not query_words:
+    # This function supports both:
+    #
+    # search_news(items, ["السعودية"])
+    #
+    # and:
+    #
+    # search_news(items, ["السعودية", "النفط"])
+    #
+    query_text = " ".join(
+        str(k)
+        for k in keywords
+        if k
+    )
+
+    query_tokens = tokenize_query(
+        query_text
+    )
+
+    if not query_tokens:
         return []
 
     scored = []
 
-    for item in items:
+    for index, item in enumerate(items):
 
-        title = normalize_text(
-            item.title
+        score = score_news_item(
+            item,
+            query_tokens,
         )
-
-        body = normalize_text(
-            f"{item.summary} "
-            f"{item.source} "
-            f"{item.region}"
-        )
-
-        score = 0
-
-        for word in query_words:
-
-            if word in title:
-                score += 5
-
-            elif word in body:
-                score += 2
 
         if score > 0:
+
             scored.append(
                 (
                     score,
+                    index,
                     item,
                 )
             )
 
     scored.sort(
-        key=lambda value: value[0],
-        reverse=True,
+        key=lambda x: (
+            -x[0],
+            x[1],
+        )
     )
 
     return [
         item
-        for _, item in scored[
+        for _, _, item in scored[
             :max_results
         ]
     ]
 
 
 # ============================================================
-# البحث العالمي المستقل
+# ONLINE SEARCH
 # ============================================================
 
 async def search_news_online(
@@ -687,43 +1050,80 @@ async def search_news_online(
     max_results: int = 25,
 ) -> List[NewsItem]:
 
-    query = str(query or "").strip()
+    query = (
+        query
+        or ""
+    ).strip()
 
     if not query:
         return []
 
+    tokens = tokenize_query(
+        query
+    )
+
+    if not tokens:
+        return []
+
+    queries: List[str] = []
+
+    # --------------------------------------------------------
+    # 1. Original phrase
+    # --------------------------------------------------------
+
+    queries.append(
+        query
+    )
+
+    # --------------------------------------------------------
+    # 2. Quoted phrase
+    # --------------------------------------------------------
+
+    if len(tokens) > 1:
+
+        queries.append(
+            f'"{query}"'
+        )
+
+    # --------------------------------------------------------
+    # 3. Individual meaningful words
+    # --------------------------------------------------------
+
+    if len(tokens) > 1:
+
+        queries.append(
+            " OR ".join(
+                f'"{token}"'
+                for token in tokens
+            )
+        )
+
+    # --------------------------------------------------------
+    # 4. Limited two-token combinations
+    # --------------------------------------------------------
+
+    if len(tokens) >= 2:
+
+        queries.append(
+            f'"{tokens[0]}" "{tokens[1]}"'
+        )
+
+    queries = list(
+        dict.fromkeys(
+            queries[
+                :MAX_ONLINE_QUERIES
+            ]
+        )
+    )
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "Chrome/120 Safari/537.36"
+            "(compatible; GlobalIntelBot/1.0)"
         )
     }
 
-    queries = [
-        query,
-        f'"{query}"',
-    ]
-
-    # إذا كان البحث متعدد الكلمات،
-    # نضيف نسخة OR حتى لا يكون البحث ضيقًا جدًا.
-    words = [
-        word
-        for word in re.split(
-            r"\s+",
-            query,
-        )
-        if len(word) >= 2
-    ]
-
-    if len(words) > 1:
-        queries.append(
-            " OR ".join(
-                f'"{word}"'
-                for word in words
-            )
-        )
+    collected: List[NewsItem] = []
 
     async with aiohttp.ClientSession(
         headers=headers
@@ -732,12 +1132,10 @@ async def search_news_online(
         tasks = [
             fetch_google_news_topic(
                 session,
-                q,
+                search_query,
                 "search",
-                "",
-                limit=max_results,
             )
-            for q in queries
+            for search_query in queries
         ]
 
         results = await asyncio.gather(
@@ -745,50 +1143,159 @@ async def search_news_online(
             return_exceptions=True,
         )
 
-    combined = []
+        for result in results:
 
-    for result in results:
+            if isinstance(
+                result,
+                list,
+            ):
 
-        if isinstance(result, list):
-            combined.extend(result)
+                collected.extend(
+                    result
+                )
 
-    combined = deduplicate(
-        combined
+    collected = deduplicate_news(
+        collected
     )
 
-    # ترتيب النتائج حسب مطابقة كلمات البحث
+    # IMPORTANT:
+    #
+    # Do not return unrelated "latest" news.
+    # Every returned item must actually match
+    # the requested search terms.
+    ranked = search_news(
+        collected,
+        tokens,
+        max_results=max_results,
+    )
+
+    return ranked
+
+
+# ============================================================
+# HYBRID SEARCH
+# ============================================================
+
+async def hybrid_search_news(
+    items: List[NewsItem],
+    query: str,
+    max_results: int = 25,
+) -> List[NewsItem]:
+
+    query = (
+        query
+        or ""
+    ).strip()
+
+    if not query:
+        return []
+
+    # --------------------------------------------------------
+    # Search existing cache first.
+    # --------------------------------------------------------
+
+    local_results = search_news(
+        items,
+        tokenize_query(query),
+        max_results=max_results,
+    )
+
+    # --------------------------------------------------------
+    # If we already have enough results,
+    # do not waste an online request.
+    # --------------------------------------------------------
+
+    if len(local_results) >= 3:
+
+        return local_results
+
+    # --------------------------------------------------------
+    # Fresh online search.
+    # --------------------------------------------------------
+
+    online_results = await search_news_online(
+        query,
+        max_results=max_results,
+    )
+
+    # --------------------------------------------------------
+    # Merge local + online results.
+    # --------------------------------------------------------
+
+    merged = deduplicate_news(
+        local_results + online_results
+    )
+
+    # Re-rank the merged collection.
     return search_news(
-        combined,
-        words or [query],
+        merged,
+        tokenize_query(query),
         max_results=max_results,
     )
 
 
 # ============================================================
-# سياق Gemini
+# AI CONTEXT
 # ============================================================
 
 def build_ai_context(
     items: List[NewsItem],
-    limit: int = 8,
+    limit: int = 6,
 ) -> str:
 
-    lines = []
+    context_lines = []
 
-    for index, item in enumerate(
-        items[:limit],
-        start=1,
-    ):
+    for item in items[:limit]:
 
-        lines.append(
-            f"{index}. "
-            f"العنوان: {item.title}\n"
-            f"المصدر: {item.source}\n"
-            f"التاريخ: "
-            f"{item.published_at or 'غير متوفر'}\n"
-            f"المنطقة: "
-            f"{item.region or 'عالمية'}\n"
-            f"الرابط: {item.url}"
+        title = item.title or "بدون عنوان"
+        source = item.source or "مصدر غير محدد"
+        date = item.published_at or "غير محدد"
+        region = item.region or "غير محدد"
+        url = item.url or ""
+
+        context_lines.append(
+            f"- العنوان: {title}\n"
+            f"  المصدر: {source}\n"
+            f"  المنطقة: {region}\n"
+            f"  التاريخ: {date}\n"
+            f"  الرابط: {url}"
         )
 
-    return "\n\n".join(lines)
+    return "\n".join(
+        context_lines
+    )
+
+
+# ============================================================
+# UTILITY
+# ============================================================
+
+def build_search_url(
+    query: str,
+) -> str:
+
+    encoded = urllib.parse.quote_plus(
+        query.strip()
+    )
+
+    return (
+        "https://www.google.com/search?q="
+        f"{encoded}"
+    )
+
+
+# ============================================================
+# COMPATIBILITY
+# ============================================================
+
+__all__ = [
+    "NewsItem",
+    "collect_news",
+    "search_news",
+    "search_news_online",
+    "hybrid_search_news",
+    "build_ai_context",
+    "build_search_url",
+    "TRUSTED_FEEDS",
+    "REGIONS",
+]

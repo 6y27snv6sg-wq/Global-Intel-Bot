@@ -3,7 +3,8 @@ import logging
 import os
 import re
 import time
-from typing import Dict, List, Any
+import urllib.parse
+from typing import Dict, List, Any, Set
 
 from telegram import (
     Update,
@@ -38,7 +39,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-log = logging.getLogger("news_bot")
+log = logging.getLogger("optimized_news_bot")
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
@@ -46,9 +47,9 @@ GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 GEMINI_MODEL = "gemini-3.5-flash"
 
 NEWS_COLLECTION_TIMEOUT = 20
-GEMINI_TIMEOUT = 45
+GEMINI_TIMEOUT = 30
 MAX_SEARCH_RESULTS = 25
-CACHE_TTL = 300  # 5 دقائق للكاش
+CACHE_TTL = 300  # 5 دقائق
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
@@ -56,16 +57,11 @@ if not BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing")
 
-
-# ============================================================
-# GEMINI CLIENT
-# ============================================================
-
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ============================================================
-# SIMPLE CACHE SYSTEM
+# STATE & CACHE MANAGEMENT
 # ============================================================
 
 class SimpleCache:
@@ -91,114 +87,81 @@ class SimpleCache:
 NEWS_CACHE = SimpleCache(ttl=CACHE_TTL)
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
 
-
-# ============================================================
-# MARKDOWN ESCAPE & UTILS
-# ============================================================
-
-def escape_markdown(text: str) -> str:
-    """تطهير النصوص لضمان عدم كسر تنسيق Telegram MarkdownV2"""
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
-    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+# قائمة المستخدمين المكتومين للتنبيهات العاجلة
+MUTED_USERS: Set[int] = set()
 
 
 # ============================================================
-# TOPICS (المناطق والقطاعات الرسمية)
+# LINK SANITIZER (منع تشوه الشاشة واستبدال المعطل بالبحث)
+# ============================================================
+
+def build_safe_link(title: str, source: str, raw_url: str) -> str:
+    """استبدال الروابط المعطلة برابط بحث آمن ومباشر في محرك البحث"""
+    if raw_url and "news.google.com" not in raw_url and raw_url.startswith("http"):
+        return raw_url
+    
+    # تحويل الرابط التوجيهي أو المعطل إلى رابط بحث آمن في Google Search
+    query = f"{title} {source}"
+    encoded_query = urllib.parse.quote_plus(query)
+    return f"https://www.google.com/search?q={encoded_query}"
+
+
+# ============================================================
+# TOPICS & KEYBOARDS (إضافة المال والاقتصاد)
 # ============================================================
 
 TOPICS = {
-    "urgent": ("🚨 عاجل ورسمي", "تصريح رسمي عاجل بيانات وزارة الخارجية"),
-    "foreign": ("🏛 الخارجية والبيانات", "وزارة الخارجية تصريح بيان رسمي"),
-    "gulf": ("🇸🇦 الخليج والرؤية", "أخبار الخليج العربي الخارجية والبيانات الرسمية"),
-    "world": ("🌍 العالم والدبلوماسية", "أخبار العالم التصريحات الدبلوماسية"),
-    "america": ("🇺🇸 أمريكا", "أخبار الولايات المتحدة الخارجية الأمريكية"),
-    "canada": ("🇨🇦 كندا", "أخبار كندا الخارجية الكندية"),
-    "latin": ("🇧🇷 أمريكا الجنوبية", "أخبار أمريكا اللاتينية والجنوبية"),
-    "europe": ("🇪🇺 أوروبا", "أخبار أوروبا الاتحاد الأوروبي"),
-    "asia": ("🌏 آسيا", "أخبار آسيا الخارجية"),
-    "africa": ("🌍 أفريقيا", "أخبار القارة الأفريقية"),
-    "australia": ("🇦🇺 أستراليا", "أخبار أستراليا ونيوزيلندا"),
-    "energy": ("⚡ النفط والطاقة", "أخبار النفط أوبك وزارة الطاقة"),
-    "security": ("🛡 الأمن والدفاع", "أخبار الأمن والدفاع وزارة الدفاع"),
+    "urgent": ("🚨 عاجل وبيانات رسمية", "تصريح رسمي عاجل بيانات وزارة الخارجية"),
+    "economy": ("📈 الاقتصاد والمال", "الاقتصاد الأسواق التضخم الفائدة البنك المركزي الأسهم"),
+    "foreign": ("🏛 الخارجية والدبلوماسية", "وزارة الخارجية تصريح بيان رسمي دبلوماسي"),
+    "gulf": ("🇸🇦 الخليج والشرق الأوسط", "أخبار الخليج العربي الخارجية السعودية الإمارات"),
+    "energy": ("⚡ النفط والطاقة", "أخبار النفط أوبك بلس وزارة الطاقة أسواق الخام"),
+    "world": ("🌍 العالم والسياسة", "أخبار العالم التصريحات الدولية القمة"),
+    "security": ("🛡 الدفاع والأمن", "أخبار الدفاع الأمن العسكري الاتفاقيات الأمنية"),
 }
 
 
-def main_keyboard():
+def main_keyboard(user_id: int):
     rows = []
     items = list(TOPICS.items())
 
     for i in range(0, len(items), 2):
-        rows.append([
-            InlineKeyboardButton(label, callback_data=f"topic:{key}:1")
-            for key, (label, _) in items[i:i + 2]
-        ])
+        row = [InlineKeyboardButton(label, callback_data=f"topic:{key}:1") for key, (label, _) in items[i:i + 2]]
+        rows.append(row)
 
+    # زر التحكم بالتنبيهات العاجلة (تفعيل / إيقاف)
+    is_muted = user_id in MUTED_USERS
+    alert_btn_text = "🔔 تفعيل التنبيهات العاجلة" if is_muted else "🔕 إيقاف التنبيهات العاجلة"
+    alert_action = "unmute_alerts" if is_muted else "mute_alerts"
+
+    rows.append([InlineKeyboardButton(alert_btn_text, callback_data=alert_action)])
+    rows.append([InlineKeyboardButton("🔄 تحديث الأخبار", callback_data="refresh")])
     return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
-# GREETING & NEWS QUERY DETECTION
+# GEMINI ON-DEMAND ENGINE (تحليل عند الطلب فقط)
 # ============================================================
 
-GREETING_RE = re.compile(
-    r"^\s*("
-    r"السلام عليكم|السلام عليكم ورحمة الله وبركاته|"
-    r"وعليكم السلام|مرحبا|مرحباً|هلا|هلا والله|"
-    r"اهلا|أهلا|أهلين|اهلين|"
-    r"صباح الخير|مساء الخير|"
-    r"شكرا|شكراً|مشكور|مشكورة|"
-    r"يعطيك العافية|يعطيك العافيه|"
-    r"تمام|ممتاز|حلو|"
-    r"كيفك|كيف حالك|"
-    r"hello|hi|hey|thanks|thank you"
-    r")\s*[!.،,؟?]*\s*$",
-    re.IGNORECASE,
-)
+ANALYSIS_PROMPT = """
+أنت محرر ومحلل أخبار تنفيذي.
+قم بتحليل القائمة التالية بأسلوب دقيق ومختصر جداً:
 
-NEWS_TERMS = {
-    "خبر", "أخبار", "اخبار", "عاجل", "آخر الأخبار", "اخر الاخبار",
-    "اليوم", "الآن", "الان", "حدث", "أحداث", "احداث", "الوضع",
-    "تطورات", "مستجدات", "سياسة", "سياسي", "حرب", "هجوم", "ضربة",
-    "قصف", "صراع", "أزمة", "ازمة", "روسيا", "أوكرانيا", "امريكا",
-    "أمريكا", "الصين", "آسيا", "إيران", "ايران", "إسرائيل", "اسرائيل",
-    "غزة", "السعودية", "الخليج", "الإمارات", "الامارات", "قطر",
-    "الكويت", "البحرين", "عمان", "تركيا", "بريطانيا", "أوروبا",
-    "اوروبا", "النفط", "الطاقة", "أوبك", "اوبك", "اقتصاد", "اقتصادية",
-    "دولار", "أسواق", "اسواق", "أمن", "امن", "دفاع", "عسكري",
-    "عسكرية", "مفاوضات", "اجتماع", "رئيس", "وزير", "وزارة", "الخارجية",
-    "تصريح", "بيان", "انتخابات", "برلمان", "أفريقيا", "افريقيا",
-    "كندا", "أستراليا", "استراليا", "أمريكا الجنوبية", "امريكا الجنوبية",
-    "البرازيل", "الأرجنتين", "news", "breaking", "latest", "world",
-    "russia", "ukraine", "usa", "america", "china", "iran", "israel",
-    "gulf", "oil", "energy", "africa", "canada", "australia", "statement",
-}
+🎯 **الخلاصة والتحليل السياسي/الاقتصادي:**
+• أهم حدث والدلالة المباشرة له.
+• التأثير المتوقع أو البعد المستقبلي.
 
+⚠️ اقتصر على 100 كلمة فقط دون إطالة.
+"""
 
-def is_greeting(text: str) -> bool:
-    return bool(GREETING_RE.match(text.strip()))
+async def analyze_with_gemini(items) -> str:
+    """استدعاء Gemini الموفر للتوكنز (عند النقر على زر التحليل فقط)"""
+    # نرسل العناوين والمصادر فقط لتقليل التوكنز لأقصى درجة
+    context_lines = [f"- {getattr(i, 'title', '')} [{getattr(i, 'source', '')}]" for i in items[:6]]
+    context_text = "\n".join(context_lines)
 
+    prompt = f"{ANALYSIS_PROMPT}\nالأخبار:\n{context_text}"
 
-def is_news_query(text: str) -> bool:
-    t = text.strip().lower()
-    if any(term.lower() in t for term in NEWS_TERMS):
-        return True
-
-    patterns = (
-        r"\bما الجديد\b", r"\bماذا يحدث\b", r"\bماذا حدث\b",
-        r"\bما الذي يحدث\b", r"\bآخر المستجدات\b", r"\bاخر المستجدات\b",
-        r"\bآخر التطورات\b", r"\bاخر التطورات\b", r"\bهل هناك\b",
-        r"\bهل حدث\b", r"\bهل يوجد\b", r"\bwhat happened\b",
-        r"\bwhat's happening\b", r"\bwhat is happening\b",
-        r"\blatest news\b", r"\bbreaking news\b",
-    )
-    return any(re.search(pattern, t, re.I) for pattern in patterns)
-
-
-# ============================================================
-# GEMINI REQUEST & FALLBACK
-# ============================================================
-
-async def ask_gemini(prompt: str) -> str:
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(
@@ -213,12 +176,12 @@ async def ask_gemini(prompt: str) -> str:
         )
         return (getattr(response, "text", None) or "").strip()
     except Exception as e:
-        log.warning(f"Gemini Unavailable / Fallback mode active: {e}")
-        return ""
+        log.warning(f"Gemini Analysis Error: {e}")
+        return "⚠️ تعذر إتمام التحليل حالياً، حاول مجدداً لاحقاً."
 
 
 # ============================================================
-# NEWS COLLECTION WITH CACHING
+# NEWS ENGINE & REPORT GENERATOR
 # ============================================================
 
 async def get_fresh_news():
@@ -235,125 +198,38 @@ async def get_fresh_news():
             NEWS_CACHE.set("all_news", items)
         return items or []
     except Exception:
-        log.exception("News collection error")
+        log.exception("News Collection Error")
         return []
 
 
-async def search_user_news(text: str):
-    items = await get_fresh_news()
-    if not items:
-        return []
-    try:
-        return search_news(items, text, max_results=MAX_SEARCH_RESULTS)
-    except Exception:
-        log.exception("News search error")
-        return []
-
-
-# ============================================================
-# REPORT GENERATION (تأنيق الروابط وتقسيم الصفحات)
-# ============================================================
-
-REPORT_PROMPT = """
-أنت محلل أخبار دقيق ومختصر.
-مهمتك تحليل الأخبار والبيانات الرسمية المتاحة فقط.
-
-صيغة الإجابة:
-🚨 الخلاصة أو التصريح الرئيسي
-
-• أهم نقطة
-• أهم نقطة
-
-📌 المصادر والبيانات الرسمية:
-- اسم المصدر: [🔗 المصدر](الرابط)
-"""
-
-
-def generate_fallback_report(items, page: int = 1, per_page: int = 5):
-    """التقرير البديل مع إخفاء الروابط الطويلة خلف نص تفاعلي أنيق"""
+def generate_base_report(items, page: int = 1, per_page: int = 5, is_muted: bool = False):
+    """عرض الأخبار بسرعة فائقة عبر البوت وبدون توكنز"""
     start_idx = (page - 1) * per_page
     end_idx = start_idx + per_page
     page_items = items[start_idx:end_idx]
 
-    lines = ["📰 **أبرز الأخبار والتصريحات الرسمية:**\n"]
+    lines = []
+    
+    # الشريط العلوي للتنبيهات العاجلة
+    if not is_muted:
+        lines.append("🔔 **[شريط التنبيهات العاجلة: مفعّل]**\n")
+    else:
+        lines.append("🔕 **[شريط التنبيهات العاجلة: مكتوم]**\n")
+
+    lines.append("📰 **أبرز التغطيات والبيانات:**\n")
 
     for item in page_items:
         title = getattr(item, "title", "") or getattr(item, "caption", "") or ""
-        source = getattr(item, "source", "") or "مصدر إخباري/رسمي"
-        url = getattr(item, "url", "") or getattr(item, "link", "") or ""
+        source = getattr(item, "source", "") or "مصدر رسمي"
+        raw_url = getattr(item, "url", "") or getattr(item, "link", "") or ""
+        
+        safe_url = build_safe_link(title, source, raw_url)
 
         if title:
-            entry = f"• **{title}**\n  📍 *{source}*"
-            # إخفاء الرابط الطويل خلف كلمة [🔗 تفاصيل الخبر]
-            if url:
-                entry += f" | [🔗 تفاصيل الخبر]({url})"
+            entry = f"• **{title}**\n  📍 *المصدر:* `{source}` | [🔗 قراءة الخبر]({safe_url})"
             lines.append(entry + "\n")
 
     return "\n".join(lines)
-
-
-async def generate_report(question: str, items, page: int = 1, per_page: int = 5) -> str:
-    if not items:
-        return "🔎 لم أجد أخباراً أو تصريحات مرتبطة بسؤالك ضمن المصادر المتاحة حالياً."
-
-    if page == 1:
-        context = build_ai_context(items[:10])
-        prompt = f"{REPORT_PROMPT}\nالسؤال: {question}\nالأخبار والبيانات المتاحة:\n{context}"
-        ai_result = await ask_gemini(prompt)
-        if ai_result:
-            return ai_result
-
-    return generate_fallback_report(items, page=page, per_page=per_page)
-
-
-def build_pagination_keyboard(key: str, current_page: int, total_items: int, per_page: int = 5):
-    buttons = []
-    total_pages = (total_items + per_page - 1) // per_page
-
-    if current_page < total_pages:
-        buttons.append(
-            InlineKeyboardButton(
-                "➕ عرض المزيد من الأخبار",
-                callback_data=f"topic:{key}:{current_page + 1}"
-            )
-        )
-
-    rows = []
-    if buttons:
-        rows.append(buttons)
-    rows.append([InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="home")])
-
-    return InlineKeyboardMarkup(rows)
-
-
-# ============================================================
-# SAFE MESSAGE SENDING
-# ============================================================
-
-async def send_long_message(message_or_query, text: str, reply_markup=None):
-    if not text:
-        return
-
-    sender = getattr(message_or_query, "message", message_or_query)
-
-    try:
-        for i in range(0, len(text), 3900):
-            chunk = text[i:i + 3900]
-            await sender.reply_text(
-                chunk,
-                reply_markup=reply_markup if (i + 3900 >= len(text)) else None,
-                disable_web_page_preview=True,
-                parse_mode="Markdown"
-            )
-    except Exception:
-        clean_text = text.replace("*", "").replace("_", "").replace("`", "")
-        for i in range(0, len(clean_text), 3900):
-            chunk = clean_text[i:i + 3900]
-            await sender.reply_text(
-                chunk,
-                reply_markup=reply_markup if (i + 3900 >= len(clean_text)) else None,
-                disable_web_page_preview=True
-            )
 
 
 # ============================================================
@@ -361,10 +237,12 @@ async def send_long_message(message_or_query, text: str, reply_markup=None):
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     await update.message.reply_text(
-        "📰 مرحباً بك في بوت الأخبار والتصريحات الرسمية الشامل.\n\n"
-        "اختر القطاع أو اكتب سؤالك/اسم الجهة التي تود البحث عنها مباشرة:",
-        reply_markup=main_keyboard(),
+        "🏛 **منصة الأخبار والبيانات الرسمية الشاملة**\n\n"
+        "اختر القطاع المطلوبة أو استخدم خيار التنبيهات والتحليل:",
+        reply_markup=main_keyboard(user_id),
+        parse_mode="Markdown"
     )
 
 
@@ -373,62 +251,96 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data
+    user_id = update.effective_user.id
 
-    if data == "home":
-        await query.message.reply_text("📰 القائمة الرئيسية:", reply_markup=main_keyboard())
+    # التعامل مع أزرار التنبيهات
+    if data == "mute_alerts":
+        MUTED_USERS.add(user_id)
+        await query.message.reply_text("🔕 تم إيقاف التنبيهات العاجلة بنجاح.", reply_markup=main_keyboard(user_id))
         return
 
+    if data == "unmute_alerts":
+        MUTED_USERS.discard(user_id)
+        await query.message.reply_text("🔔 تم تفعيل التنبيهات العاجلة بنجاح.", reply_markup=main_keyboard(user_id))
+        return
+
+    if data == "home":
+        await query.message.reply_text("📰 القائمة الرئيسية:", reply_markup=main_keyboard(user_id))
+        return
+
+    if data == "refresh":
+        NEWS_CACHE.set("all_news", None)
+        await query.message.reply_text("🔄 تم تحديث موجز الأخبار بنجاح!", reply_markup=main_keyboard(user_id))
+        return
+
+    # زر طلب تحليل الذكاء الاصطناعي (Gemini On-Demand)
+    if data.startswith("analyze:"):
+        key = data.split(":")[1]
+        status = await query.message.reply_text("🧠 جاري إرسال البيانات إلى Gemini لتحليلها وتلخيصها...")
+        
+        items = await get_fresh_news()
+        _, topic_text = TOPICS.get(key, ("", ""))
+        results = search_news(items, topic_text, max_results=10) if items else []
+
+        if results:
+            analysis = await analyze_with_gemini(results)
+            await status.edit_text(f"🧠 **التحليل التنفيذي (Gemini):**\n\n{analysis}", parse_mode="Markdown")
+        else:
+            await status.edit_text("⚠️ لا توجد بيانات كافية للتحليل.")
+        return
+
+    # التصفح العادي للأخبار
     parts = data.split(":")
     if len(parts) < 3 or parts[0] != "topic":
         return
 
-    key = parts[1]
-    page = int(parts[2])
-
+    key, page = parts[1], int(parts[2])
     if key not in TOPICS:
         return
 
     _, topic_text = TOPICS[key]
-    user_id = update.effective_user.id
-
     lock = USER_LOCKS.setdefault(user_id, asyncio.Lock())
 
     if lock.locked():
-        await query.message.reply_text("⏳ يوجد طلب قيد المعالجة. انتظر لحظات.")
+        await query.message.reply_text("⏳ جاري التحميل...")
         return
 
     async with lock:
-        status = await query.message.reply_text("📡 جاري تحديث الأخبار والتصريحات الرسمية...")
+        status = await query.message.reply_text("📡 جاري ترتيب الأخبار وتنقية الروابط...")
 
         try:
             items = await get_fresh_news()
-
-            if not items:
-                await status.edit_text("⚠️ تعذر الوصول إلى المصادر حالياً.")
-                return
-
-            results = search_news(items, topic_text, max_results=MAX_SEARCH_RESULTS)
+            results = search_news(items, topic_text, max_results=MAX_SEARCH_RESULTS) if items else []
 
             if not results:
-                await status.edit_text("🔎 لا توجد أخبار جديدة مرتبطة بهذا القسم حالياً.")
+                await status.edit_text("🔎 لا توجد أخبار جديدة في هذا القطاع حالياً.")
                 return
 
-            report = await generate_report(topic_text, results, page=page)
-            kb = build_pagination_keyboard(key, page, len(results))
+            is_muted = user_id in MUTED_USERS
+            report = generate_base_report(results, page=page, per_page=5, is_muted=is_muted)
 
-            await send_long_message(query.message, report, reply_markup=kb)
+            total_pages = (len(results) + 4) // 5
+            nav_buttons = []
+            
+            # أزرار الإضافة والتنقل
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("➕ إضافية (أخبار أكثر)", callback_data=f"topic:{key}:{page+1}"))
+            
+            # زر استخدام التحليل الذكي عند الطلب فقط
+            nav_buttons.append(InlineKeyboardButton("🧠 طلب تحليل الذكاء الاصطناعي", callback_data=f"analyze:{key}"))
 
-            try:
-                await status.delete()
-            except Exception:
-                pass
+            rows = [nav_buttons, [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="home")]]
+
+            await status.edit_text(
+                report,
+                reply_markup=InlineKeyboardMarkup(rows),
+                disable_web_page_preview=True,
+                parse_mode="Markdown"
+            )
 
         except Exception:
             log.exception("Button Handler Exception")
-            try:
-                await status.edit_text("⚠️ تعذر جلب التقرير حالياً.")
-            except Exception:
-                await query.message.reply_text("⚠️ تعذر جلب التقرير حالياً.")
+            await status.edit_text("⚠️حدث خطأ أثناء عرض التقرير.")
 
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,77 +348,49 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not text:
         return
 
-    if is_greeting(text):
-        reply = "وعليكم السلام ورحمة الله وبركاته، أهلاً بك!" if "السلام" in text else "أهلاً بك!"
-        await update.message.reply_text(
-            f"{reply}\nاختر قسماً أو اكتب استفسارك:",
-            reply_markup=main_keyboard()
-        )
-        return
-
-    if not is_news_query(text):
-        await update.message.reply_text(
-            "أنا مخصص لمتابعة وتلخيص الأخبار والتصريحات الرسمية.\n"
-            "يمكنك اختيار قسم من الأزرار أو كتابة استفسار (مثال: بيان الخارجية السعودية، أخبار كندا، النفط).",
-            reply_markup=main_keyboard()
-        )
-        return
-
     user_id = update.effective_user.id
     lock = USER_LOCKS.setdefault(user_id, asyncio.Lock())
 
     if lock.locked():
-        await update.message.reply_text("⏳ يوجد طلب قيد المعالجة. انتظر لحظة.")
+        await update.message.reply_text("⏳ جاري البحث...")
         return
 
     async with lock:
-        status = await update.message.reply_text("📡 جاري البحث في كافة الوكالات والمصادر الرسمية...")
+        status = await update.message.reply_text(f"🔎 جاري البحث عن: '{text}'...")
 
         try:
-            results = await search_user_news(text)
+            items = await get_fresh_news()
+            results = search_news(items, text, max_results=MAX_SEARCH_RESULTS) if items else []
 
             if not results:
-                await status.edit_text("🔎 لم أجد أخباراً مرتبطة بسؤالك في التغطيات الحالية.")
+                await status.edit_text("🔎 لم أجد نتائج مطابقة لبحثك.")
                 return
 
-            report = await generate_report(text, results, page=1)
-            await send_long_message(update.message, report)
-
-            try:
-                await status.delete()
-            except Exception:
-                pass
-
+            is_muted = user_id in MUTED_USERS
+            report = generate_base_report(results, page=1, per_page=5, is_muted=is_muted)
+            
+            await status.edit_text(
+                report,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="home")]]),
+                disable_web_page_preview=True,
+                parse_mode="Markdown"
+            )
         except Exception:
-            log.exception("User Message Exception")
-            try:
-                await status.edit_text("⚠️ حدث خطأ أثناء معالجة طلبك.")
-            except Exception:
-                await update.message.reply_text("⚠️ حدث خطأ أثناء معالجة طلبك.")
+            log.exception("Message Search Exception")
+            await status.edit_text("⚠️ حدث خطأ أثناء البحث.")
 
 
 # ============================================================
-# MAIN & INIT
+# MAIN
 # ============================================================
-
-async def post_init(application):
-    me = await application.bot.get_me()
-    log.info("Telegram connected successfully: @%s", me.username)
-
 
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(topic:|home)"))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(topic:|home|refresh|mute_alerts|unmute_alerts|analyze:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message))
 
-    log.info("Bot starting...")
+    log.info("Optimized Bot Started...")
     app.run_polling(drop_pending_updates=True)
 
 

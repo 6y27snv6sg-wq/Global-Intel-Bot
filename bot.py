@@ -405,6 +405,17 @@ def status_visual(status: str) -> str:
     return visual(status_theme(status))
 
 
+async def send_status_theme(message, status: str):
+    """
+    Compatibility hook for the status-theme layer.
+
+    The visible status message is already sent by the caller using
+    ``status_visual(...)``. This hook intentionally does not send a second
+    Telegram message, so restoring it cannot alter the existing UI flow.
+    """
+    return None
+
+
 # ============================================================
 # NEWS COLLECTION
 # ============================================================

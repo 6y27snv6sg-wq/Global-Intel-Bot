@@ -1,5 +1,4 @@
-
-'''"""
+"""
 themes.py
 ---------
 إدارة الهوية البصرية والثيمات المتحركة لبوت الأخبار.
@@ -147,13 +146,3 @@ __all__ = [
     "status_theme",
     "topic_theme",
 ]
-'''
-
-path = Path("/mnt/data/themes.py")
-path.write_text(themes_py, encoding="utf-8")
-
-# فحص نحوي
-compile(themes_py, str(path), "exec")
-
-print(f"تم إنشاء themes.py بنجاح: {len(themes_py.splitlines())} سطر")
-print("الفحص النحوي: OK")

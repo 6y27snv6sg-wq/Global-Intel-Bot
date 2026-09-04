@@ -1,4 +1,4 @@
-# themes.py — النسخة النهائية المستقلة
+
 from pathlib import Path
 from typing import Final
 import base64

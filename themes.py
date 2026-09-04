@@ -78,6 +78,9 @@ def _sticker_attr(sticker: Any, name: str, default: Any = None) -> Any:
         return sticker.get(name, default)
     return getattr(sticker, name, default)
 
+def _emoji_matches(actual: str, expected: str) -> bool:
+    return str(actual or "").replace("\\ufe0f", "") == str(expected or "").replace("\\ufe0f", "")
+
 async def load_custom_emoji_ids(bot: Any, pack_name: str = CUSTOM_EMOJI_PACK) -> dict[str, str]:
     sticker_set = await bot.get_sticker_set(pack_name)
     stickers = _sticker_attr(sticker_set, "stickers", []) or []
@@ -88,14 +91,28 @@ async def load_custom_emoji_ids(bot: Any, pack_name: str = CUSTOM_EMOJI_PACK) ->
         if not custom_id:
             continue
         for theme, fallback in THEME_EMOJIS.items():
-            if emoji == fallback:
+            if _emoji_matches(emoji, fallback):
                 result[theme] = str(custom_id)
                 break
-        if emoji == "🛡" and "defense" not in result:
-            result["defense"] = str(custom_id)
-        if emoji == "🏛" and "official" not in result:
-            result["official"] = str(custom_id)
     return result
+
+
+async def load_custom_emoji_sticker_ids(bot: Any, pack_name: str = CUSTOM_EMOJI_PACK) -> dict[str, str]:
+    """Return Telegram file_ids for the published video custom-emoji stickers."""
+    sticker_set = await bot.get_sticker_set(pack_name)
+    stickers = _sticker_attr(sticker_set, "stickers", []) or []
+    result: dict[str, str] = {}
+    for sticker in stickers:
+        emoji = _sticker_attr(sticker, "emoji", "") or ""
+        file_id = _sticker_attr(sticker, "file_id", None)
+        if not file_id:
+            continue
+        for theme, fallback in THEME_EMOJIS.items():
+            if _emoji_matches(emoji, fallback):
+                result[theme] = str(file_id)
+                break
+    return result
+
 
 def custom_emoji_html(custom_emoji_id: str | None, fallback_emoji: str) -> str:
     fallback = str(fallback_emoji or "🌐")
@@ -114,5 +131,5 @@ __all__ = [
     "CUSTOM_EMOJI_PACK", "THEMES", "THEME_FILES", "THEME_EMOJIS", "THEME_ASSETS_DIR",
     "STATUS_THEMES", "TOPIC_THEMES", "theme_label", "theme_emoji", "theme_path",
     "theme_exists", "available_themes", "status_theme", "topic_theme",
-    "load_custom_emoji_ids", "custom_emoji_html", "theme_file", "theme_bytes",
+    "load_custom_emoji_ids", "load_custom_emoji_sticker_ids", "custom_emoji_html", "theme_file", "theme_bytes",
 ]

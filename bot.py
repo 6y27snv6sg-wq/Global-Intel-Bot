@@ -8,7 +8,7 @@ import urllib.parse
 from collections import deque
 from typing import Any, Dict, List, Set
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -30,8 +30,11 @@ from news_engine import (
 )
 
 from themes import (
-    theme_file,
+    CUSTOM_EMOJI_PACK,
+    custom_emoji_html,
+    load_custom_emoji_ids,
     status_theme,
+    theme_emoji,
 )
 
 
@@ -363,41 +366,43 @@ def build_safe_link(title: str, source: str, raw_url: str) -> str:
 
 
 # ============================================================
-# VISUAL THEMES
+# TELEGRAM CUSTOM EMOJI THEMES
 # ============================================================
 
-async def send_theme(message, theme: str) -> bool:
-    """
-    يرسل الثيم المتحرك إذا كان ملفه موجودًا وصالحًا للإرسال.
-    إذا لم يوجد الملف أو فشل الإرسال، يعود False بدون تعطيل البوت.
-    """
+CUSTOM_EMOJI_IDS: Dict[str, str] = {}
+
+
+async def initialize_custom_emoji_pack(application: Application):
+    """Load the published GlobalIntelNews custom emoji IDs at startup."""
+    global CUSTOM_EMOJI_IDS
+
     try:
-        media = theme_file(theme)
-
-        if media is None:
-            return False
-
-        await message.reply_sticker(
-            sticker=InputFile(media, filename=media.name),
+        CUSTOM_EMOJI_IDS = await load_custom_emoji_ids(
+            application.bot,
+            CUSTOM_EMOJI_PACK,
         )
-
-        return True
-
+        log.info(
+            "Loaded %d/10 custom emoji themes from %s.",
+            len(CUSTOM_EMOJI_IDS),
+            CUSTOM_EMOJI_PACK,
+        )
     except Exception:
-        log.warning(
-            "Theme '%s' could not be sent; continuing without visual theme.",
-            theme,
-            exc_info=True,
+        CUSTOM_EMOJI_IDS = {}
+        log.exception(
+            "Could not load custom emoji pack %s; using normal emoji fallback.",
+            CUSTOM_EMOJI_PACK,
         )
-        return False
 
 
-async def send_status_theme(message, status: str) -> bool:
-    """إرسال الثيم المرتبط بحالة تشغيلية داخل البوت."""
-    return await send_theme(
-        message,
-        status_theme(status),
+def visual(theme: str) -> str:
+    return custom_emoji_html(
+        CUSTOM_EMOJI_IDS.get(theme),
+        theme_emoji(theme),
     )
+
+
+def status_visual(status: str) -> str:
+    return visual(status_theme(status))
 
 
 # ============================================================
@@ -830,7 +835,7 @@ def format_urgent_alert(item) -> str:
     safe_url = build_safe_link(title, source, get_item_url(item))
 
     return (
-        "🚨 <b>تنبيه عاجل</b>\n\n"
+        f"{visual('urgent')} <b>تنبيه عاجل</b>\n\n"
         f"<b>{safe_html(title)}</b>\n\n"
         f"📍 المصدر: <code>{safe_html(source)}</code>\n"
         f'<a href="{safe_html(safe_url)}">🔗 قراءة الخبر</a>'
@@ -950,6 +955,8 @@ async def post_init(application: Application):
 
     URGENT_MONITOR_STARTED = True
 
+    await initialize_custom_emoji_pack(application)
+
     application.create_task(
         urgent_monitor(application),
         name="urgent-news-monitor",
@@ -970,7 +977,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(user_id)
 
     await update.message.reply_text(
-        "🌐 <b>مركز الأخبار</b>\n\n"
+        f"{visual('world')} <b>مركز الأخبار</b>\n\n"
         "اختر القطاع المطلوب لمتابعة التغطية الحية والمتخصصة.\n\n"
         "🚨 التنبيهات العاجلة تعمل تلقائياً ويمكن إيقافها من الزر.",
         reply_markup=main_keyboard(user_id),
@@ -1005,7 +1012,7 @@ async def show_topic(
     async with lock:
         await send_status_theme(query.message, "monitoring")
         status = await query.message.reply_text(
-            "📡 جاري جمع وفرز الأخبار..."
+            f"{status_visual('monitoring')} جاري جمع وفرز الأخبار..."
         )
 
         try:
@@ -1077,7 +1084,7 @@ async def show_search_page(
         results,
         page=page,
         per_page=PER_PAGE,
-        heading="🔎 نتائج البحث",
+        heading=f"{status_visual('search')} نتائج البحث",
     )
 
     await query.message.reply_text(
@@ -1169,7 +1176,7 @@ async def button_handler(
 
         await send_status_theme(query.message, "monitoring")
         status = await query.message.reply_text(
-            "📡 جاري جلب آخر الأخبار..."
+            f"{status_visual('monitoring')} جاري جلب آخر الأخبار..."
         )
 
         try:
@@ -1268,7 +1275,7 @@ async def button_handler(
 
         await send_status_theme(query.message, "analysis")
         status = await query.message.reply_text(
-            "🧠 جاري تحليل البيانات..."
+            f"{status_visual('analysis')} جاري تحليل البيانات..."
         )
 
         try:
@@ -1385,7 +1392,7 @@ async def handle_user_message(
     async with lock:
         await send_status_theme(update.message, "search")
         status = await update.message.reply_text(
-            "🔎 جاري البحث في كافة التغطيات عن:\n"
+            f"{status_visual('search')} جاري البحث في كافة التغطيات عن:\n"
             f"<b>{safe_html(text)}</b>...",
             parse_mode="HTML",
         )

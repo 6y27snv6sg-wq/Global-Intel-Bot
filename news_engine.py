@@ -6,6 +6,7 @@
 import asyncio
 import html
 import logging
+import os
 import re
 import time
 import urllib.parse
@@ -27,6 +28,9 @@ MAX_GDELT_RECORDS = 40
 SEARCH_TIMEOUT = 14
 COLLECTION_CONCURRENCY = 10
 ROTATION_WINDOW_SECONDS = 300
+# GDELT is an optional fallback only. It is disabled by default because its
+# endpoint is not reliable enough to be part of every collection cycle.
+ENABLE_GDELT = (os.getenv("ENABLE_GDELT", "0").strip().lower() in {"1", "true", "yes", "on"})
 
 
 # ============================================================
@@ -756,7 +760,9 @@ async def fetch_gdelt_news(
     region: str = "",
     max_records: int = MAX_GDELT_RECORDS,
 ) -> List[NewsItem]:
-    if not query:
+    # GDELT is intentionally opt-in. Google News/RSS/official feeds are the
+    # primary discovery layer; GDELT must never slow or destabilize collection.
+    if not ENABLE_GDELT or not query:
         return []
     params = {
         "query": query,
@@ -813,7 +819,12 @@ async def fetch_gdelt_news(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log.warning("Error fetching GDELT [%s]: %s", query[:100], exc)
+        log.debug(
+            "GDELT unavailable for [%s] (%s): %s",
+            query[:100],
+            type(exc).__name__,
+            exc,
+        )
     return items
 
 
@@ -938,7 +949,7 @@ async def _gather_limited(coros: Iterable[Any], limit: int = COLLECTION_CONCURRE
     clean: List[Any] = []
     for result in results:
         if isinstance(result, Exception):
-            log.warning("Collection task failed: %s", result)
+            log.debug("Collection task failed: %s", result)
             continue
         clean.append(result)
     return clean
@@ -959,14 +970,12 @@ async def collect_news(max_items: int = 150) -> List[NewsItem]:
             tasks.append(fetch_google_news_topic(session, query, category=category, language="ar"))
         for query, category in GLOBAL_QUERIES_EN:
             tasks.append(fetch_google_news_topic(session, query, category=category, language="en"))
-            tasks.append(fetch_gdelt_news(session, query, category=category))
 
         # Rotating country coverage prevents a huge burst while ensuring the
         # full country list is covered across repeated collection cycles.
         for query, region in _country_queries(limit=10):
             tasks.append(fetch_google_news_topic(session, query, category="regional", region=region, language="ar"))
             tasks.append(fetch_google_news_topic(session, query, category="regional", region=region, language="en"))
-            tasks.append(fetch_gdelt_news(session, query, category="regional", region=region, max_records=18))
 
         batches = await _gather_limited(tasks)
 
@@ -1001,15 +1010,25 @@ async def search_news_online(query: str, max_results: int = 25) -> List[NewsItem
             tasks.append(fetch_google_news_topic(session, q, category="search", language="ar"))
         for q in english_queries[:4]:
             tasks.append(fetch_google_news_topic(session, q, category="search", language="en"))
-        for q in (arabic_queries[:2] + english_queries[:2]):
-            tasks.append(fetch_gdelt_news(session, q, category="search", max_records=35))
+        if ENABLE_GDELT:
+            gdelt_queries = arabic_queries[:1] + english_queries[:1]
+            if gdelt_queries:
+                tasks.append(
+                    fetch_gdelt_news(
+                        session,
+                        gdelt_queries[0],
+                        category="search",
+                        max_records=25,
+                    )
+                )
 
         # For Arabic free-form queries, add a best-effort English translation.
         if re.search(r"[\u0600-\u06ff]", query):
             translated = await translate_query_to_english(query, session)
             if translated and translated not in english_queries:
                 tasks.append(fetch_google_news_topic(session, translated, category="search", language="en"))
-                tasks.append(fetch_gdelt_news(session, translated, category="search", max_records=35))
+                # Do not add a second GDELT request. The single bounded
+                # fallback above is sufficient for a user search.
 
         batches = await _gather_limited(tasks, limit=8)
 

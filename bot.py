@@ -149,6 +149,7 @@ SENT_URGENT_KEYS = deque(maxlen=MAX_SENT_URGENT_KEYS)
 
 URGENT_MONITOR_STARTED = False
 URGENT_BASELINE_READY = False
+URGENT_MONITOR_TASK = None
 
 
 # ============================================================
@@ -959,7 +960,7 @@ async def urgent_monitor(application: Application):
 # ============================================================
 
 async def post_init(application: Application):
-    global URGENT_MONITOR_STARTED
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
 
     if URGENT_MONITOR_STARTED:
         return
@@ -968,10 +969,30 @@ async def post_init(application: Application):
 
     await initialize_custom_emoji_pack(application)
 
-    application.create_task(
+    # post_init runs before Application.start(). Using Application.create_task()
+    # here triggers PTB's "application is not running" warning. Use a native
+    # asyncio task and explicitly cancel/await it from post_stop().
+    URGENT_MONITOR_TASK = asyncio.create_task(
         urgent_monitor(application),
         name="urgent-news-monitor",
     )
+
+
+async def post_stop(application: Application):
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+
+    task = URGENT_MONITOR_TASK
+    URGENT_MONITOR_TASK = None
+    URGENT_MONITOR_STARTED = False
+
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    log.info("Urgent monitor stopped cleanly.")
 
 
 # ============================================================
@@ -1532,6 +1553,7 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
 

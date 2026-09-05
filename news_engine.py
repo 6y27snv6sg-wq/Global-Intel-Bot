@@ -20,11 +20,11 @@ import feedparser
 
 log = logging.getLogger("news_engine")
 
-FETCH_TIMEOUT = 12
+FETCH_TIMEOUT = 5
 MAX_FEED_ITEMS = 25
-MAX_ONLINE_QUERIES = 8
+MAX_ONLINE_QUERIES = 6
 MAX_GDELT_RECORDS = 40
-SEARCH_TIMEOUT = 18
+SEARCH_TIMEOUT = 14
 COLLECTION_CONCURRENCY = 10
 ROTATION_WINDOW_SECONDS = 300
 
@@ -34,16 +34,13 @@ ROTATION_WINDOW_SECONDS = 300
 # ============================================================
 
 TRUSTED_FEEDS: Dict[str, str] = {
-    "العربية": "https://www.alarabiya.net/.well-known/rss/urgent.xml",
     "الجزيرة": (
         "https://www.aljazeera.net/aljazeerarss/"
         "a7c1866f-6829-4883-8441-358d731800bc/"
         "43316f44-8e12-4320-b4c2-a22f6654b321"
     ),
     "سكاي نيوز عربية": "https://www.skynewsarabia.com/rss/v1/news.xml",
-    "الشرق": "https://asharq.com/rss/",
     "CNBC عربية": "https://www.cnbcarabia.com/rss.xml",
-    "الشرق اقتصاد": "https://economy.asharq.com/rss/",
     "Investing": "https://sa.investing.com/rss/news.rss",
     "وكالة الأنباء السعودية": "https://www.spa.gov.sa/rss.xml",
     "BBC عربي": "https://feeds.bbci.co.uk/arabic/rss.xml",
@@ -56,9 +53,7 @@ TRUSTED_FEEDS: Dict[str, str] = {
 # expanded through Google News and GDELT so the engine is not locked to them.
 ADDITIONAL_TRUSTED_FEEDS: Dict[str, str] = {
     "NASA": "https://www.nasa.gov/rss/dyn/breaking_news.rss",
-    "WHO": "https://www.who.int/rss-feeds/news-english.xml",
     "UN News": "https://news.un.org/feed/subscribe/en/news/all/rss.xml",
-    "NATO": "https://www.nato.int/cps/en/natohq/news.xml",
 }
 
 OFFICIAL_DOMAIN_HINTS = (
@@ -826,31 +821,6 @@ async def fetch_gdelt_news(
 # DEDUPLICATION / EVENT VERIFICATION
 # ============================================================
 
-EVENT_ALIAS_GROUPS = {
-    "conflict": ("war", "attack", "strike", "missile", "drone", "airstrike", "clashes", "حرب", "هجوم", "ضربة", "صاروخ", "مسيرة", "غارة", "اشتباكات"),
-    "diplomacy": ("president", "prime minister", "foreign minister", "talks", "meeting", "summit", "statement", "بيان", "رئيس", "رئيس الوزراء", "وزير الخارجية", "محادثات", "اجتماع", "قمة"),
-    "economy": ("economy", "markets", "inflation", "interest rate", "central bank", "اقتصاد", "أسواق", "تضخم", "فائدة", "بنك مركزي"),
-    "oil_energy": ("oil", "crude", "brent", "opec", "energy", "gas", "النفط", "خام", "برنت", "أوبك", "طاقة", "غاز"),
-    "security": ("defense", "defence", "military", "security", "armed forces", "دفاع", "عسكري", "أمن", "قوات مسلحة"),
-    "disaster": ("earthquake", "flood", "fire", "storm", "cyclone", "زلزال", "فيضان", "حريق", "عاصفة", "إعصار"),
-    "election": ("election", "vote", "poll", "parliament", "انتخابات", "تصويت", "استطلاع", "برلمان"),
-}
-
-def _event_signatures(item: NewsItem) -> tuple[set[str], set[str], set[str]]:
-    text = normalize_search_text(f"{item.title} {item.summary}")
-    tokens = set(tokenize_query(text))
-    countries = set()
-    for ar_name, en_name in COUNTRY_EN.items():
-        ar = normalize_search_text(ar_name)
-        en = normalize_search_text(en_name)
-        if (ar and ar in text) or (en and en in text):
-            countries.add(en)
-    groups = set()
-    for group, aliases in EVENT_ALIAS_GROUPS.items():
-        if any(normalize_search_text(x) in text for x in aliases):
-            groups.add(group)
-    return tokens, countries, groups
-
 def same_event(a: NewsItem, b: NewsItem) -> bool:
     if not a.title or not b.title:
         return False
@@ -861,18 +831,8 @@ def same_event(a: NewsItem, b: NewsItem) -> bool:
     sim = similarity_score(na, nb)
     if sim >= 0.72:
         return True
-
-    ta, ca, ga = _event_signatures(a)
-    tb, cb, gb = _event_signatures(b)
-    if (ca & cb) and (ga & gb):
-        da = parse_datetime(a.published_at)
-        db = parse_datetime(b.published_at)
-        if da and db and abs((da - db).total_seconds()) <= 36 * 3600:
-            return True
-
+    # Strong overlap in the core title plus same region is usually the same event.
     if sim >= 0.55 and a.region and a.region == b.region:
-        return True
-    if len(ta & tb) >= 5 and similarity_score(a.title, b.title) >= 0.48:
         return True
     return False
 
@@ -955,7 +915,7 @@ def _rotated_countries() -> List[Tuple[str, str]]:
     return flat[offset:] + flat[:offset]
 
 
-def _country_queries(limit: int = 18) -> List[Tuple[str, str]]:
+def _country_queries(limit: int = 10) -> List[Tuple[str, str]]:
     selected = _rotated_countries()[:limit]
     result: List[Tuple[str, str]] = []
     for region, country in selected:
@@ -1003,7 +963,7 @@ async def collect_news(max_items: int = 150) -> List[NewsItem]:
 
         # Rotating country coverage prevents a huge burst while ensuring the
         # full country list is covered across repeated collection cycles.
-        for query, region in _country_queries(limit=28):
+        for query, region in _country_queries(limit=10):
             tasks.append(fetch_google_news_topic(session, query, category="regional", region=region, language="ar"))
             tasks.append(fetch_google_news_topic(session, query, category="regional", region=region, language="en"))
             tasks.append(fetch_gdelt_news(session, query, category="regional", region=region, max_records=18))

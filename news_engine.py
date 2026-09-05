@@ -68,10 +68,18 @@ ECON_TERMS = [
     "عملات","دولار","بيتكوين","تداول","نفط","أوبك","خام","تضخم","برنت",
     "طاقة","غاز","استثمار","سندات","ميزانية","ناتج محلي","بنك مركزي",
     "صادرات","واردات","أسعار المستهلك","أسعار المنتجين","استحواذ","أرباح",
+    "oil","crude","opec","brent","energy","natural gas","lng","economy",
+    "economic","markets","market","stocks","equities","stock exchange",
+    "inflation","interest rates","gold","dollar","usd","bitcoin","crypto",
+    "investment","bonds","budget","gdp","central bank","exports","imports",
+    "earnings","acquisition",
 ]
+
 ECON_EXCLUDE = [
     "إنقاذ","انقاذ","زلزال","وفاة","تعازي","يعزي","يعزّي","حادث","غرق",
     "انتشال","إنقاذ عمال","منجم","نفق","فيضانات","طقس",
+    "rescue","earthquake","death","funeral","accident","drowning","flood",
+    "weather",
 ]
 
 SECURITY_TERMS = [
@@ -79,24 +87,44 @@ SECURITY_TERMS = [
     "صاروخ","صواريخ","قصف","غارة","غارات","هجوم","اشتباك","مناورات","قاعدة عسكرية",
     "طيران عسكري","مقاتلات","طائرات مسيرة","ذخائر","دفاع جوي","عملية عسكرية",
     "عمليات عسكرية","قوات خاصة","استهداف","إطلاق النار","قتال","معارك","أسطول",
+    "military","army","forces","defense","defence","security","weapons","weapon",
+    "missile","missiles","airstrike","airstrike","strike","attack","fighting",
+    "battle","battles","combat","drone","drones","ammunition","air defense",
+    "military operation","troops","navy","warship",
 ]
+
 SECURITY_SOCIAL_EXCLUDE = [
     "يعزي","يعزّي","تعازي","وفاة والده","وفاة والدته","وفاة شقيق","وفاة عمه",
     "تهنئة","ترقية","تعيين","استقبال","زيارة تفقدية","احتفال",
+    "condolences","condolence","promotion","appointment","welcomes","ceremony",
+    "inspection visit",
 ]
 
 OFFICIAL_TERMS = [
     "بيان رسمي","تصريح رسمي","بيان صحفي","المتحدث الرسمي","المتحدث باسم",
     "مصدر مسؤول","أعلنت الوزارة","أعلن الوزير","قالت الوزارة","قال الوزير",
-    "وزارة الخارجية","وزارة الدفاع","وزارة الداخلية","رئاسة الوزراء",
+    "وزارة الخارجية","وزارة الدفاع","وزارة الداخلية","وزارة المالية",
+    "وزارة الطاقة","وزارة الصحة","وزارة الإعلام","رئاسة الوزراء",
     "الديوان الملكي","الحكومة تعلن","الحكومة تؤكد","الرئاسة تعلن","الرئاسة تؤكد",
+    "السفير","السفارة","المبعوث","الخارجية","الوزارة","الوزير",
     "foreign ministry","ministry said","government said","official statement",
-    "spokesperson","state department",
+    "press statement","spokesperson","state department","ambassador","embassy",
+    "envoy","president said","prime minister said","minister said","ministry",
 ]
 
 URGENT_TERMS = [
     "عاجل","طارئ","هجوم","انفجار","قصف","صاروخ","زلزال","اشتباك","غارة",
     "إخلاء","حالة طوارئ","تحذير عاجل","استهداف","غارات","إطلاق النار",
+    "breaking","urgent","attack","explosion","airstrike","missile","earthquake",
+    "evacuation","emergency","warning","strike","gunfire",
+]
+
+# Generic digest/roundup articles are not individual news events.
+DIGEST_TERMS = [
+    "أهم الأخبار","أبرز الأخبار","حصاد الأخبار","موجز الأخبار",
+    "أخبار العالم حتى","أهم الأخبار العالمية والعربية",
+    "most important news","top news","news roundup","world news roundup",
+    "top stories","daily roundup","news digest","latest news roundup",
 ]
 
 COUNTRY_EN = {
@@ -127,7 +155,7 @@ def normalize_text(value):
     text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
     for old, new in {"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ة":"ه","ؤ":"و","ئ":"ي"}.items():
         text = text.replace(old, new)
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s\u0600-\u06FF-]", " " , text)).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s\u0600-\u06FF-]", " ", text)).strip()
 
 def tokenize(value):
     return {x for x in normalize_text(value).split() if len(x) > 2}
@@ -220,64 +248,143 @@ def score_terms(text, terms):
     n = normalize_text(text)
     return sum(1 for term in terms if normalize_text(term) in n)
 
+def _is_digest(title):
+    n = normalize_text(title)
+    return any(normalize_text(term) in n for term in DIGEST_TERMS)
+
+def _security_signal(title, summary=""):
+    t = normalize_text(title)
+    s = normalize_text(summary)
+    if any(normalize_text(x) in t for x in SECURITY_SOCIAL_EXCLUDE):
+        return False
+    return score_terms(t, SECURITY_TERMS) >= 1 or score_terms(s, SECURITY_TERMS) >= 2
+
+def _economy_signal(title, summary=""):
+    t = normalize_text(title)
+    s = normalize_text(summary)
+
+    # Economic relevance must come from the article itself, never from
+    # the search source/query string.
+    title_hits = score_terms(t, ECON_TERMS)
+    summary_hits = score_terms(s, ECON_TERMS)
+    negative = score_terms(f"{t} {s}", ECON_EXCLUDE)
+
+    if negative >= 1 and title_hits == 0:
+        return False
+
+    # A clear economic term in the title is sufficient.
+    if title_hits >= 1:
+        return True
+
+    # Otherwise require multiple economic signals in the summary.
+    return summary_hits >= 2 and negative == 0
+
+def _official_signal(title, summary, item=None):
+    t = normalize_text(title)
+    s = normalize_text(summary)
+
+    title_hits = score_terms(t, OFFICIAL_TERMS)
+    summary_hits = score_terms(s, OFFICIAL_TERMS)
+
+    # A real official marker in the headline is enough.
+    if title_hits >= 1:
+        return True
+
+    # Do not treat generic "government forces" / "government" as an
+    # official statement. Require explicit statement language.
+    explicit = [
+        "بيان","تصريح","المتحدث","قالت الوزارة","قال الوزير",
+        "اعلنت الوزارة","أعلنت الوزارة","السفير","الخارجية",
+        "statement","spokesperson","ministry said","minister said",
+        "ambassador","foreign ministry","official statement",
+    ]
+    if any(normalize_text(x) in s for x in explicit) and summary_hits >= 1:
+        return True
+
+    if item is not None and item.official and summary_hits >= 1:
+        return True
+
+    return False
+
 def classify_item(item):
     title = normalize_text(item.title)
     summary = normalize_text(item.summary)
     text = f"{title} {summary}"
-    title_score = lambda terms: sum(3 if normalize_text(t) in title else 0 for t in terms)
-    body_score = lambda terms: sum(1 if normalize_text(t) in text else 0 for t in terms)
 
-    econ = title_score(ECON_TERMS) + body_score(ECON_TERMS)
-    if any(normalize_text(x) in text for x in ECON_EXCLUDE):
+    if _is_digest(item.title):
+        item.category = "general"
+        return item
+
+    econ = (score_terms(title, ECON_TERMS) * 3
+            + score_terms(summary, ECON_TERMS))
+    if score_terms(text, ECON_EXCLUDE):
         econ -= 5
 
-    sec = title_score(SECURITY_TERMS) + body_score(SECURITY_TERMS)
-    if any(normalize_text(x) in title for x in SECURITY_SOCIAL_EXCLUDE):
+    sec = (score_terms(title, SECURITY_TERMS) * 3
+           + score_terms(summary, SECURITY_TERMS))
+    if score_terms(title, SECURITY_SOCIAL_EXCLUDE):
         sec -= 12
 
-    official = title_score(OFFICIAL_TERMS) + body_score(OFFICIAL_TERMS)
+    official = (score_terms(title, OFFICIAL_TERMS) * 3
+                + score_terms(summary, OFFICIAL_TERMS))
     if item.official:
-        official += 5
+        official += 2
 
-    urgent = title_score(URGENT_TERMS) * 2 + body_score(URGENT_TERMS)
+    urgent = (score_terms(title, URGENT_TERMS) * 2
+              + score_terms(summary, URGENT_TERMS))
 
-    scores = {"econ": econ, "secu": sec, "forg": official, "urg": urgent}
-    best = max(scores, key=scores.get)
-    if scores[best] >= 4:
-        item.category = best
+    # Explicit category assignment. Security/social and official stories
+    # must not be promoted to economy merely because they mention oil/energy.
+    if _security_signal(title, summary) and sec >= max(econ, official, 4):
+        item.category = "secu"
+    elif _official_signal(title, summary, item) and official >= max(econ, sec, 4):
+        item.category = "forg"
+    elif _economy_signal(title, summary) and econ >= max(sec, official, 4):
+        item.category = "econ"
+    elif urgent >= 4:
+        item.category = "urg"
     else:
         item.category = "general"
+
     return item
 
 def is_topic_match(item, topic_key):
-    title = normalize_text(item.title)
-    summary = normalize_text(item.summary)
-    text = f"{title} {summary}"
+    title = item.title or ""
+    summary = item.summary or ""
+
+    # This is intentionally the first gate for every section.
+    # Generic digest articles can never enter any section.
+    if _is_digest(title):
+        return False
 
     if topic_key == "econ":
-        positive = score_terms(title, ECON_TERMS) * 3 + score_terms(summary, ECON_TERMS)
-        negative = score_terms(text, ECON_EXCLUDE) * 5
-        return positive >= 4 and positive > negative
+        # Section classification uses title/summary only.
+        # It NEVER uses source/search_text.
+        return _economy_signal(title, summary) and not (
+            _security_signal(title, summary)
+            and score_terms(normalize_text(title), SECURITY_TERMS) >= 1
+            and score_terms(normalize_text(title), ECON_TERMS) <= 1
+        )
 
     if topic_key == "secu":
-        positive = score_terms(title, SECURITY_TERMS) * 3 + score_terms(summary, SECURITY_TERMS)
-        negative = score_terms(title, SECURITY_SOCIAL_EXCLUDE) * 8
-        return positive >= 5 and positive > negative
+        return _security_signal(title, summary)
 
     if topic_key == "forg":
-        official_hits = score_terms(title, OFFICIAL_TERMS) * 3 + score_terms(summary, OFFICIAL_TERMS)
-        return official_hits >= 4 or (item.official and official_hits >= 2)
+        return _official_signal(title, summary, item)
 
     if topic_key == "urg":
-        return score_terms(title, URGENT_TERMS) >= 1 or (
-            score_terms(summary, URGENT_TERMS) >= 2
+        return (
+            score_terms(title, URGENT_TERMS) >= 1
+            or score_terms(summary, URGENT_TERMS) >= 2
         )
 
     if topic_key == "gulf":
+        text = normalize_text(f"{title} {summary}")
         gulf = REGIONS["الشرق الأوسط"]
         return any(normalize_text(x) in text for x in gulf)
 
     if topic_key == "wrld":
+        text = normalize_text(f"{title} {summary}")
         return bool(item.region) or any(
             normalize_text(x) in text
             for x in ["امريكا","الولايات المتحده","اوروبا","الصين","روسيا","اوكرانيا","الهند","اليابان"]
@@ -288,12 +395,17 @@ def is_topic_match(item, topic_key):
 def deduplicate_news(items):
     unique = []
     seen_urls = set()
+
     for item in items:
+        if _is_digest(item.title):
+            continue
+
         url_key = item.url.strip().lower()
         if url_key and url_key in seen_urls:
             continue
         if url_key:
             seen_urls.add(url_key)
+
         duplicate = False
         for existing in unique:
             if same_event(item, existing):
@@ -308,8 +420,10 @@ def deduplicate_news(items):
                     unique.append(item)
                 duplicate = True
                 break
+
         if not duplicate:
             unique.append(item)
+
     return unique
 
 def parse_date(value):
@@ -324,12 +438,24 @@ def parse_date(value):
 def parse_entry(entry, source, category="general"):
     title = html.unescape(str(entry.get("title", "") or "").strip())
     url = str(entry.get("link", "") or "").strip()
+
     if not title or not url:
         return None
-    summary = html.unescape(str(entry.get("summary", "") or entry.get("description", "") or ""))
+
+    summary = html.unescape(
+        str(entry.get("summary", "") or entry.get("description", "") or "")
+    )
     published = parse_date(entry.get("published") or entry.get("updated") or "")
-    item = NewsItem(title=title, original_title=title, url=url, source=source,
-                    summary=summary, published=published, category=category)
+
+    item = NewsItem(
+        title=title,
+        original_title=title,
+        url=url,
+        source=source,
+        summary=summary,
+        published=published,
+        category=category,
+    )
     return classify_item(item)
 
 async def fetch_feed(session, source, url):
@@ -342,13 +468,17 @@ async def fetch_feed(session, source, url):
             if response.status != 200:
                 return []
             data = await response.read()
+
         parsed = feedparser.parse(data)
         items = []
+
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)
             if item:
                 items.append(item)
+
         return items
+
     except Exception:
         log.exception("Feed failed: %s", source)
         return []
@@ -360,94 +490,145 @@ def google_news_url(query):
 async def search_news_online(query, max_results=25):
     queries = [query]
     normalized = normalize_text(query)
+
     for key, aliases in QUERY_ALIASES.items():
         if normalize_text(key) in normalized:
             queries.extend(aliases[:3])
+
     queries = list(dict.fromkeys(queries))[:MAX_ONLINE_QUERIES]
 
     async with aiohttp.ClientSession() as session:
         groups = await asyncio.gather(
-            *(fetch_feed(session, f"بحث: {q}", google_news_url(q)) for q in queries),
+            *(
+                fetch_feed(
+                    session,
+                    f"بحث: {q}",
+                    google_news_url(q)
+                )
+                for q in queries
+            ),
             return_exceptions=True,
         )
+
     items = []
     for group in groups:
         if isinstance(group, list):
             items.extend(group)
-    return rank_search_results(deduplicate_news(items), query)[:max_results]
+
+    items = [
+        item for item in deduplicate_news(items)
+        if not _is_digest(item.title)
+    ]
+
+    return rank_search_results(items, query)[:max_results]
 
 def rank_search_results(items, query):
     q_tokens = tokenize(query)
     ranked = []
+
     for item in items:
         title_tokens = tokenize(item.title)
         summary_tokens = tokenize(item.summary)
+
         title_hits = len(q_tokens & title_tokens)
         summary_hits = len(q_tokens & summary_tokens)
+
         exact_phrase = normalize_text(query) in normalize_text(item.title)
-        peripheral = len(q_tokens & tokenize(item.search_text))
+
+        # IMPORTANT:
+        # Do not count source/search_text as topical relevance.
+        # "بحث: السعودية اقتصاد أسواق نفط" must not make an unrelated
+        # article look economic.
         score = (
             title_hits * 12
             + summary_hits * 3
-            + peripheral * 0.5
             + (25 if exact_phrase else 0)
             + item.trust_score * 0.04
         )
+
         item.relevance_score = score
         ranked.append((score, item))
+
     ranked.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in ranked]
 
 async def search_news(items, query, max_results=25):
-    return rank_search_results(deduplicate_news(items), query)[:max_results]
+    return rank_search_results(
+        [
+            item for item in deduplicate_news(items)
+            if not _is_digest(item.title)
+        ],
+        query,
+    )[:max_results]
 
 async def hybrid_search_news(items, query, max_results=25):
     local = await search_news(items, query, max_results)
     online = await search_news_online(query, max_results)
-    merged = deduplicate_news(local + online)
+
+    merged = [
+        item for item in deduplicate_news(local + online)
+        if not _is_digest(item.title)
+    ]
+
     ranked = rank_search_results(merged, query)
-    # لا نعرض نتائج لا تحمل أي صلة فعلية بالاستعلام.
+
+    # Search relevance comes ONLY from title/summary.
+    # Source names and search query labels are deliberately ignored.
     q_tokens = tokenize(query)
     filtered = []
+
     for item in ranked:
         title_hits = len(q_tokens & tokenize(item.title))
         summary_hits = len(q_tokens & tokenize(item.summary))
-        if title_hits or summary_hits or normalize_text(query) in item.search_text:
+
+        if title_hits or summary_hits:
             filtered.append(item)
+
     return filtered[:max_results]
 
 async def collect_news(max_items=150):
     feeds = {**TRUSTED_FEEDS, **ADDITIONAL_TRUSTED_FEEDS}
+
     async with aiohttp.ClientSession() as session:
         groups = await asyncio.gather(
             *(fetch_feed(session, source, url) for source, url in feeds.items()),
             return_exceptions=True,
         )
+
     items = []
     for group in groups:
         if isinstance(group, list):
             items.extend(group)
 
-    # اكتشاف إضافي عام، مع الحفاظ على سقف الاستهلاك.
+    # Do not use generic "أهم الأخبار العالمية" discovery here.
+    # Those roundup pages were the direct cause of digest articles
+    # leaking into topic sections.
     discovery_queries = [
-        "أهم الأخبار العالمية",
         "السعودية اقتصاد أسواق نفط",
         "الشرق الأوسط أمن دفاع",
-        "بيانات رسمية حكومات",
-        "world news economy security",
+        "بيانات رسمية وزارة خارجية",
+        "world economy markets oil",
+        "world security defense",
     ]
+
     try:
         discovery = await asyncio.gather(
             *(search_news_online(q, 15) for q in discovery_queries),
             return_exceptions=True,
         )
+
         for group in discovery:
             if isinstance(group, list):
                 items.extend(group)
+
     except Exception:
         log.exception("Discovery failed.")
 
-    items = deduplicate_news(items)
+    items = [
+        item for item in deduplicate_news(items)
+        if not _is_digest(item.title)
+    ]
+
     items.sort(
         key=lambda x: (
             float(x.relevance_score or 0),
@@ -456,12 +637,15 @@ async def collect_news(max_items=150):
         ),
         reverse=True,
     )
+
     return items[:max_items]
 
 def build_ai_context(items):
     lines = []
+
     for i, item in enumerate(items, 1):
         published = item.published.isoformat() if item.published else "غير متاح"
+
         lines.append(
             f"{i}. العنوان: {item.title}\n"
             f"المصدر: {item.source}\n"
@@ -469,4 +653,5 @@ def build_ai_context(items):
             f"التاريخ: {published}\n"
             f"الملخص: {item.summary[:700]}"
         )
+
     return "\n\n".join(lines)

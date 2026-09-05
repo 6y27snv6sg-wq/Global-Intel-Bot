@@ -1587,8 +1587,44 @@ def main():
         URGENT_MONITOR_INTERVAL,
     )
 
-    application.run_polling(
-        drop_pending_updates=True
+    # ========================================================
+    # TELEGRAM WEBHOOK
+    # ========================================================
+
+    port = int(os.getenv("PORT", "8080"))
+
+    public_domain = os.getenv(
+        "RAILWAY_PUBLIC_DOMAIN",
+        "worker-production-347b.up.railway.app",
+    )
+
+    import hashlib
+
+    webhook_path = hashlib.sha256(
+        BOT_TOKEN.encode("utf-8")
+    ).hexdigest()
+
+    webhook_url = (
+        f"https://{public_domain}/{webhook_path}"
+    )
+
+    log.info(
+        "Starting Telegram webhook on 0.0.0.0:%s",
+        port,
+    )
+
+    log.info(
+        "Telegram webhook URL configured for domain: %s",
+        public_domain,
+    )
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path,
+        webhook_url=webhook_url,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
     )
 
 

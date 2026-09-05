@@ -65,7 +65,7 @@ GEMINI_MODEL = "gemini-3.5-flash"
 # ============================================================
 
 NEWS_COLLECTION_TIMEOUT = 25
-SEARCH_TIMEOUT = NEWS_COLLECTION_TIMEOUT + 35
+SEARCH_TIMEOUT = 14
 GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
@@ -370,40 +370,30 @@ def build_safe_link(title: str, source: str, raw_url: str) -> str:
 # ============================================================
 
 CUSTOM_EMOJI_IDS: Dict[str, str] = {}
-CUSTOM_EMOJI_STICKER_IDS: Dict[str, str] = {}
 
 
 async def initialize_custom_emoji_pack(application: Application):
-    """Load both custom-emoji entity IDs and video-sticker file IDs."""
-    global CUSTOM_EMOJI_IDS, CUSTOM_EMOJI_STICKER_IDS
+    """Load the published GlobalIntelNews custom emoji IDs at startup."""
+    global CUSTOM_EMOJI_IDS
 
     try:
         CUSTOM_EMOJI_IDS = await load_custom_emoji_ids(
             application.bot,
             CUSTOM_EMOJI_PACK,
         )
-        try:
-            from themes import load_custom_emoji_sticker_ids
-            CUSTOM_EMOJI_STICKER_IDS = await load_custom_emoji_sticker_ids(
-                application.bot,
-                CUSTOM_EMOJI_PACK,
-            )
-        except Exception:
-            CUSTOM_EMOJI_STICKER_IDS = {}
-
         log.info(
-            "Loaded %d/10 custom emoji IDs and %d/10 sticker IDs from %s.",
+            "Loaded %d/10 custom emoji themes from %s.",
             len(CUSTOM_EMOJI_IDS),
-            len(CUSTOM_EMOJI_STICKER_IDS),
             CUSTOM_EMOJI_PACK,
         )
     except Exception:
         CUSTOM_EMOJI_IDS = {}
-        CUSTOM_EMOJI_STICKER_IDS = {}
         log.exception(
             "Could not load custom emoji pack %s; using normal emoji fallback.",
             CUSTOM_EMOJI_PACK,
         )
+
+
 def visual(theme: str) -> str:
     return custom_emoji_html(
         CUSTOM_EMOJI_IDS.get(theme),
@@ -417,43 +407,13 @@ def status_visual(status: str) -> str:
 
 async def send_status_theme(message, status: str):
     """
-    Send the matching published video custom-emoji as a short-lived sticker.
+    Compatibility hook for the status-theme layer.
 
-    The existing status text remains unchanged. If Telegram does not allow
-    sending the custom-emoji sticker as a sticker in the current chat, the
-    function silently falls back to the existing inline custom-emoji text.
+    The visible status message is already sent by the caller using
+    ``status_visual(...)``. This hook intentionally does not send a second
+    Telegram message, so restoring it cannot alter the existing UI flow.
     """
-    theme = status_theme(status)
-    file_id = CUSTOM_EMOJI_STICKER_IDS.get(theme)
-
-    if not file_id or not message:
-        return None
-
-    try:
-        sent = await message.reply_sticker(
-            sticker=file_id,
-            disable_notification=True,
-        )
-        # Keep the status animation visible briefly without leaving a
-        # permanent extra message in the chat.
-        async def _remove_later():
-            try:
-                await asyncio.sleep(2.4)
-                await sent.delete()
-            except Exception:
-                pass
-
-        asyncio.create_task(_remove_later())
-        return sent
-
-    except Exception:
-        log.warning(
-            "Could not send animated theme sticker for status=%s; "
-            "continuing with inline custom emoji.",
-            status,
-            exc_info=True,
-        )
-        return None
+    return None
 
 
 # ============================================================

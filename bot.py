@@ -1291,9 +1291,7 @@ async def urgent_monitor(
 async def post_init(
     application,
 ):
-        global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
-
-    
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
 
     if URGENT_MONITOR_STARTED:
         return
@@ -1315,6 +1313,22 @@ async def post_init(
 
 
 async def post_stop(
+    application,
+):
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+
+    task = URGENT_MONITOR_TASK
+
+    URGENT_MONITOR_TASK = None
+    URGENT_MONITOR_STARTED = False
+
+    if task and not task.done():
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     application,
 ):
     global (

@@ -678,6 +678,99 @@ def parse_date(value):
     except Exception:
         return None
 
+
+def _entry_publisher(entry, fallback_source):
+    """Prefer the real publisher embedded in Google News RSS entries."""
+    raw = entry.get("source")
+    publisher = ""
+
+    if isinstance(raw, dict):
+        publisher = str(raw.get("title") or raw.get("name") or "").strip()
+    elif raw:
+        try:
+            publisher = str(getattr(raw, "title", "") or raw).strip()
+        except Exception:
+            publisher = ""
+
+    # Google News discovery labels are implementation details, not publishers.
+    if publisher:
+        return publisher
+    return fallback_source
+
+
+def _is_non_article_result(item):
+    """Reject homepages, section pages and generic portal entries."""
+    title = normalize_text(item.title)
+    original = normalize_text(item.original_title)
+    combined = f"{title} {original}"
+
+    generic_titles = (
+        "الموقع الرسمي",
+        "official website",
+        "home page",
+        "homepage",
+        "الرئيسيه",
+        "الرئيسية",
+        "ministry of foreign affairs",
+    )
+
+    parsed = urlparse(item.url or "")
+    path = (parsed.path or "").strip("/")
+
+    # Generic ministry/portal titles with no article-specific wording.
+    if any(normalize_text(x) in combined for x in generic_titles):
+        article_signals = (
+            "يدين", "تدين", "يعرب", "تعلن", "اعلنت", "أعلنت", "بيان",
+            "تصريح", "اجتماع", "استقبل", "بحث", "ناقش", "اتصال",
+            "condemns", "statement", "meeting", "announces", "minister",
+        )
+        if not any(normalize_text(x) in combined for x in article_signals):
+            return True
+
+    # Root or near-root URLs from discovery are usually portals, not stories.
+    if not path or path.lower() in {"ar", "en", "arabic", "english", "home", "index"}:
+        if len(tokenize(item.title)) <= 9:
+            return True
+
+    return False
+
+
+def _query_country_terms(query):
+    """Return high-signal country aliases present in the user's query."""
+    nq = normalize_text(query)
+    terms = set()
+
+    for ar_name, en_name in COUNTRY_EN.items():
+        ar = normalize_text(ar_name)
+        en = normalize_text(en_name)
+        if (ar and ar in nq) or (en and en in nq):
+            terms.add(ar)
+            terms.add(en)
+
+    # Common Saudi variants that appear in Arabic/English headlines.
+    if "السعود" in nq or "saudi" in nq:
+        terms.update({
+            normalize_text("السعودية"),
+            normalize_text("المملكة العربية السعودية"),
+            normalize_text("Saudi Arabia"),
+            normalize_text("Saudi"),
+        })
+
+    return {x for x in terms if x}
+
+
+def _country_anchor_match(item, query):
+    """For country searches, require the article itself to mention that country."""
+    terms = _query_country_terms(query)
+    if not terms:
+        return True
+
+    haystack = normalize_text(
+        f"{item.title} {item.original_title} {item.summary}"
+    )
+    return any(term in haystack for term in terms)
+
+
 def parse_entry(entry, source, category="general"):
     title = html.unescape(str(entry.get("title", "") or "").strip())
     url = str(entry.get("link", "") or "").strip()
@@ -690,11 +783,13 @@ def parse_entry(entry, source, category="general"):
     )
     published = parse_date(entry.get("published") or entry.get("updated") or "")
 
+    publisher = _entry_publisher(entry, source)
+
     item = NewsItem(
         title=title,
         original_title=title,
         url=url,
-        source=source,
+        source=publisher,
         summary=summary,
         published=published,
         category=category,
@@ -806,61 +901,94 @@ async def search_news_online(query, max_results=25):
 
     ranked = rank_search_results(items, query)
 
-    # Relevance must come from title/original title/summary only.
+    # Relevance must come from article text only.
     q_tokens = tokenize(query)
     filtered = []
     for item in ranked:
-        title_hits = len(q_tokens & tokenize(item.title))
-        original_hits = len(q_tokens & tokenize(item.original_title))
-        summary_hits = len(q_tokens & tokenize(item.summary))
-        if title_hits or original_hits or summary_hits:
-            filtered.append(item)
-
-    return filtered[:max_results]
-
-def rank_search_results(items, query):
-    q_tokens = tokenize(query)
-    ranked = []
-
-    for item in items:
-        title_tokens = tokenize(item.title)
-        summary_tokens = tokenize(item.summary)
-
-        title_hits = len(q_tokens & title_tokens)
-        summary_hits = len(q_tokens & summary_tokens)
-
-        exact_phrase = normalize_text(query) in normalize_text(item.title)
-
-        # IMPORTANT:
-        # Do not count source/search_text as topical relevance.
-        # "بحث: السعودية اقتصاد أسواق نفط" must not make an unrelated
-        # article look economic.
-        score = (
-            title_hits * 12
-            + summary_hits * 3
-            + (25 if exact_phrase else 0)
-            + item.trust_score * 0.04
-        )
-
-        item.relevance_score = score
-        ranked.append((score, item))
-
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [item for _, item in ranked]
-
-async def search_news(items, query, max_results=25):
-    q_tokens = tokenize(query)
-    candidates = []
-
-    for item in deduplicate_news(items):
-        if _is_digest(item.title):
+        if _is_non_article_result(item):
+            continue
+        if not _country_anchor_match(item, query):
             continue
 
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
 
-        if title_hits or original_hits or summary_hits:
+        # Prefer a headline/original-title match. Summary-only matches are kept
+        # only when there is more than one query-token hit.
+        if title_hits or original_hits or summary_hits >= 2:
+            filtered.append(item)
+
+    return filtered[:max_results]
+
+def rank_search_results(items, query):
+    q_tokens = tokenize(query)
+    normalized_query = normalize_text(query)
+    ranked = []
+
+    for item in items:
+        title_tokens = tokenize(item.title)
+        original_tokens = tokenize(item.original_title)
+        summary_tokens = tokenize(item.summary)
+
+        title_hits = len(q_tokens & title_tokens)
+        original_hits = len(q_tokens & original_tokens)
+        summary_hits = len(q_tokens & summary_tokens)
+
+        title_text = normalize_text(item.title)
+        original_text = normalize_text(item.original_title)
+        exact_phrase = (
+            normalized_query in title_text
+            or normalized_query in original_text
+        )
+
+        # Ranking order:
+        # 1) actual topical match in article text,
+        # 2) official/original publisher,
+        # 3) trusted publisher,
+        # 4) freshness as a tie-breaker.
+        score = (
+            title_hits * 16
+            + original_hits * 12
+            + summary_hits * 2
+            + (30 if exact_phrase else 0)
+            + (18 if item.official else 0)
+            + item.trust_score * 0.08
+        )
+
+        if _country_anchor_match(item, query):
+            score += 8
+        else:
+            score -= 40
+
+        item.relevance_score = score
+        published_ts = item.published.timestamp() if item.published else 0
+        ranked.append((
+            1 if item.official else 0,
+            score,
+            item.trust_score,
+            published_ts,
+            item,
+        ))
+
+    ranked.sort(key=lambda x: x[:-1], reverse=True)
+    return [row[-1] for row in ranked]
+
+async def search_news(items, query, max_results=25):
+    q_tokens = tokenize(query)
+    candidates = []
+
+    for item in deduplicate_news(items):
+        if _is_digest(item.title) or _is_non_article_result(item):
+            continue
+        if not _country_anchor_match(item, query):
+            continue
+
+        title_hits = len(q_tokens & tokenize(item.title))
+        original_hits = len(q_tokens & tokenize(item.original_title))
+        summary_hits = len(q_tokens & tokenize(item.summary))
+
+        if title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
 
     return rank_search_results(candidates, query)[:max_results]

@@ -153,6 +153,55 @@ DIGEST_TERMS = [
     "top stories","daily roundup","news digest","latest news roundup",
 ]
 
+# Hard-noise patterns: service/SEO pages rather than intelligence-grade news.
+LOW_VALUE_HARD_TERMS = [
+    "بث مباشر", "شاهد مباشر", "مشاهدة مباشرة", "مشاهدة مباراة",
+    "شاهد المباراة", "رابط المباراة", "روابط المباراة", "live stream",
+    "watch live", "streaming link", "live score", "نتيجة مباشرة",
+]
+
+SPORT_TERMS = [
+    "مباراة", "دوري", "بطولة", "كأس", "منتخب", "فريق", "هدف", "لاعب",
+    "مدرب", "سباق", "فورمولا", "formula 1", "football", "soccer",
+    "match", "league", "cup", "tournament", "team", "player", "race",
+]
+
+CULTURE_ROUTINE_TERMS = [
+    "معرض", "متحف", "مهرجان", "حفلة", "فيلم", "مسرح", "تراث",
+    "exhibition", "museum", "festival", "concert", "film", "heritage",
+]
+
+PROTOCOL_TERMS = [
+    "يهنئ", "تهنئ", "تهنئة", "يعزي", "تعازي", "ذكرى الاستقلال",
+    "congratulates", "congratulations", "condolences", "independence day",
+]
+
+HIGH_IMPACT_TERMS = [
+    "حرب", "هجوم", "قصف", "صاروخ", "انفجار", "زلزال", "فيضانات",
+    "طوارئ", "عقوبات", "انتخابات", "استقالة", "إقالة", "مفاوضات",
+    "اتفاق", "أزمة", "احتجاج", "اعتقال", "اغتيال", "انقلاب",
+    "war", "attack", "strike", "missile", "explosion", "earthquake",
+    "flood", "emergency", "sanctions", "election", "resigns",
+    "negotiations", "agreement", "crisis", "protest", "arrest", "coup",
+]
+
+SEARCH_INTENT_TERMS = {
+    "sport": SPORT_TERMS + ["رياضة", "رياضي", "sports"],
+    "culture": CULTURE_ROUTINE_TERMS + ["ثقافة", "ثقافي", "culture", "arts"],
+    "economy": ECON_TERMS,
+    "security": SECURITY_TERMS,
+}
+
+EVENT_CLASS_TERMS = {
+    "fatality_rescue": ["وفاة", "جثة", "ضحية", "الضحايا", "انتشال", "إنقاذ", "انقاذ", "موت",
+                        "death", "dead", "body", "victim", "rescue"],
+    "attack": ["هجوم", "قصف", "غارة", "صاروخ", "انفجار", "استهداف",
+               "attack", "airstrike", "missile", "explosion", "strike"],
+    "politics": ["انتخابات", "استقالة", "إقالة", "تعيين", "حكومة", "رئيس", "وزير",
+                 "election", "resign", "appointed", "government", "president", "minister"],
+    "economy": ECON_TERMS,
+}
+
 COUNTRY_EN = {
     "السعودية":"Saudi Arabia","الإمارات":"United Arab Emirates","قطر":"Qatar",
     "الكويت":"Kuwait","البحرين":"Bahrain","عمان":"Oman","اليمن":"Yemen",
@@ -508,6 +557,10 @@ def same_event(a, b):
     if _lexical_event_match(a, b):
         return True
 
+    # Event-class + shared-entity fingerprint catches heavily reworded coverage.
+    if _semantic_event_match(a, b):
+        return True
+
     # Cross-language identity: compare language-neutral, high-signal event
     # concepts rather than raw words. This is deliberately conservative.
     ia = _event_identity(a)
@@ -778,7 +831,7 @@ def deduplicate_news(items):
     seen_urls = {}
 
     for item in items:
-        if _is_digest(item.title):
+        if _is_digest(item.title) or _hard_low_value(item):
             continue
 
         url_key = item.url.strip().lower()
@@ -853,6 +906,90 @@ def _entry_publisher(entry, fallback_source):
     if publisher:
         return publisher
     return fallback_source
+
+
+def _query_intent(query):
+    nq = normalize_text(query)
+    for intent, terms in SEARCH_INTENT_TERMS.items():
+        if any(normalize_text(term) in nq for term in terms):
+            return intent
+    return "general"
+
+
+def _hard_low_value(item):
+    text = normalize_text(f"{item.title} {item.original_title}")
+    return any(normalize_text(term) in text for term in LOW_VALUE_HARD_TERMS)
+
+
+def _content_value_adjustment(item, query):
+    """Context-sensitive news-value score; generic rules, no country-specific tuning."""
+    intent = _query_intent(query)
+    text = normalize_text(f"{item.title} {item.original_title} {item.summary}")
+    title = normalize_text(f"{item.title} {item.original_title}")
+    delta = 0.0
+
+    if any(normalize_text(x) in text for x in HIGH_IMPACT_TERMS):
+        delta += 24
+    if _security_signal(item.title, item.summary):
+        delta += 18
+    if _economy_signal(item.title, item.summary):
+        delta += 14
+    if _official_signal(item.title, item.summary, item):
+        delta += 12
+    if item.official:
+        delta += 8
+
+    sport = any(normalize_text(x) in title for x in SPORT_TERMS)
+    culture = any(normalize_text(x) in title for x in CULTURE_ROUTINE_TERMS)
+    protocol = any(normalize_text(x) in title for x in PROTOCOL_TERMS)
+
+    if sport:
+        delta += 22 if intent == "sport" else -28
+    if culture:
+        delta += 18 if intent == "culture" else -12
+    if protocol and intent == "general":
+        delta -= 16
+
+    return delta
+
+
+def _event_classes(item):
+    text = normalize_text(f"{item.title} {item.original_title} {item.summary}")
+    return {
+        name for name, terms in EVENT_CLASS_TERMS.items()
+        if any(normalize_text(term) in text for term in terms)
+    }
+
+
+def _semantic_event_match(a, b):
+    """Conservative event match for heavily reworded headlines."""
+    if not _published_close(a, b, hours=30):
+        return False
+
+    classes = _event_classes(a) & _event_classes(b)
+    if not classes:
+        return False
+
+    ta = tokenize(a.title)
+    tb = tokenize(b.title)
+    common = ta & tb
+    if len(common) < 2:
+        return False
+
+    # Require at least one fairly specific shared token, not just short glue words.
+    specific = {t for t in common if len(t) >= 4 and t not in EVENT_STOPWORDS}
+    if not specific:
+        return False
+
+    nums_a = _title_numbers(a.title)
+    nums_b = _title_numbers(b.title)
+    if nums_a and nums_b and nums_a.isdisjoint(nums_b):
+        return False
+
+    # Same detected region is a useful guard when titles are sparse.
+    same_region = bool(a.region and b.region and a.region == b.region)
+    containment = len(common) / max(1, min(len(ta), len(tb)))
+    return (same_region and len(common) >= 2 and containment >= 0.22) or len(common) >= 3
 
 
 def _is_non_article_result(item):
@@ -1064,7 +1201,7 @@ async def search_news_online(query, max_results=25):
     q_tokens = tokenize(query)
     filtered = []
     for item in ranked:
-        if _is_non_article_result(item):
+        if _is_non_article_result(item) or _hard_low_value(item):
             continue
         if not _country_anchor_match(item, query):
             continue
@@ -1156,7 +1293,16 @@ def rank_search_results(items, query):
             + (30 if exact_phrase else 0)
             + (18 if item.official else 0)
             + item.trust_score * 0.08
+            + _content_value_adjustment(item, query)
         )
+
+        # Freshness matters, but it must not overpower relevance/news value.
+        if item.published:
+            try:
+                age_hours = max(0.0, (datetime.now(timezone.utc) - item.published).total_seconds() / 3600)
+                score += max(-18.0, 14.0 - min(age_hours, 192.0) * 0.16)
+            except Exception:
+                pass
 
         if _country_anchor_match(item, query):
             score += 8
@@ -1182,7 +1328,7 @@ async def search_news(items, query, max_results=25):
     candidates = []
 
     for item in deduplicate_news(items):
-        if _is_digest(item.title) or _is_non_article_result(item):
+        if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
             continue
         if not _country_anchor_match(item, query):
             continue

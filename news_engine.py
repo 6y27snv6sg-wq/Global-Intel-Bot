@@ -734,50 +734,80 @@ def _economy_signal(title, summary=""):
 def _official_signal(title, summary, item=None):
     t = normalize_text(title)
 
-    # Precision-first rule for the official-statements section:
-    # publisher status alone (for example un.org) is never sufficient.
-    # The headline itself must clearly attribute an official actor or
-    # explicitly identify a statement/press release. This prevents general
-    # humanitarian or conflict reporting from official publishers entering
-    # the section merely because the article summary mentions officials.
-    strong_markers = [
-        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
-        "المتحدث باسم", "مصدر مسؤول", "وزارة الخارجية",
-        "وزارة الدفاع", "وزارة الداخلية", "وزارة المالية",
-        "وزارة الطاقة", "وزارة الصحة", "وزارة الاعلام",
-        "رئاسه الوزراء", "الديوان الملكي", "الخارجيه",
+    # Precision + recall:
+    # - A direct statement/release marker is sufficient.
+    # - An official actor must normally be paired with an official action.
+    # - A direct official publisher may qualify when its headline itself
+    #   describes an official action.
+    # Publisher status alone is NEVER sufficient, so general UN/news reports
+    # do not leak into the official-statements section.
+    document_markers = [
+        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "مؤتمر صحفي",
+        "المتحدث الرسمي", "المتحدث باسم", "مصدر مسؤول",
         "official statement", "press statement", "press release",
-        "foreign ministry", "state department", "spokesperson",
+        "readout", "remarks by", "briefing by", "spokesperson",
     ]
-    if any(normalize_text(x) in t for x in strong_markers):
-        return True
+
+    institution_markers = [
+        "وزارة الخارجيه", "وزارة الدفاع", "وزارة الداخليه",
+        "وزارة الماليه", "وزارة الطاقه", "وزارة الصحه",
+        "رئاسه الوزراء", "الديوان الملكي",
+        "foreign ministry", "ministry of foreign affairs",
+        "state department",
+    ]
 
     official_actors = [
         "الحكومه", "الرئاسه", "الوزاره", "الوزير", "السفير",
         "السفاره", "المبعوث", "رئيس الوزراء", "الرئيس",
+        "الامين العام",
         "government", "president", "prime minister", "minister",
-        "ambassador", "embassy", "envoy",
+        "ambassador", "embassy", "envoy", "secretary general",
+        "secretary-general",
     ]
+
     official_actions = [
         "اعلن", "اعلنت", "اكد", "اكدت", "صرح", "صرحت",
         "قال", "قالت", "حذر", "حذرت", "ادان", "ادانت",
         "نفى", "نفت", "اصدر", "اصدرت", "كشف", "كشفت",
         "يدعو", "دعا", "تدعو", "رحب", "رحبت", "قرر", "قررت",
+        "استقبل", "استقبلت", "بحث", "بحثت", "ناقش", "ناقشت",
+        "اجتمع", "اجتمعت", "التقى", "التقت", "اتصال", "لقاء",
         "announced", "said", "confirmed", "stated", "warned",
         "condemned", "denied", "issued", "called for", "welcomed",
+        "met", "meets", "received", "receives", "discussed", "discusses",
+        "held talks", "spoke with",
     ]
 
-    actor_hit = any(normalize_text(x) in t for x in official_actors)
-    action_hit = any(normalize_text(x) in t for x in official_actions)
-    if actor_hit and action_hit:
+    if any(normalize_text(x) in t for x in document_markers):
         return True
 
-    # Attribution-style headlines such as "الخارجية التركية: ..." are
-    # official-signal stories even when the reporting outlet is secondary.
-    if ":" in title:
-        prefix = normalize_text(title.split(":", 1)[0])
-        if any(normalize_text(x) in prefix for x in strong_markers + official_actors):
+    institution_hit = any(normalize_text(x) in t for x in institution_markers)
+    actor_hit = any(normalize_text(x) in t for x in official_actors)
+    action_hit = any(normalize_text(x) in t for x in official_actions)
+
+    if (institution_hit or actor_hit) and action_hit:
+        return True
+
+    # Attribution headlines such as "الخارجية التركية: ..." qualify, but
+    # ordinary phrases such as "القوى الخارجية" do not.
+    raw_title = str(title or "")
+    if ":" in raw_title:
+        prefix = normalize_text(raw_title.split(":", 1)[0])
+        foreign_ministry_prefix = (
+            prefix == "الخارجيه"
+            or prefix.startswith("الخارجيه ")
+        )
+        if (
+            foreign_ministry_prefix
+            or any(normalize_text(x) in prefix for x in institution_markers + official_actors)
+        ):
             return True
+
+    # Direct official domains are trusted as publishers, but still require
+    # an action-bearing headline. This admits genuine ministry/government
+    # releases while rejecting generic institutional news reports.
+    if item is not None and item.official and action_hit:
+        return True
 
     return False
 
@@ -1193,6 +1223,25 @@ def _institution_entity_profile(query):
     return {"aliases": {x for x in aliases if x}, "exclude": set(), "kind": "institution"}
 
 
+def _is_broad_official_discovery_query(query):
+    """Official discovery queries are topics, not one atomic named entity."""
+    nq = normalize_text(query)
+    if not nq:
+        return False
+
+    markers = (
+        "بيانات رسميه", "بيان رسمي", "تصريح رسمي", "بيان صحفي",
+        "وزاره خارجيه", "وزاره الخارجيه", "الخارجيه",
+        "official statement", "press statement", "press release",
+        "foreign ministry", "ministry of foreign affairs",
+    )
+    if not any(normalize_text(marker) in nq for marker in markers):
+        return False
+
+    # Country-specific searches should keep the strict entity anchor.
+    return not bool(_country_aliases_from_query(query))
+
+
 def _query_entity_profile(query):
     """Build one atomic entity profile for search anchoring."""
     nq = normalize_text(query)
@@ -1214,6 +1263,13 @@ def _query_entity_profile(query):
     aliases = _country_aliases_from_query(query)
     if aliases:
         return {"aliases": aliases, "exclude": set(), "kind": "country"}
+
+    # Broad official discovery is a topic search, not a single entity phrase.
+    # Without this exception, a query such as "بيانات رسمية وزارة خارجية"
+    # becomes one impossible exact entity anchor and all raw results are
+    # discarded before ranking.
+    if _is_broad_official_discovery_query(query):
+        return {"aliases": set(), "exclude": set(), "kind": "official_discovery"}
 
     # Generic short entity fallback: preserve the complete phrase atomically.
     if _query_intent(query) == "general":
@@ -1667,6 +1723,9 @@ async def collect_news(max_items=150):
         "السعودية اقتصاد أسواق نفط",
         "الشرق الأوسط أمن دفاع",
         "بيانات رسمية وزارة خارجية",
+        "بيان رسمي وزارة الخارجية",
+        "foreign ministry official statement",
+        "press release foreign ministry",
         "world economy markets oil",
         "world security defense",
 

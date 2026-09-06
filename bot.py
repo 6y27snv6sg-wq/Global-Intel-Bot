@@ -66,6 +66,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
 NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
+CALLBACK_ACK_TIMEOUT = 1.5
 GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
@@ -297,6 +298,21 @@ def track_task(coro, name):
     BACKGROUND_TASKS.add(task)
     task.add_done_callback(BACKGROUND_TASKS.discard)
     return task
+
+
+async def safe_query_answer(query, text=None, show_alert=False):
+    """Acknowledge Telegram callbacks without allowing ACK latency to block UI work."""
+    try:
+        await asyncio.wait_for(
+            query.answer(text=text, show_alert=show_alert),
+            timeout=CALLBACK_ACK_TIMEOUT,
+        )
+        return True
+    except asyncio.TimeoutError:
+        log.info("Callback acknowledgement timed out; continuing action.")
+    except Exception as exc:
+        log.info("Callback acknowledgement failed; continuing action: %s", type(exc).__name__)
+    return False
 
 
 async def initialize_custom_emoji_pack(application):
@@ -811,11 +827,11 @@ async def send_topic_update(message, key, previous_results):
 
 async def show_topic(query, user_id, key, page):
     """Fast cache-only topic/page navigation; never wait behind user locks."""
-    try:
-        await query.answer("📡 جاري تحميل الأخبار...", show_alert=False)
-    except Exception:
-        # An expired callback acknowledgement must not prevent page rendering.
-        log.info("Callback acknowledgement expired; continuing topic render.")
+    await safe_query_answer(
+        query,
+        "📡 جاري تحميل الأخبار...",
+        show_alert=False,
+    )
 
     status = await query.message.reply_text(
         f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
@@ -1005,13 +1021,15 @@ async def button_handler(update, context):
     if data == "toggle_alerts":
         if user_id in MUTED_USERS:
             MUTED_USERS.discard(user_id)
-            await query.answer(
+            await safe_query_answer(
+                query,
                 "🔔 تم تفعيل التنبيهات العاجلة.",
                 show_alert=True,
             )
         else:
             MUTED_USERS.add(user_id)
-            await query.answer(
+            await safe_query_answer(
+                query,
                 "🔕 تم إيقاف التنبيهات العاجلة.",
                 show_alert=True,
             )
@@ -1022,7 +1040,7 @@ async def button_handler(update, context):
         return
 
     if data == "home":
-        await query.answer("🏠 مركز الأخبار")
+        await safe_query_answer(query, "🏠 مركز الأخبار")
         await query.message.reply_text(
             f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n\n"
             "اختر القسم المطلوب. الأخبار المتاحة تظهر أولاً "
@@ -1033,7 +1051,7 @@ async def button_handler(update, context):
         return
 
     if data == "refresh":
-        await query.answer("🔄 بدأ التحديث", show_alert=False)
+        await safe_query_answer(query, "🔄 بدأ التحديث", show_alert=False)
 
         cached = NEWS_CACHE.peek("all_news") or []
         await query.message.reply_text(
@@ -1069,7 +1087,7 @@ async def button_handler(update, context):
         return
 
     if data == "more":
-        await query.answer("🔎 البحث متاح الآن")
+        await safe_query_answer(query, "🔎 البحث متاح الآن")
         await query.message.reply_text(
             "➕ <b>المزيد</b>\n\n"
             "اكتب مباشرة اسم دولة أو مدينة أو موضوع.\n\n"
@@ -1095,10 +1113,10 @@ async def button_handler(update, context):
         try:
             page = max(1, int(data.split(":", 1)[1]))
         except ValueError:
-            await query.answer("⚠️ صفحة غير صالحة.")
+            await safe_query_answer(query, "⚠️ صفحة غير صالحة.")
             return
 
-        await query.answer("📄 جاري عرض النتائج...")
+        await safe_query_answer(query, "📄 جاري عرض النتائج...")
         await show_search_page(query, user_id, page)
         return
 
@@ -1107,7 +1125,7 @@ async def button_handler(update, context):
         if key not in TOPICS:
             return
 
-        await query.answer("🧠 جاري تجهيز التحليل...")
+        await safe_query_answer(query, "🧠 جاري تجهيز التحليل...")
         status = await query.message.reply_text(
             "🧠 جاري تحليل البيانات..."
         )
@@ -1192,14 +1210,11 @@ async def handle_user_message(update, context):
         try:
             query_text = expand_search_query(text)
 
-            # Search never waits for a fresh global collection.
-            # Use existing cache only; warm it separately in the background.
+            # User search has priority over the heavy global collector.
+            # Use whatever cache already exists, but never start a full collection
+            # while the user's direct search is running. Online discovery below
+            # provides fresh results independently.
             cached = NEWS_CACHE.peek("all_news") or []
-            if not cached:
-                track_task(
-                    collect_and_cache_news(),
-                    f"search-cache-warm-{user_id}",
-                )
 
             local_results = await search_news(
                 cached,

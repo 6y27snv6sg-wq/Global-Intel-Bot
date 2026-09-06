@@ -16,7 +16,9 @@ import feedparser
 
 log = logging.getLogger("news_engine")
 
-FETCH_TIMEOUT = 7
+FETCH_TIMEOUT = 4
+FETCH_CONNECT_TIMEOUT = 2
+COLLECTION_CONCURRENCY = 20
 MAX_FEED_ITEMS = 30
 MAX_ONLINE_QUERIES = 6
 COLLECTION_CONCURRENCY = 10
@@ -186,7 +188,7 @@ def normalize_text(value):
 # Gemini is deliberately NOT used here.
 _TRANSLATION_CACHE: dict[str, str] = {}
 _TRANSLATION_CACHE_MAX = 1500
-_TRANSLATION_TIMEOUT = 8
+_TRANSLATION_TIMEOUT = 3
 _TRANSLATION_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 
 
@@ -218,7 +220,7 @@ async def translate_title_to_arabic(session, title: str) -> str:
         "q": title,
     }
 
-    for attempt in range(2):
+    for attempt in range(1):
         try:
             timeout = aiohttp.ClientTimeout(total=_TRANSLATION_TIMEOUT)
             async with session.get(
@@ -699,28 +701,40 @@ def parse_entry(entry, source, category="general"):
     return classify_item(item)
 
 async def fetch_feed(session, source, url):
+    """Fetch one source in isolation; a failed source never blocks collection."""
     try:
+        timeout = aiohttp.ClientTimeout(
+            total=FETCH_TIMEOUT,
+            connect=FETCH_CONNECT_TIMEOUT,
+            sock_connect=FETCH_CONNECT_TIMEOUT,
+            sock_read=FETCH_TIMEOUT,
+        )
         async with session.get(
             url,
-            timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
+            timeout=timeout,
             headers={"User-Agent": "Global-Intel-Bot/2.0"},
         ) as response:
             if response.status != 200:
+                log.warning("Feed HTTP %s: %s", response.status, source)
                 return []
             data = await response.read()
 
         parsed = feedparser.parse(data)
         items = []
-
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)
             if item:
                 items.append(item)
-
         return items
 
-    except Exception:
-        log.exception("Feed failed: %s", source)
+    except asyncio.TimeoutError:
+        log.warning("Feed timeout; skipped: %s", source)
+        return []
+    except aiohttp.ClientError as exc:
+        log.warning("Feed connection error; skipped %s: %s", source, exc)
+        return []
+    except Exception as exc:
+        log.warning("Feed failed; skipped %s: %s", source, exc)
         return []
 
 def google_news_url(query):
@@ -832,7 +846,12 @@ async def hybrid_search_news(items, query, max_results=25):
 async def collect_news(max_items=150):
     feeds = {**TRUSTED_FEEDS, **ADDITIONAL_TRUSTED_FEEDS}
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(
+        limit=COLLECTION_CONCURRENCY,
+        limit_per_host=2,
+        ttl_dns_cache=60,
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
         groups = await asyncio.gather(
             *(fetch_feed(session, source, url) for source, url in feeds.items()),
             return_exceptions=True,

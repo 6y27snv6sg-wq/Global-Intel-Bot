@@ -21,6 +21,8 @@ FETCH_CONNECT_TIMEOUT = 2
 COLLECTION_CONCURRENCY = 20
 MAX_FEED_ITEMS = 30
 MAX_ONLINE_QUERIES = 6
+ONLINE_SEARCH_BUDGET = 5
+DISCOVERY_BUDGET = 6
 ROTATION_WINDOW_SECONDS = 300
 
 TRUSTED_FEEDS = {
@@ -741,6 +743,12 @@ def google_news_url(query):
     return f"https://news.google.com/rss/search?q={q}&hl=ar&gl=SA&ceid=SA:ar"
 
 async def search_news_online(query, max_results=25):
+    """
+    Best-effort online discovery.
+
+    Slow queries are cancelled after a short hard budget. Results that already
+    arrived are kept; one failed source never invalidates the rest.
+    """
     queries = [query]
     normalized = normalize_text(query)
 
@@ -750,33 +758,65 @@ async def search_news_online(query, max_results=25):
 
     queries = list(dict.fromkeys(queries))[:MAX_ONLINE_QUERIES]
 
-    async with aiohttp.ClientSession() as session:
-        groups = await asyncio.gather(
-            *(
+    connector = aiohttp.TCPConnector(
+        limit=MAX_ONLINE_QUERIES,
+        limit_per_host=2,
+        ttl_dns_cache=60,
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            asyncio.create_task(
                 fetch_feed(
                     session,
                     f"بحث: {q}",
-                    google_news_url(q)
+                    google_news_url(q),
                 )
-                for q in queries
-            ),
-            return_exceptions=True,
+            )
+            for q in queries
+        ]
+
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=ONLINE_SEARCH_BUDGET,
         )
 
-    items = []
-    for group in groups:
-        if isinstance(group, list):
-            items.extend(group)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
-    # Canonicalize foreign-language titles before final deduplication.
-    # This makes Arabic/English versions of the same event compete as one item.
+    items = []
+    for task in done:
+        try:
+            group = task.result()
+            if isinstance(group, list):
+                items.extend(group)
+        except Exception:
+            continue
+
+    if not items:
+        return []
+
+    # Translation is non-Gemini and best effort.
     items = await translate_news_titles(items)
     items = [
         item for item in deduplicate_news(items)
         if not _is_digest(item.title)
     ]
 
-    return rank_search_results(items, query)[:max_results]
+    ranked = rank_search_results(items, query)
+
+    # Relevance must come from title/original title/summary only.
+    q_tokens = tokenize(query)
+    filtered = []
+    for item in ranked:
+        title_hits = len(q_tokens & tokenize(item.title))
+        original_hits = len(q_tokens & tokenize(item.original_title))
+        summary_hits = len(q_tokens & tokenize(item.summary))
+        if title_hits or original_hits or summary_hits:
+            filtered.append(item)
+
+    return filtered[:max_results]
 
 def rank_search_results(items, query):
     q_tokens = tokenize(query)
@@ -809,17 +849,38 @@ def rank_search_results(items, query):
     return [item for _, item in ranked]
 
 async def search_news(items, query, max_results=25):
-    return rank_search_results(
-        [
-            item for item in deduplicate_news(items)
-            if not _is_digest(item.title)
-        ],
-        query,
-    )[:max_results]
+    q_tokens = tokenize(query)
+    candidates = []
+
+    for item in deduplicate_news(items):
+        if _is_digest(item.title):
+            continue
+
+        title_hits = len(q_tokens & tokenize(item.title))
+        original_hits = len(q_tokens & tokenize(item.original_title))
+        summary_hits = len(q_tokens & tokenize(item.summary))
+
+        if title_hits or original_hits or summary_hits:
+            candidates.append(item)
+
+    return rank_search_results(candidates, query)[:max_results]
 
 async def hybrid_search_news(items, query, max_results=25):
+    """
+    Compatibility path: local results always survive online timeout/failure.
+
+    The Telegram layer now calls local and online search separately to deliver
+    results progressively, but this function stays safe for any older caller.
+    """
     local = await search_news(items, query, max_results)
-    online = await search_news_online(query, max_results)
+
+    try:
+        online = await asyncio.wait_for(
+            search_news_online(query, max_results),
+            timeout=ONLINE_SEARCH_BUDGET + 1,
+        )
+    except Exception:
+        online = []
 
     merged = [
         item for item in deduplicate_news(local + online)
@@ -827,17 +888,15 @@ async def hybrid_search_news(items, query, max_results=25):
     ]
 
     ranked = rank_search_results(merged, query)
-
-    # Search relevance comes ONLY from title/summary.
-    # Source names and search query labels are deliberately ignored.
     q_tokens = tokenize(query)
     filtered = []
 
     for item in ranked:
         title_hits = len(q_tokens & tokenize(item.title))
+        original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
 
-        if title_hits or summary_hits:
+        if title_hits or original_hits or summary_hits:
             filtered.append(item)
 
     return filtered[:max_results]
@@ -888,17 +947,30 @@ async def collect_news(max_items=150):
     ]
 
     try:
-        discovery = await asyncio.gather(
-            *(search_news_online(q, 15) for q in discovery_queries),
-            return_exceptions=True,
+        discovery_tasks = [
+            asyncio.create_task(search_news_online(q, 15))
+            for q in discovery_queries
+        ]
+        done, pending = await asyncio.wait(
+            discovery_tasks,
+            timeout=DISCOVERY_BUDGET,
         )
 
-        for group in discovery:
-            if isinstance(group, list):
-                items.extend(group)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        for task in done:
+            try:
+                group = task.result()
+                if isinstance(group, list):
+                    items.extend(group)
+            except Exception:
+                continue
 
     except Exception:
-        log.exception("Discovery failed.")
+        log.exception("Discovery failed; returning available direct-feed news.")
 
     # Canonicalize every foreign title before the final event-level dedup.
     # This prevents the same story arriving in Arabic and English from being
@@ -911,6 +983,7 @@ async def collect_news(max_items=150):
 
     items.sort(
         key=lambda x: (
+            1 if x.official else 0,
             float(x.relevance_score or 0),
             float(x.trust_score or 0),
             x.published.timestamp() if x.published else 0,

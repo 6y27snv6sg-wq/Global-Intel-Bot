@@ -830,37 +830,84 @@ async def show_search_page(query, user_id, page):
     )
 
 
-async def progressive_online_search(message, user_id, raw_query, query_text, local_results):
-    """Online discovery is additive; it can never erase or delay local results."""
+async def progressive_online_search(
+    message,
+    status,
+    user_id,
+    raw_query,
+    query_text,
+    local_results,
+):
+    """Online discovery is additive and never blocks the first visible state."""
     try:
         online = await asyncio.wait_for(
             search_news_online(query_text, MAX_SEARCH_RESULTS),
             timeout=ONLINE_SEARCH_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        log.info("Online search timed out; local results already delivered.")
+        log.info("Online search timed out; keeping available results.")
+        if not local_results:
+            try:
+                await status.edit_text(
+                    f"🔎 <b>{safe_html(raw_query)}</b>\n\n"
+                    "لم يتم العثور على نتائج خلال جولة البحث الحالية.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return
     except asyncio.CancelledError:
         raise
     except Exception:
-        log.exception("Online search failed; local results already delivered.")
+        log.exception("Online search failed; keeping available results.")
+        if not local_results:
+            try:
+                await status.edit_text(
+                    f"🔎 <b>{safe_html(raw_query)}</b>\n\n"
+                    "تعذر إكمال البحث العالمي الآن. حاول مرة أخرى بعد قليل.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return
 
-    if not online:
-        return
-
+    online = deduplicate_news(online or [])
     local_keys = {urgent_key(item) for item in local_results}
     additions = [
-        item for item in deduplicate_news(online)
+        item for item in online
         if urgent_key(item) not in local_keys
     ]
-
-    if not additions:
-        return
 
     merged = deduplicate_news(local_results + additions)[:MAX_SEARCH_RESULTS]
     USER_SEARCH_RESULTS[user_id] = merged
     USER_SEARCH_QUERY[user_id] = raw_query
+
+    if not local_results:
+        if not merged:
+            await status.edit_text(
+                f"🔎 <b>{safe_html(raw_query)}</b>\n\n"
+                "لم يتم العثور على نتائج في التغطية المتاحة حالياً.",
+                parse_mode="HTML",
+            )
+            return
+
+        report = generate_base_report(
+            merged,
+            1,
+            PER_PAGE,
+            heading=f"🔎 {raw_query}",
+            subheading=f"✓ تم العثور على {len(merged)} نتائج",
+        )
+        await status.edit_text(
+            report,
+            reply_markup=search_result_keyboard(user_id, 1),
+            disable_web_page_preview=True,
+            parse_mode="HTML",
+        )
+        return
+
+    if not additions:
+        return
 
     first_additions = additions[:PER_PAGE]
     report = generate_base_report(
@@ -871,9 +918,7 @@ async def progressive_online_search(message, user_id, raw_query, query_text, loc
             f"{status_visual('monitoring')} "
             f"{safe_html('تحديث البحث')}"
         ),
-        subheading=(
-            f"+{len(additions)} نتائج إضافية حديثة عن: {raw_query}"
-        ),
+        subheading=f"+{len(additions)} نتائج إضافية حديثة عن: {raw_query}",
     )
     await message.reply_text(
         report,
@@ -1064,19 +1109,22 @@ async def handle_user_message(update, context):
 
     async with lock:
         status = await update.message.reply_text(
-            f"{status_visual('search')} <b>البحث: {safe_html(text)}</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "◌ تجهيز أقرب النتائج المتاحة...",
+            f"🔎 <b>{safe_html(text)}</b>\n\n"
+            "◌ البحث مستمر...",
             parse_mode="HTML",
         )
 
         try:
             query_text = expand_search_query(text)
 
-            # Never wait for a fresh global collection before showing local data.
+            # Search never waits for a fresh global collection.
+            # Use existing cache only; warm it separately in the background.
             cached = NEWS_CACHE.peek("all_news") or []
             if not cached:
-                cached = await get_fresh_news()
+                track_task(
+                    collect_and_cache_news(),
+                    f"search-cache-warm-{user_id}",
+                )
 
             local_results = await search_news(
                 cached,
@@ -1093,11 +1141,8 @@ async def handle_user_message(update, context):
                     local_results,
                     1,
                     PER_PAGE,
-                    heading=f"🔎 نتائج البحث: {text}",
-                    subheading=(
-                        f"{len(local_results)} نتيجة متاحة الآن • "
-                        "البحث العالمي مستمر"
-                    ),
+                    heading=f"🔎 {text}",
+                    subheading=f"✓ تم العثور على {len(local_results)} نتائج متاحة الآن",
                 )
                 await status.edit_text(
                     report,
@@ -1109,15 +1154,14 @@ async def handle_user_message(update, context):
                 USER_SEARCH_RESULTS[user_id] = []
                 await status.edit_text(
                     f"🔎 <b>{safe_html(text)}</b>\n\n"
-                    "لم تظهر نتيجة محلية بعد.\n"
-                    "📡 جاري توسيع البحث العالمي...",
+                    "📡 جاري توسيع التغطية العالمية...",
                     parse_mode="HTML",
                 )
 
-            # Online discovery runs after the first response and never blocks it.
             track_task(
                 progressive_online_search(
                     update.message,
+                    status,
                     user_id,
                     text,
                     query_text,

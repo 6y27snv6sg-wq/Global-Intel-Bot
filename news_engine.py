@@ -733,28 +733,51 @@ def _economy_signal(title, summary=""):
 
 def _official_signal(title, summary, item=None):
     t = normalize_text(title)
-    s = normalize_text(summary)
 
-    title_hits = score_terms(t, OFFICIAL_TERMS)
-    summary_hits = score_terms(s, OFFICIAL_TERMS)
-
-    # A real official marker in the headline is enough.
-    if title_hits >= 1:
-        return True
-
-    # Do not treat generic "government forces" / "government" as an
-    # official statement. Require explicit statement language.
-    explicit = [
-        "بيان","تصريح","المتحدث","قالت الوزارة","قال الوزير",
-        "اعلنت الوزارة","أعلنت الوزارة","السفير","الخارجية",
-        "statement","spokesperson","ministry said","minister said",
-        "ambassador","foreign ministry","official statement",
+    # Precision-first rule for the official-statements section:
+    # publisher status alone (for example un.org) is never sufficient.
+    # The headline itself must clearly attribute an official actor or
+    # explicitly identify a statement/press release. This prevents general
+    # humanitarian or conflict reporting from official publishers entering
+    # the section merely because the article summary mentions officials.
+    strong_markers = [
+        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
+        "المتحدث باسم", "مصدر مسؤول", "وزارة الخارجية",
+        "وزارة الدفاع", "وزارة الداخلية", "وزارة المالية",
+        "وزارة الطاقة", "وزارة الصحة", "وزارة الاعلام",
+        "رئاسه الوزراء", "الديوان الملكي", "الخارجيه",
+        "official statement", "press statement", "press release",
+        "foreign ministry", "state department", "spokesperson",
     ]
-    if any(normalize_text(x) in s for x in explicit) and summary_hits >= 1:
+    if any(normalize_text(x) in t for x in strong_markers):
         return True
 
-    if item is not None and item.official and summary_hits >= 1:
+    official_actors = [
+        "الحكومه", "الرئاسه", "الوزاره", "الوزير", "السفير",
+        "السفاره", "المبعوث", "رئيس الوزراء", "الرئيس",
+        "government", "president", "prime minister", "minister",
+        "ambassador", "embassy", "envoy",
+    ]
+    official_actions = [
+        "اعلن", "اعلنت", "اكد", "اكدت", "صرح", "صرحت",
+        "قال", "قالت", "حذر", "حذرت", "ادان", "ادانت",
+        "نفى", "نفت", "اصدر", "اصدرت", "كشف", "كشفت",
+        "يدعو", "دعا", "تدعو", "رحب", "رحبت", "قرر", "قررت",
+        "announced", "said", "confirmed", "stated", "warned",
+        "condemned", "denied", "issued", "called for", "welcomed",
+    ]
+
+    actor_hit = any(normalize_text(x) in t for x in official_actors)
+    action_hit = any(normalize_text(x) in t for x in official_actions)
+    if actor_hit and action_hit:
         return True
+
+    # Attribution-style headlines such as "الخارجية التركية: ..." are
+    # official-signal stories even when the reporting outlet is secondary.
+    if ":" in title:
+        prefix = normalize_text(title.split(":", 1)[0])
+        if any(normalize_text(x) in prefix for x in strong_markers + official_actors):
+            return True
 
     return False
 

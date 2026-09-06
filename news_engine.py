@@ -22,7 +22,9 @@ COLLECTION_CONCURRENCY = 20
 MAX_FEED_ITEMS = 30
 MAX_ONLINE_QUERIES = 6
 ONLINE_SEARCH_BUDGET = 3.5
-SEARCH_TRANSLATION_BUDGET = 2.0
+SEARCH_TRANSLATION_BUDGET = 1.0
+LOCAL_SEARCH_TRANSLATION_BUDGET = 0.6
+SEARCH_TRANSLATION_RESULT_CAP = 10
 DISCOVERY_BUDGET = 6
 ROTATION_WINDOW_SECONDS = 300
 
@@ -1343,11 +1345,14 @@ def google_news_url(query):
 
 async def search_news_online(query, max_results=25):
     """
-    Best-effort online discovery.
+    Best-effort online discovery with a strict user-facing latency budget.
 
-    Slow queries are cancelled after a short hard budget. Results that already
-    arrived are kept; one failed source never invalidates the rest.
+    Relevance filtering happens before expensive event-level deduplication,
+    and only a small bounded set of foreign-language headlines is translated.
+    Slow queries/translations are cancelled while already-completed results
+    are preserved.
     """
+    started = time.monotonic()
     queries = [query]
     normalized = normalize_text(query)
 
@@ -1365,81 +1370,67 @@ async def search_news_online(query, max_results=25):
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
             asyncio.create_task(
-                fetch_feed(
-                    session,
-                    f"بحث: {q}",
-                    google_news_url(q),
-                )
+                fetch_feed(session, f"بحث: {q}", google_news_url(q))
             )
             for q in queries
         ]
-
-        done, pending = await asyncio.wait(
-            tasks,
-            timeout=ONLINE_SEARCH_BUDGET,
-        )
-
+        done, pending = await asyncio.wait(tasks, timeout=ONLINE_SEARCH_BUDGET)
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    items = []
+    raw_items = []
     for task in done:
         try:
             group = task.result()
             if isinstance(group, list):
-                items.extend(group)
+                raw_items.extend(group)
         except Exception:
             continue
 
-    if not items:
+    if not raw_items:
+        log.info("Online search timing query=%r raw=0 total=%.3fs", query, time.monotonic() - started)
         return []
 
-    # IMPORTANT PERFORMANCE RULE:
-    # Filter and rank BEFORE translation. Translating every raw Google News
-    # candidate was the main avoidable cost on the user-facing search path.
-    # The bot only needs translated titles for the small final result set.
-    items = [
-        item for item in deduplicate_news(items)
-        if not _is_digest(item.title)
-    ]
-
-    ranked = rank_search_results(items, query)
-
-    # Relevance must come from article text only.
+    # Cheap relevance gates FIRST.  deduplicate_news performs semantic pairwise
+    # comparisons, so running it across every unrelated feed item creates an
+    # avoidable O(n^2) delay on the interactive path.
     q_tokens = tokenize(query)
-    filtered = []
-    for item in ranked:
-        if _is_non_article_result(item) or _hard_low_value(item):
+    candidates = []
+    for item in raw_items:
+        if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
             continue
         if not _country_anchor_match(item, query):
             continue
-
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
-
-        # Prefer a headline/original-title match. Summary-only matches are kept
-        # only when there is more than one query-token hit.
         if title_hits or original_hits or summary_hits >= 2:
-            filtered.append(item)
+            candidates.append(item)
 
-    # Translate only the final bounded result set, never the full raw feed.
-    # Partial successes are preserved inside the translation budget.
-    final_items = filtered[:max_results]
-    final_items = await translate_news_titles(
-        final_items,
-        budget=SEARCH_TRANSLATION_BUDGET,
+    if not candidates:
+        log.info("Online search timing query=%r raw=%d candidates=0 total=%.3fs", query, len(raw_items), time.monotonic() - started)
+        return []
+
+    ranked = rank_search_results(deduplicate_news(candidates), query)[:max_results]
+
+    # Native-Arabic headlines require no network translation and should never
+    # wait behind foreign-language titles. Translate only the strongest bounded
+    # foreign subset, then merge and re-rank.
+    native_arabic = [item for item in ranked if not _needs_arabic_translation(item.title)]
+    foreign = [item for item in ranked if _needs_arabic_translation(item.title)]
+    foreign = foreign[:SEARCH_TRANSLATION_RESULT_CAP]
+    if foreign:
+        foreign = await translate_news_titles(foreign, budget=SEARCH_TRANSLATION_BUDGET)
+
+    final_items = _post_translation_search_filter(native_arabic + foreign, query)
+    result = rank_search_results(final_items, query)[:max_results]
+    log.info(
+        "Online search timing query=%r raw=%d candidates=%d result=%d total=%.3fs",
+        query, len(raw_items), len(candidates), len(result), time.monotonic() - started,
     )
-
-    # Translation can reveal Arabic hard-noise phrases (for example "بث مباشر")
-    # that were not detectable in the original title. Enforce every invariant
-    # again after translation, and never expose an untranslated foreign headline.
-    final_items = _post_translation_search_filter(final_items, query)
-
-    # Re-rank after translation so Arabic canonical titles can improve ordering.
-    return rank_search_results(final_items, query)[:max_results]
+    return result
 
 def _source_bucket(item):
     # Diversity is based on the representative publisher, while merged
@@ -1544,10 +1535,19 @@ def rank_search_results(items, query):
     return diversify_search_results(ordered)
 
 async def search_news(items, query, max_results=25):
+    """Fast local/cache search for the first progressive result batch.
+
+    The critical optimization is to filter the cache before semantic
+    deduplication. This prevents an unrelated large cache from turning a simple
+    query into hundreds/thousands of pairwise event comparisons.
+    """
+    started = time.monotonic()
     q_tokens = tokenize(query)
     candidates = []
 
-    for item in deduplicate_news(items):
+    # Do NOT deduplicate the whole cache here. Relevance gates are much cheaper
+    # and normally reduce the working set dramatically.
+    for item in items:
         if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
             continue
         if not _country_anchor_match(item, query):
@@ -1556,16 +1556,28 @@ async def search_news(items, query, max_results=25):
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
-
         if title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
 
-    ranked = rank_search_results(candidates, query)[:max_results]
-    # Cached/local results use the same Arabic and hard-noise invariants as
-    # online discovery, so the progressive first batch cannot leak English.
-    ranked = await translate_news_titles(ranked, budget=min(1.2, SEARCH_TRANSLATION_BUDGET))
-    ranked = _post_translation_search_filter(ranked, query)
-    return rank_search_results(ranked, query)[:max_results]
+    if not candidates:
+        log.info("Local search timing query=%r cache=%d candidates=0 total=%.3fs", query, len(items), time.monotonic() - started)
+        return []
+
+    ranked = rank_search_results(deduplicate_news(candidates), query)[:max_results]
+
+    native_arabic = [item for item in ranked if not _needs_arabic_translation(item.title)]
+    foreign = [item for item in ranked if _needs_arabic_translation(item.title)]
+    foreign = foreign[:SEARCH_TRANSLATION_RESULT_CAP]
+    if foreign:
+        foreign = await translate_news_titles(foreign, budget=LOCAL_SEARCH_TRANSLATION_BUDGET)
+
+    ranked = _post_translation_search_filter(native_arabic + foreign, query)
+    result = rank_search_results(ranked, query)[:max_results]
+    log.info(
+        "Local search timing query=%r cache=%d candidates=%d result=%d total=%.3fs",
+        query, len(items), len(candidates), len(result), time.monotonic() - started,
+    )
+    return result
 
 async def hybrid_search_news(items, query, max_results=25):
     """

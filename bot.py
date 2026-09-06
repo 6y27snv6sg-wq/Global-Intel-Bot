@@ -9,13 +9,11 @@ import urllib.parse
 from collections import deque
 from typing import Any, Dict, List, Set
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     MessageHandler,
     filters,
 )
@@ -24,11 +22,12 @@ from google import genai
 from google.genai import types
 
 from news_engine import (
-    collect_news,
-    hybrid_search_news,
     build_ai_context,
-    is_topic_match,
+    collect_news,
     deduplicate_news,
+    is_topic_match,
+    search_news,
+    search_news_online,
 )
 
 try:
@@ -66,9 +65,8 @@ GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
 NEWS_COLLECTION_TIMEOUT = 25
-SEARCH_TIMEOUT = 14
+ONLINE_SEARCH_TIMEOUT = 6
 GEMINI_TIMEOUT = 35
-TRANSLATION_TIMEOUT = 18
 
 MAX_SEARCH_RESULTS = 25
 PER_PAGE = 5
@@ -85,11 +83,12 @@ ai_client = None
 if GEMINI_API_KEY:
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
-        log.info("Gemini layer enabled.")
+        log.info("Gemini analysis layer enabled.")
     except Exception:
-        log.exception("Failed to initialize Gemini.")
+        log.exception("Failed to initialize Gemini analysis layer.")
 else:
-    log.warning("GEMINI_API_KEY not found.")
+    log.warning("GEMINI_API_KEY not found; explicit analysis will be unavailable.")
+
 
 class SimpleCache:
     def __init__(self, ttl=300):
@@ -107,6 +106,9 @@ class SimpleCache:
         self._timestamps.pop(key, None)
         return None
 
+    def peek(self, key):
+        return self._cache.get(key)
+
     def set(self, key, value):
         if value is None:
             self._cache.pop(key, None)
@@ -115,9 +117,10 @@ class SimpleCache:
         self._cache[key] = value
         self._timestamps[key] = time.time()
 
+
 NEWS_CACHE = SimpleCache(CACHE_TTL)
-TRANSLATION_CACHE = SimpleCache(86400)
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
+USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
@@ -127,6 +130,7 @@ CUSTOM_EMOJI_IDS = {}
 URGENT_MONITOR_STARTED = False
 URGENT_BASELINE_READY = False
 URGENT_MONITOR_TASK = None
+BACKGROUND_TASKS: Set[asyncio.Task] = set()
 
 TOPICS = {
     "econ": (
@@ -201,31 +205,46 @@ SEARCH_ALIASES = {
     "اسرائيل": ["إسرائيل", "Israel"],
 }
 
+
 def register_user(user_id):
     ALERT_USERS.add(user_id)
+
 
 def safe_html(value):
     return html.escape(str(value or ""))
 
+
 def normalize_text(value):
     text = str(value or "").strip().lower()
     text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
-    for old, new in {"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ة":"ه","ؤ":"و","ئ":"ي"}.items():
+    for old, new in {
+        "أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي",
+        "ة": "ه", "ؤ": "و", "ئ": "ي",
+    }.items():
         text = text.replace(old, new)
     text = re.sub(r"[^\w\s\u0600-\u06FF-]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
+
 def get_item_title(item):
     return (getattr(item, "title", "") or getattr(item, "caption", "") or "").strip()
+
 
 def get_item_source(item):
     return (getattr(item, "source", "") or "مصدر إخباري").strip()
 
+
 def get_item_url(item):
     return (getattr(item, "url", "") or getattr(item, "link", "") or "").strip()
 
+
 def get_item_summary(item):
-    return (getattr(item, "summary", "") or getattr(item, "description", "") or "").strip()
+    return (
+        getattr(item, "summary", "")
+        or getattr(item, "description", "")
+        or ""
+    ).strip()
+
 
 def expand_search_query(query):
     normalized = normalize_text(query)
@@ -233,13 +252,16 @@ def expand_search_query(query):
     for key, aliases in SEARCH_ALIASES.items():
         if normalize_text(key) in normalized:
             values.extend(aliases)
-    seen, result = set(), []
+
+    seen = set()
+    result = []
     for value in values:
         marker = normalize_text(value)
         if marker and marker not in seen:
             seen.add(marker)
             result.append(value)
     return " ".join(result)
+
 
 def build_safe_link(title, source, raw_url):
     raw_url = str(raw_url or "").strip()
@@ -251,11 +273,16 @@ def build_safe_link(title, source, raw_url):
         f"{title} {source}".strip()
     )
 
+
 def visual(theme):
     try:
-        return custom_emoji_html(CUSTOM_EMOJI_IDS.get(theme), theme_emoji(theme))
+        return custom_emoji_html(
+            CUSTOM_EMOJI_IDS.get(theme),
+            theme_emoji(theme),
+        )
     except Exception:
         return ""
+
 
 def status_visual(status):
     try:
@@ -263,25 +290,28 @@ def status_visual(status):
     except Exception:
         return ""
 
+
+def track_task(coro, name):
+    task = asyncio.create_task(coro, name=name)
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
+
+
 async def initialize_custom_emoji_pack(application):
     global CUSTOM_EMOJI_IDS
     try:
         if CUSTOM_EMOJI_PACK:
             CUSTOM_EMOJI_IDS = await load_custom_emoji_ids(
-                application.bot, CUSTOM_EMOJI_PACK
+                application.bot,
+                CUSTOM_EMOJI_PACK,
             )
     except Exception:
         CUSTOM_EMOJI_IDS = {}
         log.exception("Custom emoji pack failed; fallback enabled.")
 
-async def send_status_theme(message, status):
-    return None
 
-async def get_fresh_news(force_refresh=False):
-    if not force_refresh:
-        cached = NEWS_CACHE.get("all_news")
-        if cached is not None:
-            return cached
+async def collect_and_cache_news():
     try:
         items = await asyncio.wait_for(
             collect_news(max_items=150),
@@ -289,25 +319,38 @@ async def get_fresh_news(force_refresh=False):
         )
         if items:
             NEWS_CACHE.set("all_news", items)
-        return items or []
+            return items
     except asyncio.TimeoutError:
-        log.warning("News collection timed out.")
-        return []
+        log.warning("News collection timed out; keeping last available cache.")
     except Exception:
-        log.exception("News collection failed.")
-        return []
+        log.exception("News collection failed; keeping last available cache.")
+    return NEWS_CACHE.peek("all_news") or []
+
+
+async def get_fresh_news(force_refresh=False):
+    if not force_refresh:
+        cached = NEWS_CACHE.get("all_news")
+        if cached is not None:
+            return cached
+
+    items = await collect_and_cache_news()
+    return items or []
+
 
 def topic_filter(items, topic_key, max_results=25):
     if topic_key not in TOPICS:
         return []
+
     scored = []
     for item in items:
         if not is_topic_match(item, topic_key):
             continue
+
         title = normalize_text(get_item_title(item))
         summary = normalize_text(get_item_summary(item))
         score = 0
         _, keywords = TOPICS[topic_key]
+
         for kw in keywords:
             nkw = normalize_text(kw)
             if not nkw:
@@ -316,92 +359,83 @@ def topic_filter(items, topic_key, max_results=25):
                 score += 12
             elif nkw in summary:
                 score += 4
+
         if topic_key == "urg":
             score += 20
         if topic_key == "forg" and getattr(item, "official", False):
             score += 12
-        scored.append((score + float(getattr(item, "relevance_score", 0) or 0), item))
+
+        score += float(getattr(item, "relevance_score", 0) or 0)
+        score += float(getattr(item, "trust_score", 0) or 0) * 0.03
+        scored.append((score, item))
+
     scored.sort(key=lambda x: x[0], reverse=True)
-    return deduplicate_news([item for _, item in scored[:max_results * 2]])[:max_results]
+    return deduplicate_news(
+        [item for _, item in scored[:max_results * 2]]
+    )[:max_results]
 
-async def translate_title(title):
-    title = (title or "").strip()
-    if not title:
-        return title
-    if re.search(r"[\u0600-\u06FF]", title) and not re.search(r"[A-Za-z]", title):
-        return title
-    key = normalize_text(title)
-    cached = TRANSLATION_CACHE.get(key)
-    if cached:
-        return cached
-    if not ai_client:
-        return title
-    prompt = (
-        "ترجم العنوان التالي إلى العربية الصحفية الطبيعية فقط. "
-        "لا تضف شرحاً ولا مقدمة ولا علامات اقتباس. حافظ على أسماء الأشخاص "
-        "والدول والأرقام والمعنى السياسي والاقتصادي والعسكري بدقة.\n\n"
-        f"{title}"
-    )
-    try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                ai_client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_level="low")
-                ),
-            ),
-            timeout=TRANSLATION_TIMEOUT,
-        )
-        translated = (getattr(response, "text", None) or "").strip()
-        if translated:
-            TRANSLATION_CACHE.set(key, translated)
-            return translated
-    except Exception:
-        log.exception("Title translation failed.")
-    return title
 
-async def prepare_display_titles(items):
-    pairs = await asyncio.gather(
-        *(translate_title(get_item_title(item)) for item in items),
-        return_exceptions=True,
-    )
-    result = {}
-    for item, value in zip(items, pairs):
-        title = get_item_title(item)
-        if isinstance(value, Exception) or not value:
-            result[id(item)] = title
-        else:
-            result[id(item)] = value
-    return result
-
-def generate_base_report(items, page=1, per_page=5, heading="📰 الأخبار", display_titles=None):
+def generate_base_report(
+    items,
+    page=1,
+    per_page=5,
+    heading="📰 الأخبار",
+    heading_html=None,
+    subheading=None,
+):
     start = max(0, (page - 1) * per_page)
     page_items = items[start:start + per_page]
-    display_titles = display_titles or {}
-    lines = [f"<b>{safe_html(heading)}</b>", ""]
+
+    if heading_html:
+        lines = [f"<b>{heading_html}</b>"]
+    else:
+        lines = [f"<b>{safe_html(heading)}</b>"]
+
+    if subheading:
+        lines.extend(["", safe_html(subheading)])
+
+    lines.append("")
+
     for item in page_items:
-        title = display_titles.get(id(item), get_item_title(item))
+        title = get_item_title(item)
         source = get_item_source(item)
         if not title:
             continue
-        safe_url = build_safe_link(get_item_title(item), source, get_item_url(item))
+
+        safe_url = build_safe_link(
+            get_item_title(item),
+            source,
+            get_item_url(item),
+        )
         lines.append(
             f"• <b>{safe_html(title)}</b>\n"
             f"  📍 المصدر: <code>{safe_html(source)}</code>\n"
             f'  <a href="{safe_html(safe_url)}">🔗 قراءة الخبر</a>'
         )
         lines.append("")
+
     return "\n".join(lines).strip()
+
 
 def result_keyboard(key, page, total_items):
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     nav = []
+
     if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ السابقة", callback_data=f"t:{key}:{page-1}"))
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ السابقة",
+                callback_data=f"t:{key}:{page-1}",
+            )
+        )
     if page < total_pages:
-        nav.append(InlineKeyboardButton("➕ المزيد", callback_data=f"t:{key}:{page+1}"))
+        nav.append(
+            InlineKeyboardButton(
+                "➕ المزيد",
+                callback_data=f"t:{key}:{page+1}",
+            )
+        )
+
     rows = [nav] if nav else []
     rows.append([
         InlineKeyboardButton("🧠 تحليل", callback_data=f"analyze:{key}"),
@@ -409,26 +443,44 @@ def result_keyboard(key, page, total_items):
     ])
     return InlineKeyboardMarkup(rows)
 
+
 def search_result_keyboard(user_id, page):
     results = USER_SEARCH_RESULTS.get(user_id, [])
     total_pages = max(1, (len(results) + PER_PAGE - 1) // PER_PAGE)
     nav = []
+
     if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ السابقة", callback_data=f"s:{page-1}"))
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ السابقة",
+                callback_data=f"s:{page-1}",
+            )
+        )
     if page < total_pages:
-        nav.append(InlineKeyboardButton("➕ المزيد", callback_data=f"s:{page+1}"))
+        nav.append(
+            InlineKeyboardButton(
+                "➕ المزيد",
+                callback_data=f"s:{page+1}",
+            )
+        )
+
     rows = [nav] if nav else []
-    rows.append([InlineKeyboardButton("🏠 مركز الأخبار", callback_data="home")])
+    rows.append([
+        InlineKeyboardButton("🏠 مركز الأخبار", callback_data="home")
+    ])
     return InlineKeyboardMarkup(rows)
+
 
 def main_keyboard(user_id):
     rows = []
     topic_items = list(TOPICS.items())
+
     for i in range(0, len(topic_items), 2):
         rows.append([
             InlineKeyboardButton(label, callback_data=f"t:{key}:1")
-            for key, (label, _) in topic_items[i:i+2]
+            for key, (label, _) in topic_items[i:i + 2]
         ])
+
     rows.append([
         InlineKeyboardButton(
             "🔔 التنبيهات" if user_id in MUTED_USERS else "🔕 التنبيهات",
@@ -440,6 +492,7 @@ def main_keyboard(user_id):
         InlineKeyboardButton("➕ المزيد", callback_data="more"),
     ])
     return InlineKeyboardMarkup(rows)
+
 
 ANALYSIS_PROMPT = """
 أنت محلل أخبار واستراتيجي معلومات.
@@ -454,9 +507,12 @@ ANALYSIS_PROMPT = """
 الحد الأقصى 120 كلمة.
 """
 
+
 async def analyze_with_gemini(items):
+    """The only normal news path allowed to call Gemini."""
     if not ai_client:
         return "ℹ️ طبقة التحليل غير متاحة حالياً، لكن جمع الأخبار والبحث يعملان."
+
     try:
         context = build_ai_context(items[:8])
         response = await asyncio.wait_for(
@@ -465,15 +521,20 @@ async def analyze_with_gemini(items):
                 model=GEMINI_MODEL,
                 contents=f"{ANALYSIS_PROMPT}\n\nالبيانات:\n{context}",
                 config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_level="low")
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="low"
+                    )
                 ),
             ),
             timeout=GEMINI_TIMEOUT,
         )
-        return (getattr(response, "text", None) or "").strip() or "⚠️ لم يُرجع التحليل نتيجة."
+        return (
+            getattr(response, "text", None) or ""
+        ).strip() or "⚠️ لم يُرجع التحليل نتيجة."
     except Exception:
         log.exception("Gemini analysis failed.")
         return "⚠️ تعذر التحليل بالذكاء الاصطناعي حالياً."
+
 
 URGENT_STRONG_TERMS = {
     "عاجل", "طارئ", "هجوم", "انفجار", "قصف", "صاروخ", "زلزال",
@@ -481,11 +542,13 @@ URGENT_STRONG_TERMS = {
     "اندلاع القتال", "اندلاع اشتباكات", "إطلاق النار", "اغتيال",
 }
 
+
 def urgent_score(item):
     title = normalize_text(get_item_title(item))
     summary = normalize_text(get_item_summary(item))
     score = 0
     strong = 0
+
     for term in URGENT_STRONG_TERMS:
         n = normalize_text(term)
         if n in title:
@@ -493,12 +556,18 @@ def urgent_score(item):
             strong += 1
         elif n in summary:
             score += 2
+
     if strong and getattr(item, "trust_score", 0) >= 70:
         score += 3
     return score
 
+
 def urgent_key(item):
-    return f"{normalize_text(get_item_title(item))}|{normalize_text(get_item_source(item))}"[:500]
+    return (
+        f"{normalize_text(get_item_title(item))}|"
+        f"{normalize_text(get_item_source(item))}"
+    )[:500]
+
 
 def find_new_urgent_news(items, limit=3):
     candidates = []
@@ -507,13 +576,20 @@ def find_new_urgent_news(items, limit=3):
         key = urgent_key(item)
         if score >= 8 and key and key not in SENT_URGENT_KEYS:
             candidates.append((score, item))
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in candidates[:limit]]
 
+
 async def format_urgent_alert(item):
-    title = await translate_title(get_item_title(item))
+    # Titles are already canonicalized/translated by news_engine.
+    title = get_item_title(item)
     source = get_item_source(item)
-    url = build_safe_link(get_item_title(item), source, get_item_url(item))
+    url = build_safe_link(
+        get_item_title(item),
+        source,
+        get_item_url(item),
+    )
     return (
         f"{visual('urgent')} <b>تنبيه عاجل</b>\n\n"
         f"<b>{safe_html(title)}</b>\n\n"
@@ -521,21 +597,26 @@ async def format_urgent_alert(item):
         f'<a href="{safe_html(url)}">🔗 قراءة الخبر</a>'
     )
 
+
 async def initialize_urgent_baseline():
     global URGENT_BASELINE_READY
     if URGENT_BASELINE_READY:
         return
+
     items = await get_fresh_news(force_refresh=True)
     for item in items:
         if urgent_score(item) >= 8:
             key = urgent_key(item)
             if key:
                 SENT_URGENT_KEYS.append(key)
+
     URGENT_BASELINE_READY = True
+
 
 async def urgent_monitor(application):
     await initialize_urgent_baseline()
     await asyncio.sleep(URGENT_INITIAL_DELAY)
+
     while True:
         try:
             if ALERT_USERS:
@@ -544,6 +625,7 @@ async def urgent_monitor(application):
                     key = urgent_key(item)
                     message = await format_urgent_alert(item)
                     delivered = False
+
                     for user_id in list(ALERT_USERS):
                         if user_id in MUTED_USERS:
                             continue
@@ -556,30 +638,46 @@ async def urgent_monitor(application):
                             )
                             delivered = True
                         except Exception:
-                            log.exception("Urgent alert send failed for %s", user_id)
+                            log.exception(
+                                "Urgent alert send failed for %s",
+                                user_id,
+                            )
+
                     if delivered:
                         SENT_URGENT_KEYS.append(key)
+
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Urgent monitor error.")
+
         await asyncio.sleep(URGENT_MONITOR_INTERVAL)
+
 
 async def post_init(application):
     global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
     if URGENT_MONITOR_STARTED:
         return
+
     URGENT_MONITOR_STARTED = True
     await initialize_custom_emoji_pack(application)
     URGENT_MONITOR_TASK = asyncio.create_task(
-        urgent_monitor(application), name="urgent-news-monitor"
+        urgent_monitor(application),
+        name="urgent-news-monitor",
     )
+
 
 async def post_stop(application):
     global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+
     task = URGENT_MONITOR_TASK
     URGENT_MONITOR_TASK = None
     URGENT_MONITOR_STARTED = False
+
+    for bg_task in list(BACKGROUND_TASKS):
+        if not bg_task.done():
+            bg_task.cancel()
+
     if task and not task.done():
         task.cancel()
         try:
@@ -587,38 +685,107 @@ async def post_stop(application):
         except asyncio.CancelledError:
             pass
 
+
 async def start(update, context):
     user = update.effective_user
     if not user or not update.message:
         return
+
     register_user(user.id)
     await update.message.reply_text(
-        f"{visual('world')} <b>مركز الأخبار</b>\n\n"
-        "اختر القطاع المطلوب لمتابعة التغطية الحية والمتخصصة.\n\n"
+        f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "الرصد العالمي نشط.\n"
+        "اختر مسار المتابعة، وستظهر الأخبار المتاحة أولاً "
+        "بينما تستمر التغطية في الخلفية.\n\n"
         "🚨 التنبيهات العاجلة تعمل تلقائياً ويمكن إيقافها.",
         reply_markup=main_keyboard(user.id),
         parse_mode="HTML",
     )
 
+
+async def send_topic_update(message, key, previous_results):
+    """Refresh a topic in the background and send only meaningful additions."""
+    try:
+        fresh = await get_fresh_news(force_refresh=True)
+        current = topic_filter(fresh, key, MAX_SEARCH_RESULTS)
+        if not current:
+            return
+
+        previous_keys = {urgent_key(item) for item in previous_results}
+        additions = [
+            item for item in current
+            if urgent_key(item) not in previous_keys
+        ]
+        additions = deduplicate_news(additions)[:PER_PAGE]
+
+        if not additions:
+            return
+
+        report = generate_base_report(
+            additions,
+            1,
+            PER_PAGE,
+            heading_html=(
+                f"{status_visual('monitoring')} "
+                f"{safe_html('تحديث التغطية')}"
+            ),
+            subheading=f"+{len(additions)} أخبار جديدة في {TOPICS[key][0]}",
+        )
+        await message.reply_text(
+            report,
+            disable_web_page_preview=True,
+            parse_mode="HTML",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Progressive topic update failed.")
+
+
 async def show_topic(query, user_id, key, page):
     lock = USER_LOCKS.setdefault(user_id, asyncio.Lock())
+
     if lock.locked():
         await query.answer("⏳ جاري التحميل...", show_alert=False)
         return
+
     await query.answer("📡 جاري تحميل الأخبار...", show_alert=False)
+
     async with lock:
         status = await query.message.reply_text(
-            f"{status_visual('monitoring')} جاري جمع وفرز الأخبار..."
+            f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
+            "◌ جاري تجهيز أقرب الأخبار المتاحة...",
+            parse_mode="HTML",
         )
+
         try:
-            items = await get_fresh_news()
+            cached = NEWS_CACHE.get("all_news")
+            items = cached if cached is not None else await get_fresh_news()
             results = topic_filter(items, key, MAX_SEARCH_RESULTS)
+
             if not results:
-                await status.edit_text("🔎 لا توجد أخبار مناسبة لهذا القسم حالياً.")
+                await status.edit_text(
+                    "🔎 لا توجد أخبار مناسبة لهذا القسم في البيانات "
+                    "المتاحة حالياً.\n\n"
+                    "📡 تستمر جولة الرصد التالية تلقائياً."
+                )
+                if cached is not None:
+                    track_task(
+                        send_topic_update(query.message, key, []),
+                        f"topic-refresh-{user_id}-{key}",
+                    )
                 return
-            display_titles = await prepare_display_titles(results[:MAX_SEARCH_RESULTS])
+
             report = generate_base_report(
-                results, page, PER_PAGE, TOPICS[key][0], display_titles
+                results,
+                page,
+                PER_PAGE,
+                heading=TOPICS[key][0],
+                subheading=(
+                    f"{len(results)} خبر متاح • "
+                    "التغطية الإضافية تستمر في الخلفية"
+                ),
             )
             await status.edit_text(
                 report,
@@ -626,18 +793,34 @@ async def show_topic(query, user_id, key, page):
                 disable_web_page_preview=True,
                 parse_mode="HTML",
             )
+
+            # If this came from cache, do not make the user wait for refresh.
+            # Refresh in the background and send only genuinely new stories.
+            if cached is not None and page == 1:
+                track_task(
+                    send_topic_update(query.message, key, results),
+                    f"topic-refresh-{user_id}-{key}",
+                )
+
         except Exception:
             log.exception("Topic handler failed.")
-            await status.edit_text("⚠️ حدث خطأ أثناء عرض البيانات.")
+            await status.edit_text(
+                "⚠️ تعذر تحديث هذا القسم الآن. "
+                "البوت مستمر ويمكنك فتح قسم آخر."
+            )
+
 
 async def show_search_page(query, user_id, page):
     results = USER_SEARCH_RESULTS.get(user_id, [])
     if not results:
         await query.message.reply_text("🔎 لا توجد نتائج بحث محفوظة.")
         return
-    display_titles = await prepare_display_titles(results)
+
     report = generate_base_report(
-        results, page, PER_PAGE, f"{status_visual('search')} نتائج البحث", display_titles
+        results,
+        page,
+        PER_PAGE,
+        heading=f"🔎 نتائج البحث: {USER_SEARCH_QUERY.get(user_id, '')}",
     )
     await query.message.reply_text(
         report,
@@ -646,11 +829,66 @@ async def show_search_page(query, user_id, page):
         parse_mode="HTML",
     )
 
+
+async def progressive_online_search(message, user_id, raw_query, query_text, local_results):
+    """Online discovery is additive; it can never erase or delay local results."""
+    try:
+        online = await asyncio.wait_for(
+            search_news_online(query_text, MAX_SEARCH_RESULTS),
+            timeout=ONLINE_SEARCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.info("Online search timed out; local results already delivered.")
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Online search failed; local results already delivered.")
+        return
+
+    if not online:
+        return
+
+    local_keys = {urgent_key(item) for item in local_results}
+    additions = [
+        item for item in deduplicate_news(online)
+        if urgent_key(item) not in local_keys
+    ]
+
+    if not additions:
+        return
+
+    merged = deduplicate_news(local_results + additions)[:MAX_SEARCH_RESULTS]
+    USER_SEARCH_RESULTS[user_id] = merged
+    USER_SEARCH_QUERY[user_id] = raw_query
+
+    first_additions = additions[:PER_PAGE]
+    report = generate_base_report(
+        first_additions,
+        1,
+        PER_PAGE,
+        heading_html=(
+            f"{status_visual('monitoring')} "
+            f"{safe_html('تحديث البحث')}"
+        ),
+        subheading=(
+            f"+{len(additions)} نتائج إضافية حديثة عن: {raw_query}"
+        ),
+    )
+    await message.reply_text(
+        report,
+        reply_markup=search_result_keyboard(user_id, 1),
+        disable_web_page_preview=True,
+        parse_mode="HTML",
+    )
+
+
 async def button_handler(update, context):
     query = update.callback_query
     user = update.effective_user
     if not query or not user:
         return
+
     user_id = user.id
     register_user(user_id)
     data = query.data or ""
@@ -658,10 +896,16 @@ async def button_handler(update, context):
     if data == "toggle_alerts":
         if user_id in MUTED_USERS:
             MUTED_USERS.discard(user_id)
-            await query.answer("🔔 تم تفعيل التنبيهات العاجلة.", show_alert=True)
+            await query.answer(
+                "🔔 تم تفعيل التنبيهات العاجلة.",
+                show_alert=True,
+            )
         else:
             MUTED_USERS.add(user_id)
-            await query.answer("🔕 تم إيقاف التنبيهات العاجلة.", show_alert=True)
+            await query.answer(
+                "🔕 تم إيقاف التنبيهات العاجلة.",
+                show_alert=True,
+            )
         try:
             await query.message.edit_reply_markup(main_keyboard(user_id))
         except Exception:
@@ -671,25 +915,48 @@ async def button_handler(update, context):
     if data == "home":
         await query.answer("🏠 مركز الأخبار")
         await query.message.reply_text(
-            "🌐 <b>مركز الأخبار</b>",
+            f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n\n"
+            "اختر القسم المطلوب. الأخبار المتاحة تظهر أولاً "
+            "والرصد يستمر في الخلفية.",
             reply_markup=main_keyboard(user_id),
             parse_mode="HTML",
         )
         return
 
     if data == "refresh":
-        await query.answer("🔄 جاري تحديث الأخبار...", show_alert=True)
-        NEWS_CACHE.set("all_news", None)
-        status = await query.message.reply_text("📡 جاري جلب آخر الأخبار...")
-        try:
-            items = await get_fresh_news(force_refresh=True)
-            await status.edit_text(
-                f"✅ تم تحديث الأخبار بنجاح ({len(items)} خبر).\n\nاختر القسم المطلوب.",
-                reply_markup=main_keyboard(user_id),
-            )
-        except Exception:
-            log.exception("Refresh failed.")
-            await status.edit_text("⚠️ حدث خطأ أثناء تحديث الأخبار.")
+        await query.answer("🔄 بدأ التحديث", show_alert=False)
+
+        cached = NEWS_CACHE.peek("all_news") or []
+        await query.message.reply_text(
+            f"{status_visual('monitoring')} <b>تحديث التغطية</b>\n\n"
+            f"● المتاح الآن: {len(cached)} خبر\n"
+            "◌ جاري توسيع التغطية في الخلفية...",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(user_id),
+        )
+
+        async def refresh_and_notify():
+            before = len(cached)
+            fresh = await get_fresh_news(force_refresh=True)
+            after = len(fresh)
+            try:
+                await query.message.reply_text(
+                    f"✅ <b>اكتملت جولة التحديث</b>\n\n"
+                    f"الأخبار المتاحة الآن: {after}"
+                    + (
+                        f"\n+{max(0, after - before)} إضافة جديدة"
+                        if after > before else ""
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=main_keyboard(user_id),
+                )
+            except Exception:
+                log.exception("Refresh completion message failed.")
+
+        track_task(
+            refresh_and_notify(),
+            f"manual-refresh-{user_id}",
+        )
         return
 
     if data == "more":
@@ -697,11 +964,21 @@ async def button_handler(update, context):
         await query.message.reply_text(
             "➕ <b>المزيد</b>\n\n"
             "اكتب مباشرة اسم دولة أو مدينة أو موضوع.\n\n"
-            "أمثلة:\nالسعودية\nالسعودية النفط\nبريطانيا\nألمانيا\nالبنك المركزي الأوروبي",
+            "أمثلة:\n"
+            "السعودية\n"
+            "السعودية النفط\n"
+            "بريطانيا\n"
+            "ألمانيا\n"
+            "البنك المركزي الأوروبي",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🏠 مركز الأخبار", callback_data="home")]]
-            ),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🏠 مركز الأخبار",
+                        callback_data="home",
+                    )
+                ]
+            ]),
         )
         return
 
@@ -711,6 +988,7 @@ async def button_handler(update, context):
         except ValueError:
             await query.answer("⚠️ صفحة غير صالحة.")
             return
+
         await query.answer("📄 جاري عرض النتائج...")
         await show_search_page(query, user_id, page)
         return
@@ -719,97 +997,150 @@ async def button_handler(update, context):
         key = data.split(":", 1)[1]
         if key not in TOPICS:
             return
+
         await query.answer("🧠 جاري تجهيز التحليل...")
-        status = await query.message.reply_text("🧠 جاري تحليل البيانات...")
+        status = await query.message.reply_text(
+            "🧠 جاري تحليل البيانات..."
+        )
+
         try:
             items = await get_fresh_news()
             results = topic_filter(items, key, 8)
             if not results:
-                await status.edit_text("⚠️ لا توجد بيانات كافية للتحليل.")
+                await status.edit_text(
+                    "⚠️ لا توجد بيانات كافية للتحليل."
+                )
                 return
+
             analysis = await analyze_with_gemini(results)
             await status.edit_text(
-                "🧠 <b>التحليل التنفيذي</b>\n\n" + safe_html(analysis),
+                "🧠 <b>التحليل التنفيذي</b>\n\n"
+                + safe_html(analysis),
                 parse_mode="HTML",
             )
         except Exception:
             log.exception("Analysis failed.")
-            await status.edit_text("⚠️ حدث خطأ أثناء التحليل.")
+            await status.edit_text(
+                "⚠️ حدث خطأ أثناء التحليل."
+            )
         return
 
     if data.startswith("t:"):
         parts = data.split(":")
         if len(parts) != 3:
             return
+
         _, key, page_text = parts
         if key not in TOPICS:
             return
+
         try:
             page = max(1, int(page_text))
         except ValueError:
             return
+
         await show_topic(query, user_id, key, page)
         return
+
 
 async def handle_user_message(update, context):
     if not update.message:
         return
+
     text = (update.message.text or "").strip()
     user = update.effective_user
     if not text or not user:
         return
+
     user_id = user.id
     register_user(user_id)
     lock = USER_LOCKS.setdefault(user_id, asyncio.Lock())
+
     if lock.locked():
-        await update.message.reply_text("⏳ يوجد بحث جارٍ حالياً...")
+        await update.message.reply_text(
+            "⏳ يوجد طلب جارٍ حالياً. ستظهر نتيجته فور توفرها."
+        )
         return
+
     async with lock:
         status = await update.message.reply_text(
-            f"{status_visual('search')} جاري البحث في كافة التغطيات عن:\n"
-            f"<b>{safe_html(text)}</b>...",
+            f"{status_visual('search')} <b>البحث: {safe_html(text)}</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "◌ تجهيز أقرب النتائج المتاحة...",
             parse_mode="HTML",
         )
+
         try:
-            items = await get_fresh_news()
             query_text = expand_search_query(text)
-            results = await asyncio.wait_for(
-                hybrid_search_news(items, query_text, MAX_SEARCH_RESULTS),
-                timeout=SEARCH_TIMEOUT,
+
+            # Never wait for a fresh global collection before showing local data.
+            cached = NEWS_CACHE.peek("all_news") or []
+            if not cached:
+                cached = await get_fresh_news()
+
+            local_results = await search_news(
+                cached,
+                query_text,
+                MAX_SEARCH_RESULTS,
             )
-            if not results:
-                fresh = await get_fresh_news(force_refresh=True)
-                results = await asyncio.wait_for(
-                    hybrid_search_news(fresh, query_text, MAX_SEARCH_RESULTS),
-                    timeout=SEARCH_TIMEOUT,
+            local_results = deduplicate_news(local_results)
+
+            USER_SEARCH_QUERY[user_id] = text
+
+            if local_results:
+                USER_SEARCH_RESULTS[user_id] = local_results
+                report = generate_base_report(
+                    local_results,
+                    1,
+                    PER_PAGE,
+                    heading=f"🔎 نتائج البحث: {text}",
+                    subheading=(
+                        f"{len(local_results)} نتيجة متاحة الآن • "
+                        "البحث العالمي مستمر"
+                    ),
                 )
-            if not results:
-                USER_SEARCH_RESULTS.pop(user_id, None)
-                await status.edit_text("🔎 لم أجد نتائج مطابقة لبحثك.")
-                return
-            USER_SEARCH_RESULTS[user_id] = deduplicate_news(results)
-            display_titles = await prepare_display_titles(USER_SEARCH_RESULTS[user_id])
-            report = generate_base_report(
-                USER_SEARCH_RESULTS[user_id],
-                1,
-                PER_PAGE,
-                f"🔎 نتائج البحث: {text}",
-                display_titles,
+                await status.edit_text(
+                    report,
+                    reply_markup=search_result_keyboard(user_id, 1),
+                    disable_web_page_preview=True,
+                    parse_mode="HTML",
+                )
+            else:
+                USER_SEARCH_RESULTS[user_id] = []
+                await status.edit_text(
+                    f"🔎 <b>{safe_html(text)}</b>\n\n"
+                    "لم تظهر نتيجة محلية بعد.\n"
+                    "📡 جاري توسيع البحث العالمي...",
+                    parse_mode="HTML",
+                )
+
+            # Online discovery runs after the first response and never blocks it.
+            track_task(
+                progressive_online_search(
+                    update.message,
+                    user_id,
+                    text,
+                    query_text,
+                    local_results,
+                ),
+                f"online-search-{user_id}",
             )
-            await status.edit_text(
-                report,
-                reply_markup=search_result_keyboard(user_id, 1),
-                disable_web_page_preview=True,
-                parse_mode="HTML",
-            )
-        except asyncio.TimeoutError:
-            await status.edit_text("⏳ البحث استغرق وقتاً أطول من المتوقع. حاول مرة أخرى.")
+
         except Exception:
             log.exception("Search failed.")
-            await status.edit_text("⚠️ حدث خطأ أثناء البحث.")
+            await status.edit_text(
+                "⚠️ تعذر تنفيذ هذا البحث الآن. "
+                "البوت مستمر ويمكنك المحاولة بعبارة أخرى."
+            )
+
 
 async def error_handler(update, context):
-    log.error("Unhandled Telegram error: %r", context.error, exc_info=True)
+    log.error(
+        "Unhandled Telegram error: %r",
+        context.error,
+        exc_info=True,
+    )
+
 
 def main():
     application = (
@@ -819,15 +1150,22 @@ def main():
         .post_stop(post_stop)
         .build()
     )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(
         CallbackQueryHandler(
             button_handler,
-            pattern=r"^(t:.*|s:\d+|home|refresh|more|toggle_alerts|analyze:.*)$",
+            pattern=(
+                r"^(t:.*|s:\d+|home|refresh|more|"
+                r"toggle_alerts|analyze:.*)$"
+            ),
         )
     )
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_user_message,
+        )
     )
     application.add_error_handler(error_handler)
 
@@ -836,7 +1174,9 @@ def main():
         "RAILWAY_PUBLIC_DOMAIN",
         "worker-production-347b.up.railway.app",
     )
-    webhook_path = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()
+    webhook_path = hashlib.sha256(
+        BOT_TOKEN.encode("utf-8")
+    ).hexdigest()
     webhook_url = f"https://{public_domain}/{webhook_path}"
 
     log.info("Starting Telegram webhook on port %s", port)
@@ -848,6 +1188,7 @@ def main():
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
+
 
 if __name__ == "__main__":
     main()

@@ -892,8 +892,10 @@ async def search_news_online(query, max_results=25):
     if not items:
         return []
 
-    # Translation is non-Gemini and best effort.
-    items = await translate_news_titles(items)
+    # IMPORTANT PERFORMANCE RULE:
+    # Filter and rank BEFORE translation. Translating every raw Google News
+    # candidate was the main avoidable cost on the user-facing search path.
+    # The bot only needs translated titles for the small final result set.
     items = [
         item for item in deduplicate_news(items)
         if not _is_digest(item.title)
@@ -919,7 +921,12 @@ async def search_news_online(query, max_results=25):
         if title_hits or original_hits or summary_hits >= 2:
             filtered.append(item)
 
-    return filtered[:max_results]
+    # Translate only the final bounded result set, never the full raw feed.
+    final_items = filtered[:max_results]
+    final_items = await translate_news_titles(final_items)
+
+    # Re-rank after translation so Arabic canonical titles can improve ordering.
+    return rank_search_results(final_items, query)[:max_results]
 
 def rank_search_results(items, query):
     q_tokens = tokenize(query)

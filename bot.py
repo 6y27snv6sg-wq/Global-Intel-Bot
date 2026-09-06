@@ -67,6 +67,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
 CALLBACK_ACK_TIMEOUT = 1.5
+CALLBACK_DEDUP_TTL = 60
+CALLBACK_ACTION_DEBOUNCE = 5
 GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
@@ -133,6 +135,8 @@ URGENT_BASELINE_READY = False
 URGENT_MONITOR_TASK = None
 BACKGROUND_TASKS: Set[asyncio.Task] = set()
 NEWS_COLLECTION_TASK = None
+SEEN_CALLBACK_IDS: Dict[str, float] = {}
+RECENT_CALLBACK_ACTIONS: Dict[str, float] = {}
 
 TOPICS = {
     "econ": (
@@ -313,6 +317,44 @@ async def safe_query_answer(query, text=None, show_alert=False):
     except Exception as exc:
         log.info("Callback acknowledgement failed; continuing action: %s", type(exc).__name__)
     return False
+
+
+def claim_callback(query, user_id, data):
+    """Return True exactly once for a callback delivery/action within the debounce window."""
+    now = time.monotonic()
+
+    # Prune occasionally so the dictionaries stay bounded during long runtimes.
+    if len(SEEN_CALLBACK_IDS) > 512:
+        cutoff = now - CALLBACK_DEDUP_TTL
+        for key, seen_at in list(SEEN_CALLBACK_IDS.items()):
+            if seen_at < cutoff:
+                SEEN_CALLBACK_IDS.pop(key, None)
+
+    if len(RECENT_CALLBACK_ACTIONS) > 512:
+        cutoff = now - CALLBACK_ACTION_DEBOUNCE
+        for key, seen_at in list(RECENT_CALLBACK_ACTIONS.items()):
+            if seen_at < cutoff:
+                RECENT_CALLBACK_ACTIONS.pop(key, None)
+
+    callback_id = str(getattr(query, "id", "") or "").strip()
+    if callback_id:
+        seen_at = SEEN_CALLBACK_IDS.get(callback_id)
+        if seen_at is not None and now - seen_at < CALLBACK_DEDUP_TTL:
+            log.info("Duplicate callback delivery ignored: %s", data)
+            return False
+        SEEN_CALLBACK_IDS[callback_id] = now
+
+    message = getattr(query, "message", None)
+    chat_id = getattr(getattr(message, "chat", None), "id", "")
+    message_id = getattr(message, "message_id", "")
+    action_key = f"{user_id}:{chat_id}:{message_id}:{data}"
+    seen_at = RECENT_CALLBACK_ACTIONS.get(action_key)
+    if seen_at is not None and now - seen_at < CALLBACK_ACTION_DEBOUNCE:
+        log.info("Repeated callback action ignored: %s", data)
+        return False
+
+    RECENT_CALLBACK_ACTIONS[action_key] = now
+    return True
 
 
 async def initialize_custom_emoji_pack(application):
@@ -1017,6 +1059,9 @@ async def button_handler(update, context):
     register_user(user_id)
     data = query.data or ""
     log.info("Callback received: %s", data)
+
+    if not claim_callback(query, user_id, data):
+        return
 
     if data == "toggle_alerts":
         if user_id in MUTED_USERS:

@@ -21,7 +21,8 @@ FETCH_CONNECT_TIMEOUT = 2
 COLLECTION_CONCURRENCY = 20
 MAX_FEED_ITEMS = 30
 MAX_ONLINE_QUERIES = 6
-ONLINE_SEARCH_BUDGET = 5
+ONLINE_SEARCH_BUDGET = 4
+SEARCH_TRANSLATION_BUDGET = 1.5
 DISCOVERY_BUDGET = 6
 ROTATION_WINDOW_SECONDS = 300
 
@@ -944,7 +945,7 @@ def _content_value_adjustment(item, query):
     protocol = any(normalize_text(x) in title for x in PROTOCOL_TERMS)
 
     if sport:
-        delta += 22 if intent == "sport" else -28
+        delta += 24 if intent == "sport" else -40
     if culture:
         delta += 18 if intent == "culture" else -12
     if protocol and intent == "general":
@@ -1029,19 +1030,36 @@ def _is_non_article_result(item):
     return False
 
 
+def _known_country_names():
+    """All configured country names, including compound names, as full entities."""
+    names = set(COUNTRY_EN.keys())
+    for places in REGIONS.values():
+        names.update(places)
+    return {normalize_text(x) for x in names if normalize_text(x)}
+
+
 def _query_country_terms(query):
-    """Return high-signal country aliases present in the user's query."""
+    """Return full country/entity aliases present in the query.
+
+    Compound names remain atomic: "جنوب أفريقيا" never degrades to matching
+    "جنوب" or "أفريقيا" separately.
+    """
     nq = normalize_text(query)
     terms = set()
+
+    for ar_name in _known_country_names():
+        if ar_name and ar_name in nq:
+            terms.add(ar_name)
 
     for ar_name, en_name in COUNTRY_EN.items():
         ar = normalize_text(ar_name)
         en = normalize_text(en_name)
         if (ar and ar in nq) or (en and en in nq):
-            terms.add(ar)
-            terms.add(en)
+            if ar:
+                terms.add(ar)
+            if en:
+                terms.add(en)
 
-    # Common Saudi variants that appear in Arabic/English headlines.
     if "السعود" in nq or "saudi" in nq:
         terms.update({
             normalize_text("السعودية"),
@@ -1050,11 +1068,18 @@ def _query_country_terms(query):
             normalize_text("Saudi"),
         })
 
+    # Generic short entity query fallback. This makes the engine work for
+    # countries not hard-coded in COUNTRY_EN without splitting compound names.
+    if not terms and _query_intent(query) == "general":
+        q_words = [x for x in nq.split() if x]
+        if 1 <= len(q_words) <= 4:
+            terms.add(nq)
+
     return {x for x in terms if x}
 
 
 def _country_anchor_match(item, query):
-    """For country searches, require the article itself to mention that country."""
+    """Require the complete country/entity phrase, never a partial token."""
     terms = _query_country_terms(query)
     if not terms:
         return True
@@ -1063,6 +1088,33 @@ def _country_anchor_match(item, query):
         f"{item.title} {item.original_title} {item.summary}"
     )
     return any(term in haystack for term in terms)
+
+
+def _country_centrality_score(item, query):
+    """Measure whether the searched country/entity is the subject or a side detail."""
+    terms = _query_country_terms(query)
+    if not terms:
+        return 0.0
+
+    title = normalize_text(item.title)
+    original = normalize_text(item.original_title)
+    summary = normalize_text(item.summary)
+
+    best = -30.0
+    for term in terms:
+        if not term:
+            continue
+        for value, base in ((title, 28.0), (original, 24.0)):
+            pos = value.find(term)
+            if pos >= 0:
+                length = max(1, len(value))
+                relative = pos / length
+                positional = 18.0 if relative <= 0.18 else (8.0 if relative <= 0.50 else 0.0)
+                best = max(best, base + positional)
+        if term in summary:
+            best = max(best, 8.0)
+
+    return best
 
 
 def parse_entry(entry, source, category="general"):
@@ -1217,7 +1269,15 @@ async def search_news_online(query, max_results=25):
 
     # Translate only the final bounded result set, never the full raw feed.
     final_items = filtered[:max_results]
-    final_items = await translate_news_titles(final_items)
+    try:
+        final_items = await asyncio.wait_for(
+            translate_news_titles(final_items),
+            timeout=SEARCH_TRANSLATION_BUDGET,
+        )
+    except asyncio.TimeoutError:
+        # Search must finish on time; untranslated titles are preferable to a
+        # hanging UI. Translation can never hold the result page hostage.
+        log.warning("Search title translation budget exceeded; using available titles.")
 
     # Re-rank after translation so Arabic canonical titles can improve ordering.
     return rank_search_results(final_items, query)[:max_results]
@@ -1230,7 +1290,7 @@ def _source_bucket(item):
     return source or domain or "unknown"
 
 
-def diversify_search_results(items, first_window=10, per_source=2):
+def diversify_search_results(items, first_window=5, per_source=1):
     """Prevent one publisher from monopolizing the leading search results.
 
     This reorders; it does not delete. Deferred stories remain available later.
@@ -1294,6 +1354,7 @@ def rank_search_results(items, query):
             + (18 if item.official else 0)
             + item.trust_score * 0.08
             + _content_value_adjustment(item, query)
+            + _country_centrality_score(item, query)
         )
 
         # Freshness matters, but it must not overpower relevance/news value.
@@ -1305,9 +1366,9 @@ def rank_search_results(items, query):
                 pass
 
         if _country_anchor_match(item, query):
-            score += 8
+            score += 12
         else:
-            score -= 40
+            score -= 80
 
         item.relevance_score = score
         published_ts = item.published.timestamp() if item.published else 0
@@ -1369,6 +1430,9 @@ async def hybrid_search_news(items, query, max_results=25):
     filtered = []
 
     for item in ranked:
+        if _hard_low_value(item) or not _country_anchor_match(item, query):
+            continue
+
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))

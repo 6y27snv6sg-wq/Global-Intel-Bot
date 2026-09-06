@@ -1,7 +1,6 @@
 import asyncio
 import html
 import logging
-import os
 import re
 import time
 import urllib.parse
@@ -184,371 +183,6 @@ REGIONS = {
     ],
 }
 
-ECON_TERMS = [
-    "اقتصاد",
-    "اقتصادي",
-    "أسواق",
-    "سوق",
-    "أسهم",
-    "سهم",
-    "بورصة",
-    "الذهب",
-    "فائدة",
-    "عملات",
-    "دولار",
-    "بيتكوين",
-    "تداول",
-    "نفط",
-    "أوبك",
-    "خام",
-    "تضخم",
-    "برنت",
-    "طاقة",
-    "غاز",
-    "استثمار",
-    "سندات",
-    "ميزانية",
-    "ناتج محلي",
-    "بنك مركزي",
-    "صادرات",
-    "واردات",
-    "أسعار المستهلك",
-    "أسعار المنتجين",
-    "استحواذ",
-    "أرباح",
-    "oil",
-    "crude",
-    "opec",
-    "brent",
-    "energy",
-    "natural gas",
-    "lng",
-    "economy",
-    "economic",
-    "markets",
-    "market",
-    "stocks",
-    "equities",
-    "stock exchange",
-    "inflation",
-    "interest rates",
-    "gold",
-    "dollar",
-    "usd",
-    "bitcoin",
-    "crypto",
-    "investment",
-    "bonds",
-    "budget",
-    "gdp",
-    "central bank",
-    "exports",
-    "imports",
-    "earnings",
-    "acquisition",
-]
-
-ECON_EXCLUDE = [
-    "إنقاذ",
-    "انقاذ",
-    "زلزال",
-    "وفاة",
-    "تعازي",
-    "يعزي",
-    "يعزّي",
-    "حادث",
-    "غرق",
-    "انتشال",
-    "إنقاذ عمال",
-    "منجم",
-    "نفق",
-    "فيضانات",
-    "طقس",
-    "rescue",
-    "earthquake",
-    "death",
-    "funeral",
-    "accident",
-    "drowning",
-    "flood",
-    "weather",
-]
-
-SECURITY_TERMS = [
-    "عسكري",
-    "جيش",
-    "قوات",
-    "دفاع",
-    "أمن",
-    "الأمن القومي",
-    "تسليح",
-    "أسلحة",
-    "سلاح",
-    "صاروخ",
-    "صواريخ",
-    "قصف",
-    "غارة",
-    "غارات",
-    "هجوم",
-    "اشتباك",
-    "مناورات",
-    "قاعدة عسكرية",
-    "طيران عسكري",
-    "مقاتلات",
-    "طائرات مسيرة",
-    "ذخائر",
-    "دفاع جوي",
-    "عملية عسكرية",
-    "عمليات عسكرية",
-    "قوات خاصة",
-    "استهداف",
-    "إطلاق النار",
-    "قتال",
-    "معارك",
-    "أسطول",
-    "military",
-    "army",
-    "forces",
-    "defense",
-    "defence",
-    "security",
-    "weapons",
-    "weapon",
-    "missile",
-    "missiles",
-    "airstrike",
-    "strike",
-    "attack",
-    "fighting",
-    "battle",
-    "battles",
-    "combat",
-    "drone",
-    "drones",
-    "ammunition",
-    "air defense",
-    "military operation",
-    "troops",
-    "navy",
-    "warship",
-]
-
-SECURITY_SOCIAL_EXCLUDE = [
-    "يعزي",
-    "يعزّي",
-    "تعازي",
-    "وفاة والده",
-    "وفاة والدته",
-    "وفاة شقيق",
-    "وفاة عمه",
-    "تهنئة",
-    "ترقية",
-    "تعيين",
-    "استقبال",
-    "زيارة تفقدية",
-    "احتفال",
-    "condolences",
-    "condolence",
-    "promotion",
-    "appointment",
-    "welcomes",
-    "ceremony",
-    "inspection visit",
-]
-
-# كلمات تدل على وجود جهة حكومية أو مسؤول رسمي.
-# وجودها وحده لا يعني أن الخبر "بيان رسمي".
-OFFICIAL_ENTITY_TERMS = [
-    "وزارة",
-    "وزارة الخارجية",
-    "وزارة الدفاع",
-    "وزارة الداخلية",
-    "وزارة المالية",
-    "وزارة الطاقة",
-    "وزارة الصحة",
-    "وزارة الإعلام",
-    "الخارجية",
-    "الوزير",
-    "السفير",
-    "السفارة",
-    "المبعوث",
-    "الرئاسة",
-    "الرئيس",
-    "رئيس الوزراء",
-    "رئاسة الوزراء",
-    "الديوان الملكي",
-    "الحكومة",
-    "المتحدث",
-    "government",
-    "ministry",
-    "minister",
-    "foreign ministry",
-    "defense ministry",
-    "defence ministry",
-    "ambassador",
-    "embassy",
-    "envoy",
-    "president",
-    "prime minister",
-    "spokesperson",
-]
-
-# لغة التصريح/الموقف/الإجراء الرسمي.
-# هذه هي التي تميز الخبر الرسمي الحقيقي عن مجرد خبر عن اجتماع أو لقاء.
-OFFICIAL_ACTION_TERMS = [
-    "بيان",
-    "بيان رسمي",
-    "بيان صحفي",
-    "تصريح",
-    "تصريح رسمي",
-    "تصريح صحفي",
-    "المتحدث الرسمي",
-    "المتحدث باسم",
-    "مصدر مسؤول",
-    "قال",
-    "قالت",
-    "أكد",
-    "أكدت",
-    "يؤكد",
-    "تؤكد",
-    "أعلن",
-    "أعلنت",
-    "يعلن",
-    "تعلن",
-    "صرح",
-    "صرحت",
-    "أوضح",
-    "أوضحت",
-    "شدد",
-    "شددت",
-    "دعا",
-    "دعت",
-    "حذر",
-    "حذرت",
-    "ندد",
-    "نددت",
-    "رحب",
-    "رحبت",
-    "يدعم",
-    "تدعم",
-    "دعم",
-    "توجيه",
-    "توجيهات",
-    "وجه",
-    "وجهت",
-    "يوجه",
-    "توجه",
-    "أصدر",
-    "أصدرت",
-    "أصدر بيانًا",
-    "أصدرت بيانًا",
-    "اعتماد",
-    "اعتمد",
-    "اعتمدت",
-    "official statement",
-    "press statement",
-    "press release",
-    "statement",
-    "spokesperson",
-    "said",
-    "says",
-    "announced",
-    "announces",
-    "confirmed",
-    "confirms",
-    "stated",
-    "states",
-    "declared",
-    "called for",
-    "warned",
-    "welcomed",
-    "supported",
-    "supports",
-    "directed",
-    "orders",
-    "ordered",
-    "issued",
-]
-
-# هذه العبارات تجعل الخبر أقرب إلى تحقق/شائعة/تفنيد،
-# ولا ينبغي أن يدخل قسم البيانات الرسمية لمجرد ذكر وزارة أو وثيقة.
-OFFICIAL_EXCLUDE_TERMS = [
-    "ما حقيقة",
-    "حقيقة الوثيقة",
-    "وثيقة متداولة",
-    "وثيقة مزعومة",
-    "وثيقة مزورة",
-    "وثيقة مفبركة",
-    "يزعم أنها",
-    "يزعم أنه",
-    "المتداول",
-    "متداول",
-    "شائعة",
-    "شائعات",
-    "تحقق",
-    "تدقيق",
-    "نفى صحة",
-    "نفي صحة",
-    "هل صحيح",
-    "fact check",
-    "fact-check",
-    "rumor",
-    "rumour",
-    "alleged",
-    "purported",
-    "verification",
-    "misinformation",
-    "fake document",
-]
-
-URGENT_TERMS = [
-    "عاجل",
-    "طارئ",
-    "هجوم",
-    "انفجار",
-    "قصف",
-    "صاروخ",
-    "زلزال",
-    "اشتباك",
-    "غارة",
-    "إخلاء",
-    "حالة طوارئ",
-    "تحذير عاجل",
-    "استهداف",
-    "غارات",
-    "إطلاق النار",
-    "breaking",
-    "urgent",
-    "attack",
-    "explosion",
-    "airstrike",
-    "missile",
-    "earthquake",
-    "evacuation",
-    "emergency",
-    "warning",
-    "strike",
-    "gunfire",
-]
-
-# Generic digest/roundup articles are not individual news events.
-DIGEST_TERMS = [
-    "أهم الأخبار",
-    "أبرز الأخبار",
-    "حصاد الأخبار",
-    "موجز الأخبار",
-    "أخبار العالم حتى",
-    "أهم الأخبار العالمية والعربية",
-    "most important news",
-    "top news",
-    "news roundup",
-    "world news roundup",
-    "top stories",
-    "daily roundup",
-    "news digest",
-    "latest news roundup",
-]
-
 COUNTRY_EN = {
     "السعودية": "Saudi Arabia",
     "الإمارات": "United Arab Emirates",
@@ -589,6 +223,140 @@ COUNTRY_EN = {
     "نيبال": "Nepal",
 }
 
+COUNTRY_ALIASES = {
+    "Saudi Arabia": "السعودية",
+    "United Arab Emirates": "الإمارات",
+    "Qatar": "قطر",
+    "Kuwait": "الكويت",
+    "Bahrain": "البحرين",
+    "Oman": "عمان",
+    "Yemen": "اليمن",
+    "Iraq": "العراق",
+    "Iran": "إيران",
+    "Syria": "سوريا",
+    "Lebanon": "لبنان",
+    "Jordan": "الأردن",
+    "Palestine": "فلسطين",
+    "Israel": "إسرائيل",
+    "Egypt": "مصر",
+    "Turkey": "تركيا",
+    "China": "الصين",
+    "Japan": "اليابان",
+    "India": "الهند",
+    "Russia": "روسيا",
+    "Ukraine": "أوكرانيا",
+    "United Kingdom": "بريطانيا",
+    "France": "فرنسا",
+    "Germany": "ألمانيا",
+    "Italy": "إيطاليا",
+    "Spain": "إسبانيا",
+    "United States": "الولايات المتحدة",
+    "Canada": "كندا",
+    "Mexico": "المكسيك",
+    "Brazil": "البرازيل",
+    "Argentina": "الأرجنتين",
+    "Colombia": "كولومبيا",
+    "Venezuela": "فنزويلا",
+    "Sudan": "السودان",
+    "Nepal": "نيبال",
+}
+
+ECON_TERMS = [
+    "اقتصاد", "اقتصادي", "أسواق", "سوق", "أسهم", "سهم", "بورصة",
+    "الذهب", "فائدة", "عملات", "دولار", "بيتكوين", "تداول", "نفط",
+    "أوبك", "خام", "تضخم", "برنت", "طاقة", "غاز", "استثمار", "سندات",
+    "ميزانية", "ناتج محلي", "بنك مركزي", "صادرات", "واردات",
+    "أسعار المستهلك", "أسعار المنتجين", "استحواذ", "أرباح",
+    "oil", "crude", "opec", "brent", "energy", "natural gas", "lng",
+    "economy", "economic", "markets", "market", "stocks", "equities",
+    "stock exchange", "inflation", "interest rates", "gold", "dollar",
+    "usd", "bitcoin", "crypto", "investment", "bonds", "budget", "gdp",
+    "central bank", "exports", "imports", "earnings", "acquisition",
+]
+
+ECON_EXCLUDE = [
+    "إنقاذ", "انقاذ", "زلزال", "وفاة", "تعازي", "يعزي", "يعزّي",
+    "حادث", "غرق", "انتشال", "إنقاذ عمال", "منجم", "نفق", "فيضانات",
+    "طقس", "rescue", "earthquake", "death", "funeral", "accident",
+    "drowning", "flood", "weather",
+]
+
+SECURITY_TERMS = [
+    "عسكري", "جيش", "قوات", "دفاع", "أمن", "الأمن القومي", "تسليح",
+    "أسلحة", "سلاح", "صاروخ", "صواريخ", "قصف", "غارة", "غارات", "هجوم",
+    "اشتباك", "مناورات", "قاعدة عسكرية", "طيران عسكري", "مقاتلات",
+    "طائرات مسيرة", "ذخائر", "دفاع جوي", "عملية عسكرية",
+    "عمليات عسكرية", "قوات خاصة", "استهداف", "إطلاق النار", "قتال",
+    "معارك", "أسطول",
+    "military", "army", "forces", "defense", "defence", "security",
+    "weapons", "weapon", "missile", "missiles", "airstrike", "strike",
+    "attack", "fighting", "battle", "battles", "combat", "drone",
+    "drones", "ammunition", "air defense", "military operation",
+    "troops", "navy", "warship",
+]
+
+SECURITY_SOCIAL_EXCLUDE = [
+    "يعزي", "يعزّي", "تعازي", "وفاة والده", "وفاة والدته",
+    "وفاة شقيق", "وفاة عمه", "تهنئة", "ترقية", "تعيين", "استقبال",
+    "زيارة تفقدية", "احتفال", "condolences", "condolence",
+    "promotion", "appointment", "welcomes", "ceremony", "inspection visit",
+]
+
+OFFICIAL_ENTITY_TERMS = [
+    "وزارة", "وزارة الخارجية", "وزارة الدفاع", "وزارة الداخلية",
+    "وزارة المالية", "وزارة الطاقة", "وزارة الصحة", "وزارة الإعلام",
+    "الخارجية", "الوزير", "السفير", "السفارة", "المبعوث", "الرئاسة",
+    "الرئيس", "رئيس الوزراء", "رئاسة الوزراء", "الديوان الملكي",
+    "الحكومة", "المتحدث",
+    "government", "ministry", "minister", "foreign ministry",
+    "defense ministry", "defence ministry", "ambassador", "embassy",
+    "envoy", "president", "prime minister", "spokesperson",
+]
+
+OFFICIAL_ACTION_TERMS = [
+    "بيان", "بيان رسمي", "بيان صحفي", "تصريح", "تصريح رسمي",
+    "تصريح صحفي", "المتحدث الرسمي", "المتحدث باسم", "مصدر مسؤول",
+    "قال", "قالت", "أكد", "أكدت", "يؤكد", "تؤكد", "أعلن", "أعلنت",
+    "يعلن", "تعلن", "صرح", "صرحت", "أوضح", "أوضحت", "شدد", "شددت",
+    "دعا", "دعت", "حذر", "حذرت", "ندد", "نددت", "رحب", "رحبت",
+    "يدعم", "تدعم", "دعم", "توجيه", "توجيهات", "وجه", "وجهت",
+    "يوجه", "توجه", "أصدر", "أصدرت", "اعتماد", "اعتمد", "اعتمدت",
+    "أطلق", "أطلقت", "يطلق", "تطلق", "إطلاق", "دشن", "دشنت",
+    "تدشين", "افتتح", "افتتحت", "افتتاح", "وقع", "وقعت", "توقيع",
+    "launch", "launched", "unveils", "unveiled", "introduces",
+    "introduced", "signs", "signed", "official statement",
+    "press statement", "press release", "statement", "spokesperson",
+    "said", "says", "announced", "announces", "confirmed", "confirms",
+    "stated", "states", "declared", "called for", "warned", "welcomed",
+    "supported", "supports", "directed", "orders", "ordered", "issued",
+]
+
+OFFICIAL_EXCLUDE_TERMS = [
+    "ما حقيقة", "حقيقة الوثيقة", "وثيقة متداولة", "وثيقة مزعومة",
+    "وثيقة مزورة", "وثيقة مفبركة", "يزعم أنها", "يزعم أنه", "المتداول",
+    "متداول", "شائعة", "شائعات", "تحقق", "تدقيق", "نفى صحة", "نفي صحة",
+    "هل صحيح", "حول بيان", "بشأن بيان", "تقرير عن بيان",
+    "تقرير حول بيان", "قراءة في بيان", "تحليل بيان", "تعليق على بيان",
+    "fact check", "fact-check", "rumor", "rumour", "alleged",
+    "purported", "verification", "misinformation", "fake document",
+]
+
+URGENT_TERMS = [
+    "عاجل", "طارئ", "هجوم", "انفجار", "قصف", "صاروخ", "زلزال",
+    "اشتباك", "غارة", "إخلاء", "حالة طوارئ", "تحذير عاجل", "استهداف",
+    "غارات", "إطلاق النار", "breaking", "urgent", "attack", "explosion",
+    "airstrike", "missile", "earthquake", "evacuation", "emergency",
+    "warning", "strike", "gunfire",
+]
+
+DIGEST_TERMS = [
+    "أهم الأخبار", "أبرز الأخبار", "حصاد الأخبار", "موجز الأخبار",
+    "أخبار العالم حتى", "أهم الأخبار العالمية والعربية",
+    "most important news", "top news", "news roundup",
+    "world news roundup", "top stories", "daily roundup",
+    "news digest", "latest news roundup",
+]
+
 QUERY_ALIASES = {
     "نفط": ["oil", "crude oil", "brent", "opec"],
     "النفط": ["oil", "crude oil", "brent", "opec"],
@@ -603,12 +371,32 @@ QUERY_ALIASES = {
     "ذهب": ["gold"],
     "دولار": ["dollar", "USD"],
     "بيتكوين": ["bitcoin", "crypto"],
+    "اقتصادي": ["economic", "economy"],
+    "أمن": ["security"],
+    "دفاع": ["defense", "defence"],
+    "عسكري": ["military"],
+    "صاروخ": ["missile"],
+    "قصف": ["airstrike", "strike"],
+    "هجوم": ["attack"],
+    "وزارة الخارجية": ["foreign ministry"],
+    "بيان رسمي": ["official statement"],
+}
+
+LANGUAGE_PROFILES = {
+    "ar": ("ar", "SA", "SA:ar"),
+    "en": ("en", "US", "US:en"),
+    "zh": ("zh-CN", "CN", "CN:zh-Hans"),
+    "ru": ("ru", "RU", "RU:ru"),
+    "fr": ("fr", "FR", "FR:fr"),
+    "de": ("de", "DE", "DE:de"),
+    "es": ("es", "ES", "ES:es"),
+    "it": ("it", "IT", "IT:it"),
+    "pt": ("pt-BR", "BR", "BR:pt-419"),
 }
 
 
 def normalize_text(value):
     text = str(value or "").lower().strip()
-
     text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
 
     for old, new in {
@@ -622,36 +410,123 @@ def normalize_text(value):
     }.items():
         text = text.replace(old, new)
 
-    return re.sub(
-        r"\s+",
-        " ",
-        re.sub(r"[^\w\s\u0600-\u06FF-]", " ", text),
-    ).strip()
+    text = re.sub(r"[^\w\s\u0600-\u06FF-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def tokenize(value):
-    return {
-        x
-        for x in normalize_text(value).split()
-        if len(x) > 2
-    }
+    return {x for x in normalize_text(value).split() if len(x) > 2}
+
+
+def similarity_score(a, b):
+    sa, sb = tokenize(a), tokenize(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(1, len(sa | sb))
 
 
 def normalized_title(value):
     return normalize_text(value)
 
 
-def title_fingerprint(value):
-    return " ".join(sorted(tokenize(value)))
+def _text_has_any(text, terms):
+    n = normalize_text(text)
+    return any(normalize_text(term) in n for term in terms)
 
 
-def similarity_score(a, b):
-    sa, sb = tokenize(a), tokenize(b)
+def detect_language_family(text):
+    text = str(text or "")
 
-    if not sa or not sb:
-        return 0.0
+    if re.search(r"[\u0600-\u06FF]", text):
+        return "ar"
+    if re.search(r"[\u4E00-\u9FFF]", text):
+        return "zh"
+    if re.search(r"[\u0400-\u04FF]", text):
+        return "ru"
+    if re.search(r"[\u00C0-\u024F]", text):
+        return "latin"
+    return "en"
 
-    return len(sa & sb) / max(1, len(sa | sb))
+
+def detect_region(text):
+    n = normalize_text(text)
+
+    for region, places in REGIONS.items():
+        for place in places:
+            if normalize_text(place) in n:
+                return region
+
+    for country_en, country_ar in COUNTRY_ALIASES.items():
+        if normalize_text(country_en) in n:
+            for region, places in REGIONS.items():
+                if any(
+                    normalize_text(country_ar) == normalize_text(place)
+                    for place in places
+                ):
+                    return region
+
+    return ""
+
+
+def parse_date(value):
+    if not value:
+        return None
+
+    try:
+        dt = parsedate_to_datetime(value)
+        return (
+            dt.astimezone(timezone.utc)
+            if dt.tzinfo
+            else dt.replace(tzinfo=timezone.utc)
+        )
+    except Exception:
+        return None
+
+
+def _published_close(a, b, hours=8):
+    if not a or not b:
+        return True
+    return abs((a - b).total_seconds()) <= hours * 3600
+
+
+EVENT_FAMILIES = {
+    "military": SECURITY_TERMS,
+    "oil": [
+        "نفط", "خام", "أوبك", "برنت", "oil", "crude", "opec", "brent",
+    ],
+    "markets": [
+        "أسواق", "أسهم", "بورصة", "تداول", "markets", "stocks", "equities",
+    ],
+    "earthquake": [
+        "زلزال", "earthquake",
+    ],
+    "rescue": [
+        "إنقاذ", "إنقاذ عمال", "rescue", "rescued",
+    ],
+    "diplomatic": [
+        "وزارة الخارجية", "الخارجية", "سفير", "السفير", "مبعوث",
+        "foreign ministry", "ambassador", "envoy",
+    ],
+    "official_statement": [
+        "بيان", "تصريح", "أعلن", "أكد", "statement", "announced",
+        "confirmed", "issued",
+    ],
+}
+
+
+def event_family(text):
+    n = normalize_text(text)
+    scores = {}
+
+    for family, terms in EVENT_FAMILIES.items():
+        hits = score_terms(n, terms)
+        if hits:
+            scores[family] = hits
+
+    if not scores:
+        return ""
+
+    return max(scores.items(), key=lambda x: x[1])[0]
 
 
 def same_event(a, b):
@@ -671,6 +546,20 @@ def same_event(a, b):
 
     if sim >= 0.58 and a.region and a.region == b.region:
         return True
+
+    # Cross-language event matching.
+    # It is deliberately conservative: region + event family + close
+    # publication time are required to avoid merging unrelated stories.
+    if a.region and b.region and a.region == b.region:
+        family_a = event_family(f"{a.title} {a.summary}")
+        family_b = event_family(f"{b.title} {b.summary}")
+
+        if (
+            family_a
+            and family_a == family_b
+            and _published_close(a.published, b.published, hours=8)
+        ):
+            return True
 
     return False
 
@@ -694,14 +583,8 @@ class NewsItem:
 
     def __post_init__(self):
         self.title = (self.title or "").strip()
-
-        self.original_title = (
-            self.original_title or self.title
-        )
-
-        self.source = (
-            self.source or "مصدر إخباري"
-        ).strip()
+        self.original_title = self.original_title or self.title
+        self.source = (self.source or "مصدر إخباري").strip()
 
         self.summary = re.sub(
             r"<[^>]+>",
@@ -717,25 +600,16 @@ class NewsItem:
 
         combined = f"{self.title} {self.summary}"
 
-        self.region = (
-            self.region
-            or detect_region(combined)
-        )
+        self.region = self.region or detect_region(combined)
 
         self.official = (
             self.official
-            or is_official_source(
-                self.source,
-                self.domain,
-            )
+            or is_official_source(self.source, self.domain)
         )
 
         self.trust_score = max(
             self.trust_score,
-            source_trust(
-                self.source,
-                self.domain,
-            ),
+            source_trust(self.source, self.domain),
         )
 
         self.urgency_score = score_terms(
@@ -744,51 +618,23 @@ class NewsItem:
         )
 
         self.search_text = normalize_text(
-            f"{self.title} "
-            f"{self.original_title} "
-            f"{self.summary} "
-            f"{self.source} "
-            f"{self.region}"
+            f"{self.title} {self.original_title} "
+            f"{self.summary} {self.source} {self.region}"
         )
 
 
-def detect_region(text):
-    n = normalize_text(text)
-
-    for region, places in REGIONS.items():
-        if any(
-            normalize_text(place) in n
-            for place in places
-        ):
-            return region
-
-    return ""
-
-
 def is_official_source(source, domain):
-    """
-    تحديد المصدر الرسمي لا يعتمد على كلمات مثل "وزارة"
-    داخل اسم المصدر؛ لأن ذلك قد يسبب تصنيف مصادر صحفية
-    ثانوية على أنها مصادر حكومية.
-
-    يعتمد أولاً على النطاق الرسمي، ثم على مجموعة محدودة
-    من المصادر الرسمية المعروفة.
-    """
-
     d = normalize_text(domain)
     s = normalize_text(source)
 
-    # النطاقات الحكومية/الدولية الرسمية.
     if any(
-        d.endswith(hint)
-        or hint in d
+        d.endswith(hint) or hint in d
         for hint in OFFICIAL_DOMAIN_HINTS
     ):
         return True
 
-    # مصادر رسمية معروفة موجودة في قائمة الخلاصات.
     known_official_sources = [
-        "وكالة الانباء السعوديه",
+        "وكاله الانباء السعوديه",
         "eia",
         "nasa",
         "un news",
@@ -801,8 +647,10 @@ def is_official_source(source, domain):
 
 
 def source_trust(source, domain):
+    d = normalize_text(domain)
+
     for key, score in MAJOR_NEWS_DOMAINS.items():
-        if domain.endswith(key):
+        if d.endswith(normalize_text(key)):
             return score
 
     s = normalize_text(source)
@@ -821,7 +669,6 @@ def source_trust(source, domain):
 
 def score_terms(text, terms):
     n = normalize_text(text)
-
     return sum(
         1
         for term in terms
@@ -830,22 +677,14 @@ def score_terms(text, terms):
 
 
 def _is_digest(title):
-    n = normalize_text(title)
-
-    return any(
-        normalize_text(term) in n
-        for term in DIGEST_TERMS
-    )
+    return _text_has_any(title, DIGEST_TERMS)
 
 
 def _security_signal(title, summary=""):
     t = normalize_text(title)
     s = normalize_text(summary)
 
-    if any(
-        normalize_text(x) in t
-        for x in SECURITY_SOCIAL_EXCLUDE
-    ):
+    if _text_has_any(t, SECURITY_SOCIAL_EXCLUDE):
         return False
 
     return (
@@ -858,14 +697,9 @@ def _economy_signal(title, summary=""):
     t = normalize_text(title)
     s = normalize_text(summary)
 
-    # Economic relevance must come from the article itself,
-    # never from the search source/query string.
     title_hits = score_terms(t, ECON_TERMS)
     summary_hits = score_terms(s, ECON_TERMS)
-    negative = score_terms(
-        f"{t} {s}",
-        ECON_EXCLUDE,
-    )
+    negative = score_terms(f"{t} {s}", ECON_EXCLUDE)
 
     if negative >= 1 and title_hits == 0:
         return False
@@ -873,101 +707,63 @@ def _economy_signal(title, summary=""):
     if title_hits >= 1:
         return True
 
-    return (
-        summary_hits >= 2
-        and negative == 0
-    )
+    return summary_hits >= 2 and negative == 0
 
 
 def _official_signal(title, summary, item=None):
-    """
-    التصنيف الرسمي أصبح أكثر صرامة.
-
-    المطلوب:
-    1. وجود جهة/مسؤول رسمي.
-    2. وجود فعل أو صيغة موقف/تصريح/إجراء رسمي.
-    3. عدم وجود مؤشرات تحقق/شائعة/وثيقة مزعومة.
-
-    مجرد وجود:
-      وزارة الخارجية
-      السفير
-      الحكومة
-      الوزير
-    لم يعد كافياً.
-    """
-
     t = normalize_text(title)
     s = normalize_text(summary)
     text = f"{t} {s}"
 
-    # أولاً: منع أخبار التحقق والشائعات والوثائق المزعومة.
-    if score_terms(
-        text,
-        OFFICIAL_EXCLUDE_TERMS,
-    ) > 0:
+    if score_terms(text, OFFICIAL_EXCLUDE_TERMS) > 0:
         return False
 
-    entity_hits_title = score_terms(
-        t,
-        OFFICIAL_ENTITY_TERMS,
-    )
+    entity_title = score_terms(t, OFFICIAL_ENTITY_TERMS)
+    entity_summary = score_terms(s, OFFICIAL_ENTITY_TERMS)
 
-    entity_hits_summary = score_terms(
-        s,
-        OFFICIAL_ENTITY_TERMS,
-    )
+    action_title = score_terms(t, OFFICIAL_ACTION_TERMS)
+    action_summary = score_terms(s, OFFICIAL_ACTION_TERMS)
 
-    action_hits_title = score_terms(
-        t,
-        OFFICIAL_ACTION_TERMS,
-    )
-
-    action_hits_summary = score_terms(
-        s,
-        OFFICIAL_ACTION_TERMS,
-    )
-
-    # لا يمكن أن يكون خبراً رسمياً بلا جهة رسمية
-    # أو مسؤول واضح.
     entity_present = (
-        entity_hits_title >= 1
-        or entity_hits_summary >= 1
+        entity_title >= 1 or entity_summary >= 1
     )
 
     if not entity_present:
         return False
 
-    # أفضل حالة: الجهة + الفعل الرسمي في العنوان.
-    if (
-        entity_hits_title >= 1
-        and action_hits_title >= 1
-    ):
+    generic_meeting_terms = [
+        "محادثات", "مباحثات", "اجتماع", "اجتماعات", "لقاء", "لقاءات",
+        "مؤتمر", "قمة", "مشاركة", "مشاركة متوقعة", "سيبحث", "ستبحث",
+        "يناقش", "تبحث", "talks", "meeting", "meetings", "discussions",
+        "summit", "conference", "participation", "expected participation",
+        "will discuss", "will address",
+    ]
+
+    generic_meeting = (
+        score_terms(t, generic_meeting_terms) > 0
+        and action_title == 0
+    )
+
+    if generic_meeting:
+        return False
+
+    # السفير/المسؤول وحده لا يكفي.
+    # يجب أن يرتبط بتصريح أو موقف أو فعل.
+    if entity_title >= 1 and action_title >= 1:
         return True
 
-    # حالة تصريح في العنوان مع جهة مذكورة في الملخص.
-    if (
-        action_hits_title >= 1
-        and entity_hits_summary >= 1
-    ):
+    if action_title >= 1 and entity_summary >= 1:
         return True
 
-    # حالة العنوان يذكر الجهة، والملخص يحتوي على
-    # صياغة تصريح/موقف رسمي واضحة.
-    if (
-        entity_hits_title >= 1
-        and action_hits_summary >= 1
-    ):
+    if entity_title >= 1 and action_summary >= 1:
         return True
 
-    # إذا كان المصدر نفسه رسمياً، فلا نرفع الخبر لمجرد
-    # ذكر الوزارة؛ نحتاج أيضاً إلى فعل رسمي في العنوان
-    # أو الملخص.
     if (
         item is not None
         and item.official
         and (
-            action_hits_title >= 1
-            or action_hits_summary >= 1
+            action_title >= 1
+            or action_summary >= 1
         )
     ):
         return True
@@ -997,10 +793,7 @@ def classify_item(item):
         + score_terms(summary, SECURITY_TERMS)
     )
 
-    if score_terms(
-        title,
-        SECURITY_SOCIAL_EXCLUDE,
-    ):
+    if score_terms(title, SECURITY_SOCIAL_EXCLUDE):
         sec -= 12
 
     official_signal = _official_signal(
@@ -1010,22 +803,10 @@ def classify_item(item):
     )
 
     official = (
-        score_terms(
-            title,
-            OFFICIAL_ENTITY_TERMS,
-        ) * 2
-        + score_terms(
-            title,
-            OFFICIAL_ACTION_TERMS,
-        ) * 3
-        + score_terms(
-            summary,
-            OFFICIAL_ENTITY_TERMS,
-        )
-        + score_terms(
-            summary,
-            OFFICIAL_ACTION_TERMS,
-        )
+        score_terms(title, OFFICIAL_ENTITY_TERMS) * 2
+        + score_terms(title, OFFICIAL_ACTION_TERMS) * 3
+        + score_terms(summary, OFFICIAL_ENTITY_TERMS)
+        + score_terms(summary, OFFICIAL_ACTION_TERMS)
     )
 
     if item.official:
@@ -1036,9 +817,6 @@ def classify_item(item):
         + score_terms(summary, URGENT_TERMS)
     )
 
-    # Security first when there is a genuine military/security
-    # signal. This prevents official military stories from being
-    # promoted automatically to "official statements".
     if (
         _security_signal(title, summary)
         and sec >= max(econ, 4)
@@ -1074,74 +852,37 @@ def is_topic_match(item, topic_key):
     title = item.title or ""
     summary = item.summary or ""
 
-    # This is intentionally the first gate for every section.
-    # Generic digest articles can never enter any section.
     if _is_digest(title):
         return False
 
     if topic_key == "econ":
-        # Section classification uses title/summary only.
-        # It NEVER uses source/search_text.
-        return _economy_signal(
-            title,
-            summary,
-        ) and not (
-            _security_signal(
-                title,
-                summary,
-            )
-            and score_terms(
-                normalize_text(title),
-                SECURITY_TERMS,
-            ) >= 1
-            and score_terms(
-                normalize_text(title),
-                ECON_TERMS,
-            ) <= 1
+        return _economy_signal(title, summary) and not (
+            _security_signal(title, summary)
+            and score_terms(title, SECURITY_TERMS) >= 1
+            and score_terms(title, ECON_TERMS) <= 1
         )
 
     if topic_key == "secu":
-        return _security_signal(
-            title,
-            summary,
-        )
+        return _security_signal(title, summary)
 
     if topic_key == "forg":
-        return _official_signal(
-            title,
-            summary,
-            item,
-        )
+        return _official_signal(title, summary, item)
 
     if topic_key == "urg":
         return (
-            score_terms(
-                title,
-                URGENT_TERMS,
-            ) >= 1
-            or score_terms(
-                summary,
-                URGENT_TERMS,
-            ) >= 2
+            score_terms(title, URGENT_TERMS) >= 1
+            or score_terms(summary, URGENT_TERMS) >= 2
         )
+
+    text = normalize_text(f"{title} {summary}")
 
     if topic_key == "gulf":
-        text = normalize_text(
-            f"{title} {summary}"
-        )
-
-        gulf = REGIONS["الشرق الأوسط"]
-
         return any(
             normalize_text(x) in text
-            for x in gulf
+            for x in REGIONS["الشرق الأوسط"]
         )
 
     if topic_key == "wrld":
-        text = normalize_text(
-            f"{title} {summary}"
-        )
-
         return bool(item.region) or any(
             normalize_text(x) in text
             for x in [
@@ -1157,6 +898,14 @@ def is_topic_match(item, topic_key):
         )
 
     return False
+
+
+def _item_preference(item):
+    return (
+        float(item.trust_score or 0),
+        float(item.relevance_score or 0),
+        item.published.timestamp() if item.published else 0,
+    )
 
 
 def deduplicate_news(items):
@@ -1177,18 +926,10 @@ def deduplicate_news(items):
 
         duplicate = False
 
-        for existing in unique:
+        for index, existing in enumerate(unique):
             if same_event(item, existing):
-                if (
-                    item.trust_score > existing.trust_score
-                    or (
-                        item.published
-                        and existing.published
-                        and item.published > existing.published
-                    )
-                ):
-                    unique.remove(existing)
-                    unique.append(item)
+                if _item_preference(item) > _item_preference(existing):
+                    unique[index] = item
 
                 duplicate = True
                 break
@@ -1199,40 +940,37 @@ def deduplicate_news(items):
     return unique
 
 
-def parse_date(value):
-    if not value:
-        return None
+def _extract_google_source(entry):
+    source_info = entry.get("source")
 
-    try:
-        dt = parsedate_to_datetime(value)
+    source_title = ""
+    source_href = ""
 
-        return (
-            dt.astimezone(timezone.utc)
-            if dt.tzinfo
-            else dt.replace(tzinfo=timezone.utc)
-        )
-
-    except Exception:
-        return None
-
-
-def parse_entry(entry, source, category="general"):
-    title = html.unescape(
-        str(
-            entry.get(
-                "title",
-                "",
-            )
-            or ""
+    if isinstance(source_info, dict):
+        source_title = str(
+            source_info.get("title") or ""
         ).strip()
+        source_href = str(
+            source_info.get("href") or ""
+        ).strip()
+    else:
+        source_title = str(
+            getattr(source_info, "title", "") or ""
+        ).strip()
+        source_href = str(
+            getattr(source_info, "href", "") or ""
+        ).strip()
+
+    return source_title, source_href
+
+
+def parse_entry(entry, source="مصدر إخباري", category="general"):
+    title = html.unescape(
+        str(entry.get("title", "") or "").strip()
     )
 
     url = str(
-        entry.get(
-            "link",
-            "",
-        )
-        or ""
+        entry.get("link", "") or ""
     ).strip()
 
     if not title or not url:
@@ -1240,36 +978,47 @@ def parse_entry(entry, source, category="general"):
 
     summary = html.unescape(
         str(
-            entry.get(
-                "summary",
-                "",
-            )
-            or entry.get(
-                "description",
-                "",
-            )
+            entry.get("summary")
+            or entry.get("description")
             or ""
         )
     )
 
     published = parse_date(
-        entry.get(
-            "published"
-        )
-        or entry.get(
-            "updated"
-        )
+        entry.get("published")
+        or entry.get("updated")
         or ""
     )
+
+    actual_source_title, actual_source_href = _extract_google_source(entry)
+
+    final_source = (
+        actual_source_title
+        or source
+        or "مصدر إخباري"
+    )
+
+    domain = ""
+
+    if actual_source_href:
+        domain = urlparse(
+            actual_source_href
+        ).netloc.replace("www.", "").lower()
+
+    if not domain:
+        domain = urlparse(
+            url
+        ).netloc.replace("www.", "").lower()
 
     item = NewsItem(
         title=title,
         original_title=title,
         url=url,
-        source=source,
+        source=final_source,
         summary=summary,
         published=published,
         category=category,
+        domain=domain,
     )
 
     return classify_item(item)
@@ -1283,7 +1032,7 @@ async def fetch_feed(session, source, url):
                 total=FETCH_TIMEOUT
             ),
             headers={
-                "User-Agent": "Global-Intel-Bot/2.0"
+                "User-Agent": "Global-Intel-Bot/3.0"
             },
         ) as response:
 
@@ -1295,9 +1044,7 @@ async def fetch_feed(session, source, url):
         parsed = feedparser.parse(data)
         items = []
 
-        for entry in parsed.entries[
-            :MAX_FEED_ITEMS
-        ]:
+        for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(
                 entry,
                 source,
@@ -1309,51 +1056,133 @@ async def fetch_feed(session, source, url):
         return items
 
     except Exception:
-        log.exception(
-            "Feed failed: %s",
-            source,
-        )
+        log.exception("Feed failed: %s", source)
         return []
 
 
-def google_news_url(query):
+def google_news_url(
+    query,
+    language="ar",
+):
+    profile = LANGUAGE_PROFILES.get(
+        language,
+        LANGUAGE_PROFILES["ar"],
+    )
+
+    hl, gl, ceid = profile
+
     q = urllib.parse.quote_plus(query)
 
     return (
         "https://news.google.com/rss/search"
         f"?q={q}"
-        "&hl=ar"
-        "&gl=SA"
-        "&ceid=SA:ar"
+        f"&hl={hl}"
+        f"&gl={gl}"
+        f"&ceid={ceid}"
     )
+
+
+def build_query_variants(query):
+    normalized = normalize_text(query)
+    variants = [query]
+
+    for key, aliases in QUERY_ALIASES.items():
+        if normalize_text(key) in normalized:
+            variants.extend(aliases)
+
+    for arabic_country, english_country in COUNTRY_EN.items():
+        if normalize_text(arabic_country) in normalized:
+            variants.append(
+                query.replace(
+                    arabic_country,
+                    english_country,
+                )
+            )
+
+    # If user searches using an English country name, add Arabic form.
+    for english_country, arabic_country in COUNTRY_ALIASES.items():
+        if normalize_text(english_country) in normalized:
+            variants.append(
+                query.replace(
+                    english_country,
+                    arabic_country,
+                )
+            )
+
+    # Always include a compact English equivalent for Arabic searches
+    # containing known countries/subjects.
+    english_parts = []
+
+    for arabic_country, english_country in COUNTRY_EN.items():
+        if normalize_text(arabic_country) in normalized:
+            english_parts.append(english_country)
+
+    for key, aliases in QUERY_ALIASES.items():
+        if normalize_text(key) in normalized and aliases:
+            english_parts.append(aliases[0])
+
+    if english_parts:
+        variants.append(" ".join(english_parts))
+
+    seen = set()
+    result = []
+
+    for value in variants:
+        marker = normalize_text(value)
+        if marker and marker not in seen:
+            seen.add(marker)
+            result.append(value)
+
+    return result[:MAX_ONLINE_QUERIES]
+
+
+def languages_for_query(query):
+    family = detect_language_family(query)
+
+    if family == "ar":
+        return ["ar", "en"]
+
+    if family == "zh":
+        return ["zh", "en"]
+
+    if family == "ru":
+        return ["ru", "en"]
+
+    if family == "latin":
+        return ["en", "ar"]
+
+    return ["en", "ar"]
 
 
 async def search_news_online(
     query,
     max_results=25,
 ):
-    queries = [query]
-    normalized = normalize_text(query)
+    variants = build_query_variants(query)
+    languages = languages_for_query(query)
 
-    for key, aliases in QUERY_ALIASES.items():
-        if normalize_text(key) in normalized:
-            queries.extend(
-                aliases[:3]
-            )
+    requests_plan = []
 
-    queries = list(
-        dict.fromkeys(queries)
-    )[:MAX_ONLINE_QUERIES]
+    for index, q in enumerate(variants):
+        language = languages[
+            index % len(languages)
+        ]
+        requests_plan.append(
+            (q, language)
+        )
 
     async with aiohttp.ClientSession() as session:
         groups = await asyncio.gather(
             *(
                 fetch_feed(
                     session,
-                    f"بحث: {q}",
-                    google_news_url(q),
+                    "Google News",
+                    google_news_url(
+                        q,
+                        language,
+                    ),
                 )
-                for q in queries
+                for q, language in requests_plan
             ),
             return_exceptions=True,
         )
@@ -1376,18 +1205,41 @@ async def search_news_online(
     )[:max_results]
 
 
+def _query_token_variants(query):
+    tokens = tokenize(query)
+    expanded = set(tokens)
+
+    for key, aliases in QUERY_ALIASES.items():
+        key_tokens = tokenize(key)
+
+        if key_tokens & tokens:
+            for alias in aliases:
+                expanded.update(
+                    tokenize(alias)
+                )
+
+    for arabic, english in COUNTRY_EN.items():
+        if normalize_text(arabic) in normalize_text(query):
+            expanded.update(
+                tokenize(english)
+            )
+
+    for english, arabic in COUNTRY_ALIASES.items():
+        if normalize_text(english) in normalize_text(query):
+            expanded.update(
+                tokenize(arabic)
+            )
+
+    return expanded
+
+
 def rank_search_results(items, query):
-    q_tokens = tokenize(query)
+    q_tokens = _query_token_variants(query)
     ranked = []
 
     for item in items:
-        title_tokens = tokenize(
-            item.title
-        )
-
-        summary_tokens = tokenize(
-            item.summary
-        )
+        title_tokens = tokenize(item.title)
+        summary_tokens = tokenize(item.summary)
 
         title_hits = len(
             q_tokens & title_tokens
@@ -1402,27 +1254,15 @@ def rank_search_results(items, query):
             in normalize_text(item.title)
         )
 
-        # IMPORTANT:
-        # Do not count source/search_text as topical relevance.
-        #
-        # "بحث: السعودية اقتصاد أسواق نفط"
-        # must not make an unrelated article look economic.
         score = (
             title_hits * 12
             + summary_hits * 3
-            + (
-                25
-                if exact_phrase
-                else 0
-            )
+            + (25 if exact_phrase else 0)
             + item.trust_score * 0.04
         )
 
         item.relevance_score = score
-
-        ranked.append(
-            (score, item)
-        )
+        ranked.append((score, item))
 
     ranked.sort(
         key=lambda x: x[0],
@@ -1479,20 +1319,16 @@ async def hybrid_search_news(
         query,
     )
 
-    # Search relevance comes ONLY from title/summary.
-    # Source names and search query labels are deliberately ignored.
-    q_tokens = tokenize(query)
+    q_tokens = _query_token_variants(query)
     filtered = []
 
     for item in ranked:
         title_hits = len(
-            q_tokens
-            & tokenize(item.title)
+            q_tokens & tokenize(item.title)
         )
 
         summary_hits = len(
-            q_tokens
-            & tokenize(item.summary)
+            q_tokens & tokenize(item.summary)
         )
 
         if title_hits or summary_hits:
@@ -1526,17 +1362,13 @@ async def collect_news(max_items=150):
         if isinstance(group, list):
             items.extend(group)
 
-    # Do not use generic "أهم الأخبار العالمية"
-    # discovery here.
-    #
-    # These are targeted discovery queries and their labels
-    # are NEVER used as classification evidence.
     discovery_queries = [
         "السعودية اقتصاد أسواق نفط",
+        "Saudi Arabia economy oil markets",
         "الشرق الأوسط أمن دفاع",
+        "Middle East security defense",
         "بيانات رسمية وزارة خارجية",
-        "world economy markets oil",
-        "world security defense",
+        "official statement foreign ministry",
     ]
 
     try:
@@ -1544,7 +1376,7 @@ async def collect_news(max_items=150):
             *(
                 search_news_online(
                     q,
-                    15,
+                    12,
                 )
                 for q in discovery_queries
             ),
@@ -1556,9 +1388,7 @@ async def collect_news(max_items=150):
                 items.extend(group)
 
     except Exception:
-        log.exception(
-            "Discovery failed."
-        )
+        log.exception("Discovery failed.")
 
     items = [
         item
@@ -1568,19 +1398,11 @@ async def collect_news(max_items=150):
 
     items.sort(
         key=lambda x: (
-            float(
-                x.relevance_score
-                or 0
-            ),
-            float(
-                x.trust_score
-                or 0
-            ),
-            (
-                x.published.timestamp()
-                if x.published
-                else 0
-            ),
+            float(x.relevance_score or 0),
+            float(x.trust_score or 0),
+            x.published.timestamp()
+            if x.published
+            else 0,
         ),
         reverse=True,
     )
@@ -1591,10 +1413,7 @@ async def collect_news(max_items=150):
 def build_ai_context(items):
     lines = []
 
-    for i, item in enumerate(
-        items,
-        1,
-    ):
+    for i, item in enumerate(items, 1):
         published = (
             item.published.isoformat()
             if item.published

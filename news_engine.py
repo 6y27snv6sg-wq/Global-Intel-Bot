@@ -21,8 +21,8 @@ FETCH_CONNECT_TIMEOUT = 2
 COLLECTION_CONCURRENCY = 20
 MAX_FEED_ITEMS = 30
 MAX_ONLINE_QUERIES = 6
-ONLINE_SEARCH_BUDGET = 4
-SEARCH_TRANSLATION_BUDGET = 1.5
+ONLINE_SEARCH_BUDGET = 3.5
+SEARCH_TRANSLATION_BUDGET = 2.0
 DISCOVERY_BUDGET = 6
 ROTATION_WINDOW_SECONDS = 300
 
@@ -156,7 +156,8 @@ DIGEST_TERMS = [
 
 # Hard-noise patterns: service/SEO pages rather than intelligence-grade news.
 LOW_VALUE_HARD_TERMS = [
-    "بث مباشر", "شاهد مباشر", "مشاهدة مباشرة", "مشاهدة مباراة",
+    "بث مباشر", "البث المباشر", "شاهد مباشر", "شاهد البث المباشر",
+    "مشاهدة مباشرة", "مشاهدة البث المباشر", "مشاهدة مباراة",
     "شاهد المباراة", "رابط المباراة", "روابط المباراة", "live stream",
     "watch live", "streaming link", "live score", "نتيجة مباشرة",
 ]
@@ -304,32 +305,51 @@ async def translate_title_to_arabic(session, title: str) -> str:
     return title
 
 
-async def translate_news_titles(items):
-    """Translate foreign-language titles to Arabic without using Gemini.
+async def translate_news_titles(items, budget=None):
+    """Translate titles concurrently while preserving partial successes.
 
-    The original title is preserved in ``original_title``. The Arabic title
-    becomes ``title`` so classification, deduplication and Telegram display
-    operate on the same canonical language.
+    A slow translation must never block the search page. Tasks that finish
+    inside ``budget`` are applied immediately; unfinished tasks are cancelled.
+    This avoids the previous all-or-nothing ``gather`` behaviour where one slow
+    title could cause every completed translation to be discarded by an outer
+    timeout.
     """
     if not items:
         return items
 
-    async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *(translate_title_to_arabic(session, item.title) for item in items),
-            return_exceptions=True,
+    connector = aiohttp.TCPConnector(limit=max(4, min(12, len(items))), ttl_dns_cache=60)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        task_map = {
+            asyncio.create_task(translate_title_to_arabic(session, item.title)): item
+            for item in items
+        }
+        if not task_map:
+            return items
+
+        done, pending = await asyncio.wait(
+            task_map.keys(),
+            timeout=budget,
         )
 
-    for item, translated in zip(items, results):
-        if isinstance(translated, Exception) or not translated:
-            continue
-        if translated != item.title:
-            item.original_title = item.original_title or item.title
-            item.title = translated
-            item.search_text = normalize_text(
-                f"{item.title} {item.original_title} {item.summary} "
-                f"{item.source} {item.region}"
-            )
+        for task in done:
+            item = task_map[task]
+            try:
+                translated = task.result()
+            except Exception:
+                continue
+            if translated and translated != item.title:
+                item.original_title = item.original_title or item.title
+                item.title = translated
+                item.search_text = normalize_text(
+                    f"{item.title} {item.original_title} {item.summary} "
+                    f"{item.source} {item.region}"
+                )
+
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            log.warning("Search title translation budget exceeded for %s title(s); skipped unfinished translations.", len(pending))
 
     return items
 
@@ -1038,61 +1058,173 @@ def _known_country_names():
     return {normalize_text(x) for x in names if normalize_text(x)}
 
 
-def _query_country_terms(query):
-    """Return full country/entity aliases present in the query.
+# Explicit disambiguation only where one valid geopolitical entity name is a
+# strict substring of another. The resolver remains generic for all other
+# entities; these profiles prevent false positives that token matching cannot
+# safely distinguish.
+ENTITY_DISAMBIGUATION = {
+    normalize_text("جمهورية الكونغو"): {
+        "aliases": [
+            "جمهورية الكونغو", "الكونغو",
+            "Republic of the Congo", "Congo Republic", "Congo-Brazzaville",
+        ],
+        "exclude": [
+            "جمهورية الكونغو الديمقراطية", "الكونغو الديمقراطية",
+            "Democratic Republic of the Congo", "DR Congo", "DRC",
+            "Congo-Kinshasa",
+        ],
+    },
+    normalize_text("الكونغو"): {
+        "aliases": [
+            "جمهورية الكونغو", "الكونغو",
+            "Republic of the Congo", "Congo Republic", "Congo-Brazzaville",
+        ],
+        "exclude": [
+            "جمهورية الكونغو الديمقراطية", "الكونغو الديمقراطية",
+            "Democratic Republic of the Congo", "DR Congo", "DRC",
+            "Congo-Kinshasa",
+        ],
+    },
+    normalize_text("جمهورية الكونغو الديمقراطية"): {
+        "aliases": [
+            "جمهورية الكونغو الديمقراطية", "الكونغو الديمقراطية",
+            "Democratic Republic of the Congo", "DR Congo", "DRC",
+            "Congo-Kinshasa",
+        ],
+        "exclude": ["Republic of the Congo", "Congo-Brazzaville"],
+    },
+    normalize_text("الكونغو الديمقراطية"): {
+        "aliases": [
+            "جمهورية الكونغو الديمقراطية", "الكونغو الديمقراطية",
+            "Democratic Republic of the Congo", "DR Congo", "DRC",
+            "Congo-Kinshasa",
+        ],
+        "exclude": ["Republic of the Congo", "Congo-Brazzaville"],
+    },
+}
 
-    Compound names remain atomic: "جنوب أفريقيا" never degrades to matching
-    "جنوب" or "أفريقيا" separately.
-    """
+
+def _country_aliases_from_query(query):
     nq = normalize_text(query)
-    terms = set()
-
+    aliases = set()
     for ar_name in _known_country_names():
         if ar_name and ar_name in nq:
-            terms.add(ar_name)
+            aliases.add(ar_name)
 
     for ar_name, en_name in COUNTRY_EN.items():
         ar = normalize_text(ar_name)
         en = normalize_text(en_name)
         if (ar and ar in nq) or (en and en in nq):
-            if ar:
-                terms.add(ar)
-            if en:
-                terms.add(en)
+            aliases.add(ar)
+            aliases.add(en)
 
     if "السعود" in nq or "saudi" in nq:
-        terms.update({
-            normalize_text("السعودية"),
-            normalize_text("المملكة العربية السعودية"),
-            normalize_text("Saudi Arabia"),
-            normalize_text("Saudi"),
+        aliases.update(normalize_text(x) for x in (
+            "السعودية", "المملكة العربية السعودية", "Saudi Arabia", "Saudi"
+        ))
+    return {x for x in aliases if x}
+
+
+def _institution_entity_profile(query):
+    """Resolve compound institutional queries as one entity, not loose tokens.
+
+    The first high-value pattern is foreign ministries because official-source
+    searches frequently use forms such as "وزارة الخارجية السعودية". The
+    generated aliases are country-aware and work across Arabic/English wording.
+    """
+    nq = normalize_text(query)
+    foreign_markers = (
+        normalize_text("وزارة الخارجية"), normalize_text("الخارجية"),
+        "foreign ministry", "ministry of foreign affairs",
+    )
+    if not any(marker in nq for marker in foreign_markers):
+        return None
+
+    countries = _country_aliases_from_query(query)
+    if not countries:
+        return None
+
+    aliases = {nq}
+    for country in countries:
+        aliases.update({
+            normalize_text(f"وزارة الخارجية {country}"),
+            normalize_text(f"وزارة خارجية {country}"),
+            normalize_text(f"الخارجية {country}"),
+            normalize_text(f"{country} وزارة الخارجية"),
+            normalize_text(f"{country} foreign ministry"),
+            normalize_text(f"{country} ministry of foreign affairs"),
+            normalize_text(f"ministry of foreign affairs {country}"),
         })
 
-    # Generic short entity query fallback. This makes the engine work for
-    # countries not hard-coded in COUNTRY_EN without splitting compound names.
-    if not terms and _query_intent(query) == "general":
-        q_words = [x for x in nq.split() if x]
-        if 1 <= len(q_words) <= 4:
-            terms.add(nq)
+    # Common official shorthand for Saudi MFA; derived as an alias of the same
+    # institution rather than a separate keyword rule.
+    if any(x in countries for x in {normalize_text("السعودية"), normalize_text("Saudi Arabia"), normalize_text("Saudi")}):
+        aliases.update(normalize_text(x) for x in (
+            "الخارجية السعودية", "وزارة الخارجية السعودية",
+            "وزارة الخارجية بالمملكة العربية السعودية",
+            "Saudi Foreign Ministry", "Saudi Ministry of Foreign Affairs",
+        ))
 
-    return {x for x in terms if x}
+    return {"aliases": {x for x in aliases if x}, "exclude": set(), "kind": "institution"}
+
+
+def _query_entity_profile(query):
+    """Build one atomic entity profile for search anchoring."""
+    nq = normalize_text(query)
+
+    # Longest exact geopolitical phrase wins before shorter substring aliases.
+    for key in sorted(ENTITY_DISAMBIGUATION, key=len, reverse=True):
+        if nq == key:
+            raw = ENTITY_DISAMBIGUATION[key]
+            return {
+                "aliases": {normalize_text(x) for x in raw["aliases"] if normalize_text(x)},
+                "exclude": {normalize_text(x) for x in raw["exclude"] if normalize_text(x)},
+                "kind": "geopolitical",
+            }
+
+    institution = _institution_entity_profile(query)
+    if institution:
+        return institution
+
+    aliases = _country_aliases_from_query(query)
+    if aliases:
+        return {"aliases": aliases, "exclude": set(), "kind": "country"}
+
+    # Generic short entity fallback: preserve the complete phrase atomically.
+    if _query_intent(query) == "general":
+        q_words = [x for x in nq.split() if x]
+        if 1 <= len(q_words) <= 5:
+            return {"aliases": {nq}, "exclude": set(), "kind": "generic"}
+
+    return {"aliases": set(), "exclude": set(), "kind": "none"}
+
+
+def _query_country_terms(query):
+    """Backward-compatible alias accessor used by ranking code."""
+    return _query_entity_profile(query)["aliases"]
+
+
+def _entity_haystack(item):
+    return normalize_text(f"{item.title} {item.original_title} {item.summary}")
 
 
 def _country_anchor_match(item, query):
-    """Require the complete country/entity phrase, never a partial token."""
-    terms = _query_country_terms(query)
-    if not terms:
+    """Require the resolved entity and reject explicitly conflicting entities."""
+    profile = _query_entity_profile(query)
+    aliases = profile["aliases"]
+    if not aliases:
         return True
 
-    haystack = normalize_text(
-        f"{item.title} {item.original_title} {item.summary}"
-    )
-    return any(term in haystack for term in terms)
+    haystack = _entity_haystack(item)
+    if any(term and term in haystack for term in profile["exclude"]):
+        return False
+    return any(term and term in haystack for term in aliases)
 
 
 def _country_centrality_score(item, query):
-    """Measure whether the searched country/entity is the subject or a side detail."""
-    terms = _query_country_terms(query)
+    """Measure whether the resolved entity is the subject or a side detail."""
+    profile = _query_entity_profile(query)
+    terms = profile["aliases"]
     if not terms:
         return 0.0
 
@@ -1100,22 +1232,48 @@ def _country_centrality_score(item, query):
     original = normalize_text(item.original_title)
     summary = normalize_text(item.summary)
 
-    best = -30.0
+    if any(term and term in f"{title} {original} {summary}" for term in profile["exclude"]):
+        return -90.0
+
+    best = -40.0
     for term in terms:
         if not term:
             continue
-        for value, base in ((title, 28.0), (original, 24.0)):
+        for value, base in ((title, 34.0), (original, 30.0)):
             pos = value.find(term)
             if pos >= 0:
                 length = max(1, len(value))
                 relative = pos / length
-                positional = 18.0 if relative <= 0.18 else (8.0 if relative <= 0.50 else 0.0)
+                positional = 22.0 if relative <= 0.18 else (10.0 if relative <= 0.50 else 0.0)
                 best = max(best, base + positional)
         if term in summary:
             best = max(best, 8.0)
 
+    # Institutional searches need stronger centrality because loose ministry /
+    # country co-occurrence is especially noisy.
+    if profile["kind"] == "institution" and best < 30.0:
+        best -= 28.0
+
     return best
 
+
+def _displayable_arabic(item):
+    """User-facing search results must have an Arabic-suitable headline."""
+    return not _needs_arabic_translation(item.title)
+
+
+def _post_translation_search_filter(items, query):
+    """Final invariant gate after translation and before Telegram display."""
+    clean = []
+    for item in items:
+        if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
+            continue
+        if not _country_anchor_match(item, query):
+            continue
+        if not _displayable_arabic(item):
+            continue
+        clean.append(item)
+    return clean
 
 def parse_entry(entry, source, category="general"):
     title = html.unescape(str(entry.get("title", "") or "").strip())
@@ -1268,16 +1426,17 @@ async def search_news_online(query, max_results=25):
             filtered.append(item)
 
     # Translate only the final bounded result set, never the full raw feed.
+    # Partial successes are preserved inside the translation budget.
     final_items = filtered[:max_results]
-    try:
-        final_items = await asyncio.wait_for(
-            translate_news_titles(final_items),
-            timeout=SEARCH_TRANSLATION_BUDGET,
-        )
-    except asyncio.TimeoutError:
-        # Search must finish on time; untranslated titles are preferable to a
-        # hanging UI. Translation can never hold the result page hostage.
-        log.warning("Search title translation budget exceeded; using available titles.")
+    final_items = await translate_news_titles(
+        final_items,
+        budget=SEARCH_TRANSLATION_BUDGET,
+    )
+
+    # Translation can reveal Arabic hard-noise phrases (for example "بث مباشر")
+    # that were not detectable in the original title. Enforce every invariant
+    # again after translation, and never expose an untranslated foreign headline.
+    final_items = _post_translation_search_filter(final_items, query)
 
     # Re-rank after translation so Arabic canonical titles can improve ordering.
     return rank_search_results(final_items, query)[:max_results]
@@ -1401,7 +1560,12 @@ async def search_news(items, query, max_results=25):
         if title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
 
-    return rank_search_results(candidates, query)[:max_results]
+    ranked = rank_search_results(candidates, query)[:max_results]
+    # Cached/local results use the same Arabic and hard-noise invariants as
+    # online discovery, so the progressive first batch cannot leak English.
+    ranked = await translate_news_titles(ranked, budget=min(1.2, SEARCH_TRANSLATION_BUDGET))
+    ranked = _post_translation_search_filter(ranked, query)
+    return rank_search_results(ranked, query)[:max_results]
 
 async def hybrid_search_news(items, query, max_results=25):
     """
@@ -1430,7 +1594,7 @@ async def hybrid_search_news(items, query, max_results=25):
     filtered = []
 
     for item in ranked:
-        if _hard_low_value(item) or not _country_anchor_match(item, query):
+        if _hard_low_value(item) or not _country_anchor_match(item, query) or not _displayable_arabic(item):
             continue
 
         title_hits = len(q_tokens & tokenize(item.title))

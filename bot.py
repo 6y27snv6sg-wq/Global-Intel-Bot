@@ -563,22 +563,36 @@ def urgent_score(item):
 
 
 def urgent_key(item):
-    return (
-        f"{normalize_text(get_item_title(item))}|"
-        f"{normalize_text(get_item_source(item))}"
-    )[:500]
+    """Stable urgent-event key independent of publisher/source.
+
+    The same event may arrive later from a different publisher. Including the
+    source in the key caused the bot to alert it again as if it were new.
+    """
+    title = normalize_text(get_item_title(item))
+    # Remove generic breaking-news words that vary by publisher.
+    for term in (
+        "عاجل", "خبر عاجل", "breaking", "breaking news",
+        "urgent", "تحديث", "update",
+    ):
+        title = title.replace(normalize_text(term), " ")
+    title = re.sub(r"\s+", " ", title).strip()
+    return title[:500]
 
 
 def find_new_urgent_news(items, limit=3):
     candidates = []
-    for item in items:
+    for item in deduplicate_news(items):
         score = urgent_score(item)
         key = urgent_key(item)
         if score >= 8 and key and key not in SENT_URGENT_KEYS:
             candidates.append((score, item))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
-    return [item for _, item in candidates[:limit]]
+
+    # A second event-level pass after urgency ranking prevents the same event
+    # from being emitted twice when several publishers phrase it differently.
+    ranked_items = [item for _, item in candidates]
+    return deduplicate_news(ranked_items)[:limit]
 
 
 async def format_urgent_alert(item):
@@ -760,21 +774,23 @@ async def show_topic(query, user_id, key, page):
         )
 
         try:
-            cached = NEWS_CACHE.get("all_news")
-            items = cached if cached is not None else await get_fresh_news()
+            # Never block a category button on a full global refresh.
+            # Stale cache is still useful for immediate display.
+            cached = NEWS_CACHE.peek("all_news") or []
+            items = cached
             results = topic_filter(items, key, MAX_SEARCH_RESULTS)
 
             if not results:
                 await status.edit_text(
-                    "🔎 لا توجد أخبار مناسبة لهذا القسم في البيانات "
-                    "المتاحة حالياً.\n\n"
-                    "📡 تستمر جولة الرصد التالية تلقائياً."
+                    f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
+                    "◌ لا توجد نتائج جاهزة في الذاكرة الآن.\n"
+                    "📡 جاري توسيع التغطية في الخلفية...",
+                    parse_mode="HTML",
                 )
-                if cached is not None:
-                    track_task(
-                        send_topic_update(query.message, key, []),
-                        f"topic-refresh-{user_id}-{key}",
-                    )
+                track_task(
+                    send_topic_update(query.message, key, []),
+                    f"topic-refresh-{user_id}-{key}",
+                )
                 return
 
             report = generate_base_report(
@@ -794,9 +810,8 @@ async def show_topic(query, user_id, key, page):
                 parse_mode="HTML",
             )
 
-            # If this came from cache, do not make the user wait for refresh.
-            # Refresh in the background and send only genuinely new stories.
-            if cached is not None and page == 1:
+            # The visible result is immediate; freshness work never blocks it.
+            if page == 1:
                 track_task(
                     send_topic_update(query.message, key, results),
                     f"topic-refresh-{user_id}-{key}",
@@ -937,6 +952,7 @@ async def button_handler(update, context):
     user_id = user.id
     register_user(user_id)
     data = query.data or ""
+    log.info("Callback received: %s", data)
 
     if data == "toggle_alerts":
         if user_id in MUTED_USERS:
@@ -1049,7 +1065,18 @@ async def button_handler(update, context):
         )
 
         try:
-            items = await get_fresh_news()
+            items = NEWS_CACHE.peek("all_news") or []
+            if not items:
+                track_task(
+                    collect_and_cache_news(),
+                    f"analysis-cache-warm-{user_id}",
+                )
+                await status.edit_text(
+                    "🧠 لا توجد بيانات جاهزة للتحليل الآن.\n"
+                    "📡 جاري تحديث التغطية في الخلفية، ثم أعد المحاولة بعد قليل."
+                )
+                return
+
             results = topic_filter(items, key, 8)
             if not results:
                 await status.edit_text(

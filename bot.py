@@ -1291,9 +1291,8 @@ async def urgent_monitor(
 async def post_init(
     application,
 ):
-    global 
-        URGENT_MONITOR_STARTED,
-        URGENT_MONITOR_TASK,
+        global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+
     
 
     if URGENT_MONITOR_STARTED:

@@ -131,6 +131,7 @@ URGENT_MONITOR_STARTED = False
 URGENT_BASELINE_READY = False
 URGENT_MONITOR_TASK = None
 BACKGROUND_TASKS: Set[asyncio.Task] = set()
+NEWS_COLLECTION_TASK = None
 
 TOPICS = {
     "econ": (
@@ -311,7 +312,7 @@ async def initialize_custom_emoji_pack(application):
         log.exception("Custom emoji pack failed; fallback enabled.")
 
 
-async def collect_and_cache_news():
+async def _run_news_collection():
     try:
         items = await asyncio.wait_for(
             collect_news(max_items=150),
@@ -325,6 +326,25 @@ async def collect_and_cache_news():
     except Exception:
         log.exception("News collection failed; keeping last available cache.")
     return NEWS_CACHE.peek("all_news") or []
+
+
+async def collect_and_cache_news():
+    """Single-flight collector: concurrent refresh requests share one task."""
+    global NEWS_COLLECTION_TASK
+
+    task = NEWS_COLLECTION_TASK
+    if task is None or task.done():
+        task = asyncio.create_task(
+            _run_news_collection(),
+            name="shared-news-collection",
+        )
+        NEWS_COLLECTION_TASK = task
+
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if NEWS_COLLECTION_TASK is task and task.done():
+            NEWS_COLLECTION_TASK = None
 
 
 async def get_fresh_news(force_refresh=False):
@@ -562,21 +582,47 @@ def urgent_score(item):
     return score
 
 
-def urgent_key(item):
-    """Stable urgent-event key independent of publisher/source.
+URGENT_KEY_STOPWORDS = {
+    "عاجل", "خبر", "اخبار", "تحديث", "جديد", "الان", "اليوم",
+    "breaking", "news", "urgent", "update", "latest",
+    "قال", "قالت", "يقول", "بحسب", "عن", "على", "في", "من", "الى",
+    "مع", "بعد", "قبل", "هذا", "هذه", "ذلك", "التي", "الذي",
+}
 
-    The same event may arrive later from a different publisher. Including the
-    source in the key caused the bot to alert it again as if it were new.
-    """
+
+def urgent_event_tokens(item):
     title = normalize_text(get_item_title(item))
-    # Remove generic breaking-news words that vary by publisher.
-    for term in (
-        "عاجل", "خبر عاجل", "breaking", "breaking news",
-        "urgent", "تحديث", "update",
-    ):
-        title = title.replace(normalize_text(term), " ")
-    title = re.sub(r"\s+", " ", title).strip()
-    return title[:500]
+    tokens = []
+    for token in title.split():
+        if len(token) < 3 or token in URGENT_KEY_STOPWORDS:
+            continue
+        tokens.append(token)
+    return set(tokens)
+
+
+def same_urgent_event(a, b):
+    """Conservative semantic duplicate check for differently worded headlines."""
+    ta = urgent_event_tokens(a)
+    tb = urgent_event_tokens(b)
+    if not ta or not tb:
+        return urgent_key(a) == urgent_key(b)
+
+    common = ta & tb
+    smaller = min(len(ta), len(tb))
+    union = ta | tb
+    containment = len(common) / max(1, smaller)
+    jaccard = len(common) / max(1, len(union))
+
+    # Require several shared meaningful words to avoid merging unrelated alerts.
+    return len(common) >= 3 and (containment >= 0.60 or jaccard >= 0.45)
+
+
+def urgent_key(item):
+    """Publisher-independent fingerprint for an urgent headline."""
+    tokens = sorted(urgent_event_tokens(item))
+    if tokens:
+        return " ".join(tokens)[:500]
+    return normalize_text(get_item_title(item))[:500]
 
 
 def find_new_urgent_news(items, limit=3):
@@ -589,10 +635,16 @@ def find_new_urgent_news(items, limit=3):
 
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    # A second event-level pass after urgency ranking prevents the same event
-    # from being emitted twice when several publishers phrase it differently.
-    ranked_items = [item for _, item in candidates]
-    return deduplicate_news(ranked_items)[:limit]
+    # Keep one representative per event even when publishers use different
+    # wording. Higher urgency/trust stays first because candidates are ranked.
+    unique = []
+    for _, item in candidates:
+        if any(same_urgent_event(item, kept) for kept in unique):
+            continue
+        unique.append(item)
+        if len(unique) >= limit:
+            break
+    return unique
 
 
 async def format_urgent_alert(item):

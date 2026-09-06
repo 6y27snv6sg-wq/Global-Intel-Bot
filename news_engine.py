@@ -347,20 +347,138 @@ def _published_close(a, b, hours=36):
     except Exception:
         return True
 
+EVENT_STOPWORDS = {
+    "عاجل", "خبر", "اخبار", "اليوم", "الان", "جديد", "تحديث",
+    "قال", "قالت", "يقول", "بحسب", "حول", "خلال", "بعد", "قبل",
+    "الى", "على", "عن", "في", "من", "مع", "هذا", "هذه",
+    "ذلك", "التي", "الذي", "وهو", "وهي",
+    "breaking", "news", "latest", "update", "says", "said", "according",
+    "after", "before", "with", "from", "into", "over", "amid", "the",
+}
+
+
 def tokenize(value):
-    return {x for x in normalize_text(value).split() if len(x) > 2}
+    return {
+        x for x in normalize_text(value).split()
+        if len(x) > 2 and x not in EVENT_STOPWORDS
+    }
+
 
 def normalized_title(value):
     return normalize_text(value)
 
+
 def title_fingerprint(value):
     return " ".join(sorted(tokenize(value)))
+
 
 def similarity_score(a, b):
     sa, sb = tokenize(a), tokenize(b)
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / max(1, len(sa | sb))
+
+
+def _title_numbers(value):
+    return set(re.findall(r"\b\d+(?:[.,]\d+)?%?\b", normalize_text(value)))
+
+
+def _first_keyword_window(value, size=7):
+    """First meaningful headline words after stopword cleanup."""
+    words = [
+        x for x in normalize_text(value).split()
+        if len(x) > 2 and x not in EVENT_STOPWORDS
+    ]
+    return words[:size]
+
+
+def _first_window_event_match(a, b, size=7):
+    """Use the first seven meaningful words as an extra same-event signal.
+
+    It is never sufficient alone: full-title overlap, time proximity and
+    conflicting-number guards remain mandatory.
+    """
+    wa = _first_keyword_window(a.title, size)
+    wb = _first_keyword_window(b.title, size)
+    if len(wa) < 4 or len(wb) < 4:
+        return False
+
+    sa, sb = set(wa), set(wb)
+    common = sa & sb
+    containment = len(common) / max(1, min(len(sa), len(sb)))
+
+    nums_a = _title_numbers(a.title)
+    nums_b = _title_numbers(b.title)
+    if nums_a and nums_b and nums_a.isdisjoint(nums_b):
+        return False
+
+    if not _published_close(a, b, hours=30):
+        return False
+
+    full_a = tokenize(a.title)
+    full_b = tokenize(b.title)
+    full_common = full_a & full_b
+    full_containment = len(full_common) / max(1, min(len(full_a), len(full_b)))
+
+    return (
+        len(common) >= 5
+        and containment >= 0.72
+        and len(full_common) >= 5
+        and full_containment >= 0.58
+    )
+
+
+def _source_names(item):
+    names = []
+    for value in [item.source] + list(item.alternate_sources or []):
+        value = str(value or "").strip()
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def _merge_sources(primary, secondary):
+    """Keep the strongest story but preserve all publisher names."""
+    merged = _source_names(primary)
+    for value in _source_names(secondary):
+        if value not in merged:
+            merged.append(value)
+
+    if merged:
+        primary.source = merged[0]
+        primary.alternate_sources = merged[1:]
+    return primary
+
+
+def display_sources(item):
+    """Human-readable merged source label for Telegram/UI callers."""
+    return " • ".join(_source_names(item))
+
+
+def _lexical_event_match(a, b):
+    """Conservative paraphrase detection without AI."""
+    ta = tokenize(a.title)
+    tb = tokenize(b.title)
+    if not ta or not tb:
+        return False
+
+    common = ta & tb
+    smaller = min(len(ta), len(tb))
+    union = ta | tb
+    containment = len(common) / max(1, smaller)
+    jaccard = len(common) / max(1, len(union))
+
+    nums_a = _title_numbers(a.title)
+    nums_b = _title_numbers(b.title)
+    if nums_a and nums_b and nums_a.isdisjoint(nums_b):
+        return False
+
+    if not _published_close(a, b, hours=30):
+        return False
+
+    return len(common) >= 4 and (
+        containment >= 0.68 or jaccard >= 0.50
+    )
 
 def same_event(a, b):
     na, nb = normalized_title(a.title), normalized_title(b.title)
@@ -380,6 +498,14 @@ def same_event(a, b):
     if sim >= 0.78:
         return True
     if sim >= 0.58 and a.region and a.region == b.region:
+        return True
+
+    # First seven meaningful words are an additional signal, never the only one.
+    if _first_window_event_match(a, b):
+        return True
+
+    # Strong paraphrase match for the same news cycle.
+    if _lexical_event_match(a, b):
         return True
 
     # Cross-language identity: compare language-neutral, high-signal event
@@ -433,11 +559,18 @@ class NewsItem:
     relevance_score: float = 0.0
     official: bool = False
     search_text: str = ""
+    alternate_sources: Optional[List[str]] = None
 
     def __post_init__(self):
         self.title = (self.title or "").strip()
         self.original_title = self.original_title or self.title
         self.source = (self.source or "مصدر إخباري").strip()
+        if self.alternate_sources is None:
+            self.alternate_sources = []
+        self.alternate_sources = [
+            str(x).strip() for x in self.alternate_sources
+            if str(x).strip()
+        ]
         self.summary = re.sub(r"<[^>]+>", " ", self.summary or "").strip()
         self.domain = (self.domain or urlparse(self.url).netloc or "").lower().replace("www.", "")
         combined = f"{self.title} {self.summary}"
@@ -636,36 +769,60 @@ def is_topic_match(item, topic_key):
     return False
 
 def deduplicate_news(items):
+    """Global event-level deduplication with source preservation.
+
+    This function is intentionally central: search, sections, collection and
+    urgent-news paths that call it all receive the same anti-duplication logic.
+    """
     unique = []
-    seen_urls = set()
+    seen_urls = {}
 
     for item in items:
         if _is_digest(item.title):
             continue
 
         url_key = item.url.strip().lower()
+
+        # Same URL: merge publisher metadata instead of silently discarding it.
         if url_key and url_key in seen_urls:
+            existing = seen_urls[url_key]
+            _merge_sources(existing, item)
             continue
-        if url_key:
-            seen_urls.add(url_key)
 
         duplicate = False
-        for existing in unique:
-            if same_event(item, existing):
-                if (
-                    item.trust_score > existing.trust_score
-                    or (
-                        item.published and existing.published
-                        and item.published > existing.published
+        for idx, existing in enumerate(unique):
+            if not same_event(item, existing):
+                continue
+
+            item_is_better = (
+                item.trust_score > existing.trust_score
+                or (
+                    item.trust_score == existing.trust_score
+                    and item.published and (
+                        not existing.published or item.published > existing.published
                     )
-                ):
-                    unique.remove(existing)
-                    unique.append(item)
-                duplicate = True
-                break
+                )
+            )
+
+            if item_is_better:
+                _merge_sources(item, existing)
+                unique[idx] = item
+                if existing.url:
+                    seen_urls[existing.url.strip().lower()] = item
+                if url_key:
+                    seen_urls[url_key] = item
+            else:
+                _merge_sources(existing, item)
+                if url_key:
+                    seen_urls[url_key] = existing
+
+            duplicate = True
+            break
 
         if not duplicate:
             unique.append(item)
+            if url_key:
+                seen_urls[url_key] = item
 
     return unique
 
@@ -928,6 +1085,44 @@ async def search_news_online(query, max_results=25):
     # Re-rank after translation so Arabic canonical titles can improve ordering.
     return rank_search_results(final_items, query)[:max_results]
 
+def _source_bucket(item):
+    # Diversity is based on the representative publisher, while merged
+    # alternate sources remain attached to the event.
+    source = normalize_text(item.source)
+    domain = (item.domain or "").lower().replace("www.", "")
+    return source or domain or "unknown"
+
+
+def diversify_search_results(items, first_window=10, per_source=2):
+    """Prevent one publisher from monopolizing the leading search results.
+
+    This reorders; it does not delete. Deferred stories remain available later.
+    """
+    if not items:
+        return items
+
+    selected = []
+    deferred = []
+    counts = {}
+
+    for item in items:
+        bucket = _source_bucket(item)
+        if len(selected) < first_window and counts.get(bucket, 0) >= per_source:
+            deferred.append(item)
+            continue
+
+        selected.append(item)
+        counts[bucket] = counts.get(bucket, 0) + 1
+
+    target = min(first_window, len(items))
+    if len(selected) < target:
+        need = target - len(selected)
+        selected.extend(deferred[:need])
+        deferred = deferred[need:]
+
+    return selected + deferred
+
+
 def rank_search_results(items, query):
     q_tokens = tokenize(query)
     normalized_query = normalize_text(query)
@@ -979,7 +1174,8 @@ def rank_search_results(items, query):
         ))
 
     ranked.sort(key=lambda x: x[:-1], reverse=True)
-    return [row[-1] for row in ranked]
+    ordered = [row[-1] for row in ranked]
+    return diversify_search_results(ordered)
 
 async def search_news(items, query, max_results=25):
     q_tokens = tokenize(query)

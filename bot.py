@@ -758,71 +758,67 @@ async def send_topic_update(message, key, previous_results):
 
 
 async def show_topic(query, user_id, key, page):
-    lock = USER_LOCKS.setdefault(user_id, asyncio.Lock())
+    """Fast cache-only topic/page navigation; never wait behind user locks."""
+    try:
+        await query.answer("📡 جاري تحميل الأخبار...", show_alert=False)
+    except Exception:
+        # An expired callback acknowledgement must not prevent page rendering.
+        log.info("Callback acknowledgement expired; continuing topic render.")
 
-    if lock.locked():
-        await query.answer("⏳ جاري التحميل...", show_alert=False)
-        return
+    status = await query.message.reply_text(
+        f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
+        "◌ جاري تجهيز أقرب الأخبار المتاحة...",
+        parse_mode="HTML",
+    )
 
-    await query.answer("📡 جاري تحميل الأخبار...", show_alert=False)
+    try:
+        cached = NEWS_CACHE.peek("all_news") or []
+        results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
 
-    async with lock:
-        status = await query.message.reply_text(
-            f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
-            "◌ جاري تجهيز أقرب الأخبار المتاحة...",
-            parse_mode="HTML",
-        )
-
-        try:
-            # Never block a category button on a full global refresh.
-            # Stale cache is still useful for immediate display.
-            cached = NEWS_CACHE.peek("all_news") or []
-            items = cached
-            results = topic_filter(items, key, MAX_SEARCH_RESULTS)
-
-            if not results:
-                await status.edit_text(
-                    f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
-                    "◌ لا توجد نتائج جاهزة في الذاكرة الآن.\n"
-                    "📡 جاري توسيع التغطية في الخلفية...",
-                    parse_mode="HTML",
-                )
+        if not results:
+            await status.edit_text(
+                f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
+                "◌ لا توجد نتائج جاهزة في الذاكرة الآن.\n"
+                "📡 جاري توسيع التغطية في الخلفية...",
+                parse_mode="HTML",
+            )
+            if page == 1:
                 track_task(
                     send_topic_update(query.message, key, []),
                     f"topic-refresh-{user_id}-{key}",
                 )
-                return
+            return
 
-            report = generate_base_report(
-                results,
-                page,
-                PER_PAGE,
-                heading=TOPICS[key][0],
-                subheading=(
-                    f"{len(results)} خبر متاح • "
-                    "التغطية الإضافية تستمر في الخلفية"
-                ),
-            )
-            await status.edit_text(
-                report,
-                reply_markup=result_keyboard(key, page, len(results)),
-                disable_web_page_preview=True,
-                parse_mode="HTML",
+        report = generate_base_report(
+            results,
+            page,
+            PER_PAGE,
+            heading=TOPICS[key][0],
+            subheading=(
+                f"{len(results)} خبر متاح • "
+                "التغطية الإضافية تستمر في الخلفية"
+            ),
+        )
+        await status.edit_text(
+            report,
+            reply_markup=result_keyboard(key, page, len(results)),
+            disable_web_page_preview=True,
+            parse_mode="HTML",
+        )
+
+        # Page navigation stays cache-only. Only page 1 starts freshness work.
+        if page == 1:
+            track_task(
+                send_topic_update(query.message, key, results),
+                f"topic-refresh-{user_id}-{key}",
             )
 
-            # The visible result is immediate; freshness work never blocks it.
-            if page == 1:
-                track_task(
-                    send_topic_update(query.message, key, results),
-                    f"topic-refresh-{user_id}-{key}",
-                )
-
-        except Exception:
-            log.exception("Topic handler failed.")
-            await status.edit_text(
-                "⚠️ تعذر تحديث هذا القسم الآن. "
-                "البوت مستمر ويمكنك فتح قسم آخر."
-            )
+    except Exception:
+        log.exception("Topic handler failed.")
+        await status.edit_text(
+            "⚠️ تعذر عرض هذا القسم الآن. "
+            "البوت مستمر ويمكنك فتح قسم آخر."
+        )
 
 
 async def show_search_page(query, user_id, page):

@@ -124,6 +124,7 @@ class SimpleCache:
 NEWS_CACHE = SimpleCache(CACHE_TTL)
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
+USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
@@ -868,64 +869,85 @@ async def send_topic_update(message, key, previous_results):
 
 
 async def show_topic(query, user_id, key, page):
-    """Fast cache-only topic/page navigation; never wait behind user locks."""
-    await safe_query_answer(
-        query,
-        "📡 جاري تحميل الأخبار...",
-        show_alert=False,
-    )
+    """Instant topic pagination from a stable cache snapshot.
 
-    status = await query.message.reply_text(
-        f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
-        "◌ جاري تجهيز أقرب الأخبار المتاحة...",
-        parse_mode="HTML",
-    )
+    Opening a populated section never starts a new collection cycle. Page 2+
+    always uses the same result snapshot created on page 1, so "المزيد" is
+    pure pagination and cannot be delayed or reshuffled by background refreshes.
+    """
+    await safe_query_answer(query)
+
+    snapshot_key = f"{user_id}:{key}"
 
     try:
-        cached = NEWS_CACHE.peek("all_news") or []
-        results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+        # Page 1 takes a fresh snapshot from the already-populated shared cache.
+        # Later pages must use that same snapshot for stable, instant pagination.
+        if page == 1:
+            cached = NEWS_CACHE.peek("all_news") or []
+            results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+            if results:
+                USER_TOPIC_RESULTS[snapshot_key] = list(results)
+        else:
+            results = USER_TOPIC_RESULTS.get(snapshot_key, [])
+            if not results:
+                cached = NEWS_CACHE.peek("all_news") or []
+                results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+                if results:
+                    USER_TOPIC_RESULTS[snapshot_key] = list(results)
 
-        if not results:
-            await status.edit_text(
+        if results:
+            total_pages = max(1, (len(results) + PER_PAGE - 1) // PER_PAGE)
+            page = min(page, total_pages)
+
+            report = generate_base_report(
+                results,
+                page,
+                PER_PAGE,
+                heading=TOPICS[key][0],
+                subheading=(
+                    f"{len(results)} خبر متاح • "
+                    f"الصفحة {page} من {total_pages}"
+                ),
+            )
+            await query.message.reply_text(
+                report,
+                reply_markup=result_keyboard(key, page, len(results)),
+                disable_web_page_preview=True,
+                parse_mode="HTML",
+            )
+
+            # A populated section is already useful. Do not launch a forced
+            # refresh merely because the user opened it or pressed "المزيد".
+            # Only a sparse first page may request background enrichment.
+            if page == 1 and len(results) < PER_PAGE:
+                track_task(
+                    send_topic_update(query.message, key, results),
+                    f"topic-refresh-{user_id}-{key}",
+                )
+            return
+
+        # No cached result exists. Only page 1 may start background discovery.
+        if page == 1:
+            await query.message.reply_text(
                 f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
                 "◌ لا توجد نتائج جاهزة في الذاكرة الآن.\n"
                 "📡 جاري توسيع التغطية في الخلفية...",
                 parse_mode="HTML",
             )
-            if page == 1:
-                track_task(
-                    send_topic_update(query.message, key, []),
-                    f"topic-refresh-{user_id}-{key}",
-                )
-            return
-
-        report = generate_base_report(
-            results,
-            page,
-            PER_PAGE,
-            heading=TOPICS[key][0],
-            subheading=(
-                f"{len(results)} خبر متاح • "
-                "التغطية الإضافية تستمر في الخلفية"
-            ),
-        )
-        await status.edit_text(
-            report,
-            reply_markup=result_keyboard(key, page, len(results)),
-            disable_web_page_preview=True,
-            parse_mode="HTML",
-        )
-
-        # Page navigation stays cache-only. Only page 1 starts freshness work.
-        if page == 1:
             track_task(
-                send_topic_update(query.message, key, results),
+                send_topic_update(query.message, key, []),
                 f"topic-refresh-{user_id}-{key}",
+            )
+        else:
+            await query.message.reply_text(
+                f"<b>{safe_html(TOPICS[key][0])}</b>\n\n"
+                "لا توجد أخبار إضافية محفوظة لهذه الصفحة.",
+                parse_mode="HTML",
             )
 
     except Exception:
         log.exception("Topic handler failed.")
-        await status.edit_text(
+        await query.message.reply_text(
             "⚠️ تعذر عرض هذا القسم الآن. "
             "البوت مستمر ويمكنك فتح قسم آخر."
         )

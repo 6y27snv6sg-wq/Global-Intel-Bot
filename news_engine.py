@@ -43,7 +43,7 @@ DATE_ENRICH_BUDGET = 2.5
 GENERAL_TRANSLATION_BUDGET = 2.0
 GENERAL_CANDIDATE_CAP = 100
 OFFICIAL_INDEX_TIMEOUT = 3.0
-OFFICIAL_INDEX_CONCURRENCY = 16
+OFFICIAL_INDEX_CONCURRENCY = 24
 OFFICIAL_INDEX_MAX_LINKS = 12
 OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 6
 OFFICIAL_INTERACTIVE_BUDGET = 5.5
@@ -1822,6 +1822,37 @@ def _official_index_date_hint(index_html, title, profile, article_url=None, docu
             dates = _official_calendar_dates(value)
             if len(dates) == 1:
                 evidence = dates
+        # Some publisher indexes use a date row followed by several release
+        # rows. Accept the closest preceding date only when both rows share a
+        # bounded container such as a table or section. This covers RBI-style
+        # grouped lists without borrowing a date from a neighbouring article.
+        if not evidence:
+            anchor = anchors[0]
+            anchor_pos = document.nodes.index(anchor)
+            anchor_ancestors = []
+            parent = anchor["parent"]
+            while parent:
+                anchor_ancestors.append(parent)
+                parent = parent["parent"]
+            for node in reversed(document.nodes[max(0, anchor_pos - 160):anchor_pos]):
+                if node["tag"] not in {"h2", "h3", "h4", "b", "strong", "p", "div", "span", "time", "td", "th"}:
+                    continue
+                value = document.visible(node)
+                if not re.fullmatch(r"(?:[A-Za-z]{3,9}\.?(?:\s+|\s*,\s*)\d{1,2},?\s+20\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2}|20\d{2}-\d{2}-\d{2})", value):
+                    continue
+                node_ancestors = []
+                parent = node["parent"]
+                while parent:
+                    node_ancestors.append(parent)
+                    parent = parent["parent"]
+                common = next((candidate for candidate in anchor_ancestors
+                               if any(candidate is other for other in node_ancestors)), None)
+                if common is None or common["tag"] in {"root", "body", "main"}:
+                    continue
+                dates = _official_calendar_dates(value, profile.get("date_order"))
+                if len(dates) == 1:
+                    evidence = dates
+                    break
     return next(iter(evidence)) if len(evidence) == 1 else None
 
 
@@ -1832,11 +1863,23 @@ def _visible_official_date(text, profile):
     document = _OfficialDocumentParser(text)
     visible = document.visible(document.root)
     # Label-specific captures stop before a separate modification timestamp.
-    labels = r"Published(?: on)?|Publié le|Le\s*:|Publicado(?: em| el)?|Pubblicato(?: il)?|Veröffentlicht(?: am)?|تاريخ النشر|نشر بتاريخ|الموافق"
+    labels = r"Published(?: on)?|Publié le|Le\s*:|Publicado(?: em| el)?|Pubblicato(?: il)?|Veröffentlicht(?: am)?|(?<![A-Za-z])Date(?![A-Za-z])|تاريخ النشر|نشر بتاريخ|الموافق"
     for match in re.finditer(rf"(?:{labels})\s*:?\s*(.{{1,65}})", visible, re.I):
         if re.search(r"updated|modified|mis à jour|تحديث", visible[max(0, match.start() - 20):match.start()], re.I):
             continue
         value = re.split(r"updated|modified|mis à jour|تحديث", match.group(1), flags=re.I)[0]
+        dates = _official_calendar_dates(value, profile.get("date_order"))
+        if len(dates) == 1:
+            return next(iter(dates))
+    # Several central banks display a compact standalone publication line.
+    # Require an explicit release marker so an event date in body text cannot
+    # become publication evidence.
+    for node in document.nodes:
+        if node["tag"] not in {"p", "div", "span", "time"}:
+            continue
+        value = document.visible(node)
+        if len(value) > 90 or not re.search(r"press release|media release|communiqu[eé]", value, re.I):
+            continue
         dates = _official_calendar_dates(value, profile.get("date_order"))
         if len(dates) == 1:
             return next(iter(dates))

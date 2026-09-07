@@ -1405,6 +1405,34 @@ def _official_index_url(template, now=None):
     return str(template).format(yyyymm=now.strftime("%Y%m"), yyyy=now.strftime("%Y"), mm=now.strftime("%m"))
 
 
+def _official_link_title(href, anchor_title):
+    """Return a human article title from a public index link.
+
+    Some official portals use a generic anchor such as ``قراءة المزيد`` for
+    every article while the public article URL itself contains the headline.
+    In that case derive the title from the visible public URL slug instead of
+    discarding the link.  No hidden endpoint or non-public metadata is used.
+    """
+    title = re.sub(r"\s+", " ", html.unescape(str(anchor_title or ""))).strip()
+    generic = {
+        normalize_text("قراءة المزيد"), normalize_text("اقرأ المزيد"),
+        normalize_text("المزيد"), normalize_text("read more"),
+        normalize_text("learn more"), normalize_text("more"),
+    }
+    if title and normalize_text(title) not in generic and len(tokenize(title)) >= 3:
+        return title
+
+    try:
+        path = urllib.parse.unquote(urlparse(str(href or "")).path or "")
+    except Exception:
+        path = ""
+    leaf = path.rstrip("/").rsplit("/", 1)[-1]
+    leaf = re.sub(r"\.(?:aspx?|html?|php)$", "", leaf, flags=re.I)
+    leaf = re.sub(r"[-_]+", " ", leaf)
+    leaf = re.sub(r"\s+", " ", leaf).strip()
+    return leaf if len(tokenize(leaf)) >= 3 else title
+
+
 def _official_article_links(index_html, index_url, profile):
     """Extract article links from a verified ministry publication index."""
     parser = _OfficialAnchorParser()
@@ -1419,6 +1447,7 @@ def _official_article_links(index_html, index_url, profile):
     seen = set()
     for href, title in parser.links:
         absolute = urljoin(index_url, href)
+        title = _official_link_title(absolute, title)
         parsed = urlparse(absolute)
         domain = (parsed.hostname or "").lower().replace("www.", "")
         path = (parsed.path or "").lower().strip("/")
@@ -1547,6 +1576,10 @@ async def _fetch_official_index(session, profile, index_url, semaphore):
         return []
 
     links = _official_article_links(body[:900000], index_url, profile)
+    log.info(
+        "Official public index domain=%s links=%d",
+        (urlparse(index_url).hostname or "").lower(), len(links),
+    )
     if not links:
         return []
     tasks = [

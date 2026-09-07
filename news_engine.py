@@ -6,6 +6,7 @@ import os
 import re
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -21,7 +22,8 @@ log = logging.getLogger("news_engine")
 FETCH_TIMEOUT = 4
 FETCH_CONNECT_TIMEOUT = 2
 FEED_PARSE_TIMEOUT = 1.5
-MAX_FEED_BYTES = 1_500_000
+MAX_FEED_BYTES = 900_000
+FEED_PARSE_WORKERS = 2
 FEED_CIRCUIT_FAILURES = 3
 FEED_CIRCUIT_COOLDOWN = 600
 COLLECTION_CONCURRENCY = 20
@@ -50,6 +52,14 @@ OFFICIAL_INDEX_PUBLISHERS = ("saudi_arabia", "china", "japan", "france")
 BREAKING_FEED_CONCURRENCY = 12
 
 _FEED_FAILURE_STATE = {}
+# feedparser is pure-Python and can monopolize the GIL when many feeds parse at once.
+# Keep RSS parsing on a small dedicated pool so background collectors cannot starve
+# Telegram callbacks or the main asyncio loop.
+_FEED_PARSE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=FEED_PARSE_WORKERS,
+    thread_name_prefix="feed-parser",
+)
+_FEED_PARSE_SEMAPHORE = asyncio.Semaphore(FEED_PARSE_WORKERS)
 BREAKING_TRANSLATION_BUDGET = 1.2
 BREAKING_MAX_PER_FEED = 12
 
@@ -2351,10 +2361,20 @@ async def fetch_feed(session, source, url):
                 _record_feed_failure(source)
                 return []
 
-        parsed = await asyncio.wait_for(
-            asyncio.to_thread(feedparser.parse, data),
-            timeout=FEED_PARSE_TIMEOUT,
-        )
+        # Do not submit an unbounded number of pure-Python parsers to the
+        # interpreter's default executor.  Under simultaneous full collection +
+        # breaking polling, 10+ feedparser jobs contend for the GIL and can make
+        # even the Home button appear frozen for ~20 seconds.  A tiny dedicated
+        # pool isolates parser CPU from Telegram's event loop.
+        async with _FEED_PARSE_SEMAPHORE:
+            loop = asyncio.get_running_loop()
+            parse_future = loop.run_in_executor(
+                _FEED_PARSE_EXECUTOR, feedparser.parse, data
+            )
+            parsed = await asyncio.wait_for(
+                parse_future,
+                timeout=FEED_PARSE_TIMEOUT,
+            )
         items = []
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)

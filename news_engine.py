@@ -40,6 +40,13 @@ OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 2
 OFFICIAL_INTERACTIVE_BUDGET = 5.5
 OFFICIAL_INDEX_PUBLISHERS = ("saudi_arabia", "china", "japan", "france")
 
+# Fast breaking-news lane: direct publisher feeds only.  This path is designed
+# for frequent lightweight polling and deliberately excludes Google discovery,
+# official page crawling, date enrichment, and AI analysis.
+BREAKING_FEED_CONCURRENCY = 12
+BREAKING_TRANSLATION_BUDGET = 1.2
+BREAKING_MAX_PER_FEED = 12
+
 # Current-news policy: the live platform contains only today and the previous
 # three UTC calendar days. Historical research belongs to a separate path.
 CURRENT_NEWS_LOOKBACK_DAYS = 3
@@ -2706,6 +2713,83 @@ async def hybrid_search_news(items, query, max_results=25):
             filtered.append(item)
 
     return filtered[:max_results]
+
+def _breaking_signal_score(item):
+    """Return a lightweight event score for the fast breaking-news lane.
+
+    The goal is recall from direct publisher feeds, not final alert severity.
+    Telegram applies its stricter urgent threshold before notifying users.
+    """
+    title = normalize_text(getattr(item, "title", ""))
+    summary = normalize_text(getattr(item, "summary", ""))
+    score = 0
+    for term in URGENT_TERMS:
+        needle = normalize_text(term)
+        if not needle:
+            continue
+        if needle in title:
+            score += 3
+        elif needle in summary:
+            score += 1
+    return score
+
+
+async def collect_breaking_news(max_items=30):
+    """Lightweight direct-feed collector for low-latency breaking alerts.
+
+    This intentionally reads only already-configured public publisher RSS feeds.
+    It does not run search-engine discovery or direct-page collectors, so it can
+    be polled frequently without turning the full news engine into a hot loop.
+    """
+    feeds = {**TRUSTED_FEEDS, **ADDITIONAL_TRUSTED_FEEDS}
+    connector = aiohttp.TCPConnector(
+        limit=BREAKING_FEED_CONCURRENCY,
+        limit_per_host=2,
+        ttl_dns_cache=60,
+    )
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            asyncio.create_task(fetch_feed(session, source, url))
+            for source, url in feeds.items()
+        ]
+        groups = await asyncio.gather(*tasks, return_exceptions=True)
+
+    candidates = []
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for item in group[:BREAKING_MAX_PER_FEED]:
+            if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
+                continue
+            if not _is_current_news(item):
+                continue
+            if _breaking_signal_score(item) <= 0:
+                continue
+            candidates.append(item)
+
+    # Deduplicate before translation to keep the hot path small, then translate
+    # only the few signal-bearing titles needed for Telegram's Arabic alert UI.
+    candidates = deduplicate_news(candidates)
+    candidates.sort(
+        key=lambda item: (
+            _breaking_signal_score(item),
+            float(getattr(item, "trust_score", 0) or 0),
+            item.published.timestamp() if item.published else 0,
+        ),
+        reverse=True,
+    )
+    candidates = candidates[:max_items]
+    candidates = await translate_news_titles(
+        candidates, budget=BREAKING_TRANSLATION_BUDGET
+    )
+
+    log.info(
+        "Breaking lane feeds=%d candidates=%d returned=%d",
+        len(feeds), len(candidates), min(len(candidates), max_items),
+    )
+    return candidates[:max_items]
+
 
 async def collect_news(max_items=150):
     feeds = {**TRUSTED_FEEDS, **ADDITIONAL_TRUSTED_FEEDS}

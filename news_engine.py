@@ -27,7 +27,8 @@ ONLINE_SEARCH_BUDGET = 3.5
 SEARCH_TRANSLATION_BUDGET = 1.0
 LOCAL_SEARCH_TRANSLATION_BUDGET = 0.6
 SEARCH_TRANSLATION_RESULT_CAP = 10
-DISCOVERY_BUDGET = 6
+DISCOVERY_BUDGET = 4.5
+DISCOVERY_CONCURRENCY = 8
 ROTATION_WINDOW_SECONDS = 300
 DATE_ENRICH_TIMEOUT = 2.5
 DATE_ENRICH_CONCURRENCY = 6
@@ -2779,27 +2780,64 @@ async def collect_news(max_items=150):
     ]
 
     try:
-        discovery_tasks = [
-            asyncio.create_task(search_news_online(q, 15))
-            for q in discovery_queries
-        ]
-        done, pending = await asyncio.wait(
-            discovery_tasks,
-            timeout=DISCOVERY_BUDGET,
+        # Background discovery is intentionally much leaner than interactive
+        # search.  The old path called search_news_online() once per discovery
+        # query; each call could expand aliases, create its own session, enrich
+        # dates, deduplicate and translate.  With many global probes that
+        # multiplied network requests and CPU work before one fresh item could
+        # reach the cache.
+        #
+        # The collector now performs one public Google News RSS request per
+        # discovery query through a shared bounded session.  Expensive date
+        # verification, translation and event deduplication happen once below
+        # across the merged candidate set.  Fast sources therefore surface
+        # immediately while slow probes are cancelled at the common budget.
+        discovery_connector = aiohttp.TCPConnector(
+            limit=DISCOVERY_CONCURRENCY,
+            limit_per_host=DISCOVERY_CONCURRENCY,
+            ttl_dns_cache=60,
         )
+        async with aiohttp.ClientSession(connector=discovery_connector) as discovery_session:
+            discovery_tasks = [
+                asyncio.create_task(
+                    fetch_feed(discovery_session, f"بحث: {q}", google_news_url(q))
+                )
+                for q in discovery_queries
+            ]
+            done, pending = await asyncio.wait(
+                discovery_tasks,
+                timeout=DISCOVERY_BUDGET,
+            )
 
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
+        discovery_added = 0
         for task in done:
             try:
                 group = task.result()
-                if isinstance(group, list):
-                    items.extend(group)
+                if not isinstance(group, list):
+                    continue
+                for item in group:
+                    # Keep only article-like candidates here.  Freshness is
+                    # enforced authoritatively after the shared date-enrichment
+                    # pass below, so unknown-date originals still get one chance
+                    # to prove they are current.
+                    if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
+                        continue
+                    if _freshness_state(item) in {"stale", "future"}:
+                        continue
+                    items.append(item)
+                    discovery_added += 1
             except Exception:
                 continue
+
+        log.info(
+            "Background discovery queries=%d completed=%d pending=%d added=%d budget=%.1fs",
+            len(discovery_queries), len(done), len(pending), discovery_added, DISCOVERY_BUDGET,
+        )
 
     except Exception:
         log.exception("Discovery failed; returning available direct-feed news.")

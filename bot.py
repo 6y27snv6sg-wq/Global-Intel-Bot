@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import difflib
 import logging
 import os
 import re
@@ -80,6 +81,8 @@ URGENT_MONITOR_INTERVAL = 30
 URGENT_INITIAL_DELAY = 8
 BREAKING_LANE_TIMEOUT = 8
 MAX_SENT_URGENT_KEYS = 500
+MAX_RECENT_URGENT_EVENTS = 300
+RECENT_URGENT_EVENT_TTL = 12 * 3600
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -132,6 +135,7 @@ USER_LOCKS: Dict[int, asyncio.Lock] = {}
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
 SENT_URGENT_KEYS = deque(maxlen=MAX_SENT_URGENT_KEYS)
+RECENT_URGENT_EVENTS = deque(maxlen=MAX_RECENT_URGENT_EVENTS)
 
 CUSTOM_EMOJI_IDS = {}
 URGENT_MONITOR_STARTED = False
@@ -412,7 +416,7 @@ async def collect_and_cache_news():
 
 def get_cached_news_view(limit=150):
     """Read-only UI view: breaking overlay + broad cache, without TTL mutation."""
-    breaking = BREAKING_CACHE.peek("breaking_news") or []
+    breaking = BREAKING_CACHE.get("breaking_news") or []
     broad = NEWS_CACHE.peek("all_news") or []
     return deduplicate_events(list(breaking) + list(broad), limit=limit)
 
@@ -422,12 +426,12 @@ async def get_fresh_news(force_refresh=False):
         cached = NEWS_CACHE.get("all_news")
         if cached is not None:
             return deduplicate_events(
-                list(BREAKING_CACHE.peek("breaking_news") or []) + list(cached),
+                list(BREAKING_CACHE.get("breaking_news") or []) + list(cached),
                 limit=150,
             )
     items = await collect_and_cache_news()
     return deduplicate_events(
-        list(BREAKING_CACHE.peek("breaking_news") or []) + list(items or []),
+        list(BREAKING_CACHE.get("breaking_news") or []) + list(items or []),
         limit=150,
     )
 
@@ -465,10 +469,10 @@ def topic_filter(items, topic_key, max_results=25):
         scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return deduplicate_events(
-        [item for _, item in scored[:max_results * 2]],
-        limit=max_results,
-    )
+    ranked = [item for _, item in scored[:max_results * 3]]
+    if topic_key == "urg":
+        return deduplicate_urgent_events(ranked, limit=max_results)
+    return deduplicate_events(ranked, limit=max_results)
 
 
 def generate_base_report(
@@ -672,6 +676,8 @@ URGENT_KEY_STOPWORDS = {
     "breaking", "news", "urgent", "update", "latest",
     "قال", "قالت", "يقول", "بحسب", "عن", "على", "في", "من", "الى",
     "مع", "بعد", "قبل", "هذا", "هذه", "ذلك", "التي", "الذي",
+    "وسائل", "وسايل", "اعلام", "تقارير", "تقرير", "دوي", "العاصمه", "مدينه",
+    "تشهد", "يهز",
 }
 
 
@@ -679,14 +685,40 @@ def urgent_event_tokens(item):
     title = normalize_text(get_item_title(item))
     tokens = []
     for token in title.split():
-        if len(token) < 3 or token in URGENT_KEY_STOPWORDS:
+        if len(token) < 3:
             continue
+        bare = token[2:] if token.startswith("ال") and len(token) > 4 else token
+        if token in URGENT_KEY_STOPWORDS or bare in URGENT_KEY_STOPWORDS:
+            continue
+        # Arabic tanween can leave a trailing alef after diacritics are stripped
+        # (e.g. "انفجاراً" -> "انفجارا"). Canonicalize that lightweight form
+        # only for longer tokens used by the urgent-event matcher.
+        if re.search(r"[\u0600-\u06FF]", token) and len(token) >= 5 and token.endswith("ا"):
+            token = token[:-1]
         tokens.append(token)
     return set(tokens)
 
 
 def same_urgent_event(a, b):
-    """Conservative semantic duplicate check for differently worded headlines."""
+    """High-precision urgent-event matcher used across feed cycles and UI views.
+
+    Breaking headlines often gain prefixes, source labels, or a few extra words on
+    every polling cycle.  This matcher is intentionally more tolerant than the
+    general-news matcher, while conflicting material numbers keep real updates
+    separate.
+    """
+    na = normalize_text(get_item_title(a))
+    nb = normalize_text(get_item_title(b))
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+
+    nums_a = set(re.findall(r"(?<!\w)\d{2,}(?!\w)", na))
+    nums_b = set(re.findall(r"(?<!\w)\d{2,}(?!\w)", nb))
+    if nums_a and nums_b and nums_a.isdisjoint(nums_b):
+        return False
+
     ta = urgent_event_tokens(a)
     tb = urgent_event_tokens(b)
     if not ta or not tb:
@@ -697,9 +729,13 @@ def same_urgent_event(a, b):
     union = ta | tb
     containment = len(common) / max(1, smaller)
     jaccard = len(common) / max(1, len(union))
+    similarity = difflib.SequenceMatcher(None, na, nb).ratio()
 
-    # Require several shared meaningful words to avoid merging unrelated alerts.
-    return len(common) >= 3 and (containment >= 0.60 or jaccard >= 0.45)
+    return (
+        (len(common) >= 3 and (containment >= 0.55 or jaccard >= 0.42))
+        or (len(common) >= 2 and containment >= 0.80 and jaccard >= 0.50)
+        or (len(common) >= 2 and similarity >= 0.82)
+    )
 
 
 def urgent_key(item):
@@ -834,6 +870,50 @@ def deduplicate_events(items, limit=None):
     return unique[:limit] if limit is not None else unique
 
 
+def deduplicate_urgent_events(items, limit=None):
+    """Collapse differently worded urgent coverage to one canonical event."""
+    base = deduplicate_events(items or [])
+    unique = []
+    for item in base:
+        matched = None
+        for kept in unique:
+            if same_urgent_event(item, kept):
+                matched = kept
+                break
+        if matched is not None:
+            _merge_event_sources(matched, item)
+            continue
+        unique.append(item)
+    return unique[:limit] if limit is not None else unique
+
+
+def _prune_recent_urgent_events(now=None):
+    now = time.monotonic() if now is None else now
+    while RECENT_URGENT_EVENTS:
+        seen_at, _ = RECENT_URGENT_EVENTS[0]
+        if now - seen_at <= RECENT_URGENT_EVENT_TTL:
+            break
+        RECENT_URGENT_EVENTS.popleft()
+
+
+def urgent_event_seen_recently(item):
+    """True when the same semantic urgent event was already delivered recently."""
+    _prune_recent_urgent_events()
+    return any(same_urgent_event(item, prior) for _, prior in RECENT_URGENT_EVENTS)
+
+
+def remember_urgent_event(item):
+    """Remember one delivered/baselined event without growing an unbounded history."""
+    now = time.monotonic()
+    _prune_recent_urgent_events(now)
+    for idx, (seen_at, prior) in enumerate(RECENT_URGENT_EVENTS):
+        if same_urgent_event(item, prior):
+            _merge_event_sources(prior, item)
+            RECENT_URGENT_EVENTS[idx] = (now, prior)
+            return
+    RECENT_URGENT_EVENTS.append((now, item))
+
+
 def urgent_source_names(item):
     """Return unique publisher labels preserved by engine-level deduplication."""
     values = [get_item_source(item)] + list(
@@ -909,11 +989,16 @@ def urgent_precision_state(item):
 
 def find_new_urgent_news(items, limit=3):
     candidates = []
-    for item in deduplicate_events(items):
+    for item in deduplicate_urgent_events(items):
         score = urgent_score(item)
         state = urgent_precision_state(item)
         key = urgent_key(item)
-        if state and key and key not in SENT_URGENT_KEYS:
+        if (
+            state
+            and key
+            and key not in SENT_URGENT_KEYS
+            and not urgent_event_seen_recently(item)
+        ):
             candidates.append((score, state, item))
 
     candidates.sort(
@@ -985,13 +1070,13 @@ async def _run_breaking_lane():
 
 
 def _merge_breaking_into_cache(items):
-    """Update the fast overlay without touching broad-news cache freshness."""
+    """Update the fast overlay as canonical events, not raw feed-cycle headlines."""
     if not items:
         return
-    cached = BREAKING_CACHE.peek("breaking_news") or []
+    cached = BREAKING_CACHE.get("breaking_news") or []
     BREAKING_CACHE.set(
         "breaking_news",
-        deduplicate_events(list(items) + list(cached), limit=80),
+        deduplicate_urgent_events(list(items) + list(cached), limit=80),
     )
 
 
@@ -1011,6 +1096,7 @@ async def initialize_urgent_baseline():
             key = urgent_key(item)
             if key:
                 SENT_URGENT_KEYS.append(key)
+                remember_urgent_event(item)
 
     URGENT_BASELINE_READY = True
 
@@ -1029,7 +1115,7 @@ async def urgent_monitor(application):
                 _merge_breaking_into_cache(items)
                 alerts = find_new_urgent_news(items)
                 publishable = sum(
-                    1 for item in deduplicate_events(items)
+                    1 for item in deduplicate_urgent_events(items)
                     if urgent_precision_state(item)
                 )
                 log.info(
@@ -1061,6 +1147,7 @@ async def urgent_monitor(application):
 
                     if delivered:
                         SENT_URGENT_KEYS.append(key)
+                        remember_urgent_event(item)
 
         except asyncio.CancelledError:
             raise

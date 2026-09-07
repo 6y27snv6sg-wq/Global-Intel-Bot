@@ -40,11 +40,12 @@ DATE_ENRICH_TIMEOUT = 2.5
 DATE_ENRICH_CONCURRENCY = 6
 DATE_ENRICH_MAX_CANDIDATES = 12
 OFFICIAL_INDEX_TIMEOUT = 3.0
-OFFICIAL_INDEX_CONCURRENCY = 8
-OFFICIAL_INDEX_MAX_LINKS = 4
-OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 2
+OFFICIAL_INDEX_CONCURRENCY = 16
+OFFICIAL_INDEX_MAX_LINKS = 12
+OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 6
 OFFICIAL_INTERACTIVE_BUDGET = 5.5
-OFFICIAL_INDEX_PUBLISHERS = ("saudi_arabia", "china", "japan", "france")
+OFFICIAL_COLLECTION_BUDGET = 12.0
+OFFICIAL_MAX_PAGE_BYTES = 900_000
 
 # Fast breaking-news lane: direct publisher feeds only.  This path is designed
 # for frequent lightweight polling and deliberately excludes Google discovery,
@@ -368,30 +369,37 @@ async def translate_news_titles(items, budget=None):
         if not task_map:
             return items
 
-        done, pending = await asyncio.wait(
-            task_map.keys(),
-            timeout=budget,
-        )
-
-        for task in done:
-            item = task_map[task]
-            try:
-                translated = task.result()
-            except Exception:
-                continue
-            if translated and translated != item.title:
-                item.original_title = item.original_title or item.title
-                item.title = translated
-                item.search_text = normalize_text(
-                    f"{item.title} {item.original_title} {item.summary} "
-                    f"{item.source} {item.region}"
-                )
-
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-            log.warning("Search title translation budget exceeded for %s title(s); skipped unfinished translations.", len(pending))
+        try:
+            done, pending = await asyncio.wait(
+                task_map.keys(),
+                timeout=budget,
+            )
+    
+            for task in done:
+                item = task_map[task]
+                try:
+                    translated = task.result()
+                except Exception:
+                    continue
+                if translated and translated != item.title:
+                    item.original_title = item.original_title or item.title
+                    item.title = translated
+                    item.search_text = normalize_text(
+                        f"{item.title} {item.original_title} {item.summary} "
+                        f"{item.source} {item.region}"
+                    )
+    
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+                log.warning("Search title translation budget exceeded for %s title(s); skipped unfinished translations.", len(pending))
+        finally:
+            unfinished = [task for task in task_map if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
 
     return items
 
@@ -593,6 +601,8 @@ def _lexical_event_match(a, b):
     )
 
 def same_event(a, b):
+    if getattr(a, "official_source_id", "") or getattr(b, "official_source_id", ""):
+        return a.url.split("#", 1)[0] == b.url.split("#", 1)[0]
     na, nb = normalized_title(a.title), normalized_title(b.title)
     if not na or not nb:
         return False
@@ -677,6 +687,8 @@ class NewsItem:
     search_text: str = ""
     alternate_sources: Optional[List[str]] = None
     discovery_domain_hint: str = ""
+    official_source_id: str = ""
+    publication_evidence: str = ""
 
     def __post_init__(self):
         self.title = (self.title or "").strip()
@@ -866,19 +878,17 @@ def _direct_official_statement(item):
     Verified original-publisher provenance therefore carries more weight than a
     narrow keyword such as ``statement``.  Ordinary media mentions still fail.
     """
-    if not _official_signal(item.title, item.summary, item):
-        return False
-    if _official_publisher_provenance(item):
-        return True
-
-    title = normalize_text(item.title)
-    document_markers = (
-        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "مؤتمر صحفي", "تصريح", "احاطة",
-        "official statement", "press statement", "press release", "joint statement",
-        "media note", "fact sheet", "press conference", "readout", "remarks by",
-        "briefing by", "spokesperson", "communique", "communiqué", "declaration",
-    )
-    return item.official and any(normalize_text(x) in title for x in document_markers)
+    if (getattr(item, "official_source_id", "") in OFFICIAL_SOURCE_REGISTRY
+            and getattr(item, "publication_evidence", "")
+            and _is_current_news(item)):
+        profile = OFFICIAL_SOURCE_REGISTRY[item.official_source_id]
+        if profile.get("statement_index") and _domain_matches(item.domain, profile["domains"]):
+            return True
+    profile = OFFICIAL_SOURCE_REGISTRY.get(getattr(item, "official_source_id", ""))
+    return bool(profile and getattr(item, "publication_evidence", "")
+                and _is_current_news(item)
+                and _domain_matches(item.domain, profile["domains"])
+                and _official_signal(item.original_title or item.title, item.summary, item))
 
 
 def classify_item(item):
@@ -1273,7 +1283,8 @@ FOREIGN_MINISTRY_REGISTRY = {
         "country_aliases": ("فرنسا", "France"),
         "adjectives": ("الفرنسية", "الفرنسيه", "French"),
         "domains": ("diplomatie.gouv.fr",),
-        "publication_paths": ("/presse/", "/declarations-officielles-et-interventions"),
+        "publication_paths": ("/presse/", "/declarations-officielles-et-interventions",
+                              "/presse-et-ressources/decouvrir-et-informer/actualites/"),
         "publication_terms": ("communiqué", "declaration", "déclaration", "point de presse", "entretien"),
         "publisher_name": "France Diplomatie",
         "index_urls": ("https://www.diplomatie.gouv.fr/fr/presse/espace-presse/declarations-officielles-et-interventions",),
@@ -1286,7 +1297,6 @@ FOREIGN_MINISTRY_REGISTRY = {
         "publication_terms": ("spokesperson remarks", "regular press conference", "foreign ministry", "statement"),
         "publisher_name": "Ministry of Foreign Affairs of China",
         "index_urls": ("https://www.mfa.gov.cn/eng/xw/fyrbt/",),
-        "updated_label_is_publication": True,
     },
     "russia": {
         "country_aliases": ("روسيا", "Russia"),
@@ -1351,7 +1361,7 @@ FOREIGN_MINISTRY_REGISTRY = {
         "publication_paths": ("/press/release/", "/press/kaiken/"),
         "publication_terms": ("press release", "meeting", "courtesy call", "statement", "telephone talk"),
         "publisher_name": "Ministry of Foreign Affairs of Japan",
-        "index_urls": ("https://www.mofa.go.jp/press/release/{yyyymm}_index.html",),
+        "index_urls": ("https://www.mofa.go.jp/press/release/index.html",),
     },
     "india": {
         "country_aliases": ("الهند", "India"),
@@ -1379,6 +1389,95 @@ FOREIGN_MINISTRY_REGISTRY = {
         "domains": ("mfa.gov.ua",),
     },
 }
+
+
+# Registry coverage and successful collection are reported separately.
+# Membership never supplies a ranking bonus.
+G20_MEMBERS = frozenset((
+    "argentina", "australia", "brazil", "canada", "china", "france",
+    "germany", "india", "indonesia", "italy", "japan", "mexico", "russia",
+    "saudi_arabia", "south_africa", "south_korea", "turkey",
+    "united_kingdom", "united_states", "european_union", "african_union",
+))
+# Public publisher indexes, not a declaration of successful live retrieval.
+# Refused/dynamic pages remain visible in diagnostics; no internal API fallback.
+_OFFICIAL_PUBLIC_SOURCES = """argentina|foreign_affairs|الخارجية الأرجنتينية|https://www.cancilleria.gob.ar/es/comunicados-oficiales|/comunicados/;/actualidad/|1
+argentina|central_bank|البنك المركزي الأرجنتيني|https://www.bcra.gob.ar/noticias/||0
+australia|foreign_affairs|الخارجية الأسترالية|https://www.dfat.gov.au/news/departmental-media-releases|/news/|1
+australia|central_bank|البنك الاحتياطي الأسترالي|https://www.rba.gov.au/media-releases/|/media-releases/|1
+brazil|foreign_affairs|الخارجية البرازيلية|https://www.gov.br/mre/en/contact-us/press-area/press-releases|/press-releases/|1
+brazil|government|الرئاسة البرازيلية|https://www.gov.br/planalto/en/latest-news|/latest-news/|0
+canada|foreign_affairs|الخارجية الكندية|https://www.canada.ca/en/global-affairs/news.html|/global-affairs/news/|1
+canada|central_bank|بنك كندا|https://www.bankofcanada.ca/press/||1
+canada|government|رئيس الوزراء الكندي|https://www.pm.gc.ca/en/news|/news/|1
+china|foreign_affairs|الخارجية الصينية|https://www.mfa.gov.cn/eng/xw/fyrbt/|/fyrbt/|1
+china|government|الحكومة الصينية|https://english.www.gov.cn/news/|/news/;/policies/|0
+france|foreign_affairs|الخارجية الفرنسية|https://www.diplomatie.gouv.fr/fr/presse/espace-presse/declarations-officielles-et-interventions|/declarations-officielles-et-interventions/;/actualites/|1
+france|central_bank|بنك فرنسا|https://www.banque-france.fr/en/news|/news/|0
+france|government|الرئاسة الفرنسية|https://www.elysee.fr/toutes-les-actualites||0
+germany|foreign_affairs|الخارجية الألمانية|https://www.auswaertiges-amt.de/en/newsroom/news|/newsroom/news/|1
+germany|central_bank|البنك الاتحادي الألماني|https://www.bundesbank.de/en/press/press-releases|/press/press-releases/|1
+india|foreign_affairs|الخارجية الهندية|https://www.mea.gov.in/press-releases|/press-releases|1
+india|central_bank|البنك الاحتياطي الهندي|https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx|bs_pressrelease|1
+india|official_agency|مكتب المعلومات الصحفية الهندي|https://www.pib.gov.in/allRel.aspx?reg=48&lang=2|pressrelease|1
+indonesia|foreign_affairs|الخارجية الإندونيسية|https://kemlu.go.id/||1
+indonesia|central_bank|بنك إندونيسيا|https://www.bi.go.id/en/default.aspx|/news-release/|1
+italy|foreign_affairs|الخارجية الإيطالية|https://www.esteri.it/en/sala_stampa/archivionotizie/comunicati/|/archivionotizie/comunicati/|1
+italy|central_bank|بنك إيطاليا|https://www.bancaditalia.it/media/comunicati/index.html?com.dotmarketing.htmlpage.language=1|/media/comunicati/|1
+japan|foreign_affairs|الخارجية اليابانية|https://www.mofa.go.jp/press/release/index.html|/press/release/|1
+japan|central_bank|بنك اليابان|https://www.boj.or.jp/en/whatsnew/index.htm|/en/|0
+mexico|foreign_affairs|الخارجية المكسيكية|https://www.gob.mx/sre/archivo/prensa|/sre/prensa/|1
+mexico|finance|المالية المكسيكية|https://www.gob.mx/shcp/archivo/prensa|/shcp/prensa/|1
+russia|foreign_affairs|الخارجية الروسية|https://www.mid.ru/en/press_service/spokesman/official_statement/|/press_service/|1
+russia|central_bank|بنك روسيا|https://www.cbr.ru/eng/news/|/eng/press/;/eng/dkp/;/eng/news/|0
+saudi_arabia|foreign_affairs|الخارجية السعودية|https://www.mofa.gov.sa/ar/ministry/statements/Pages/default.aspx|/ministry/statements/|1
+saudi_arabia|central_bank|البنك المركزي السعودي|https://www.sama.gov.sa/ar-SA/MediaCenter/News/Pages/AllNews.aspx|/news/|1
+south_africa|foreign_affairs|الخارجية الجنوب أفريقية|https://dirco.gov.za/media-statements/||1
+south_africa|central_bank|البنك الاحتياطي الجنوب أفريقي|https://www.resbank.co.za/en/home/publications/media-releases|/publications/|1
+south_korea|foreign_affairs|الخارجية الكورية الجنوبية|https://www.mofa.go.kr/eng/brd/m_5676/list.do|/m_5676/view.do|1
+south_korea|central_bank|بنك كوريا|https://www.bok.or.kr/eng/bbs/E0000634/list.do?menuNo=400069|/e0000634/view.do|1
+turkey|foreign_affairs|الخارجية التركية|https://www.mfa.gov.tr/sub.en.mfa?ad9093da-8e71-4678-a1b6-05f297baadc4=||1
+turkey|central_bank|البنك المركزي التركي|https://www.tcmb.gov.tr/wps/wcm/connect/en/tcmb+en/main+menu/announcements/press+releases|/press|1
+united_kingdom|foreign_affairs|الخارجية البريطانية|https://www.gov.uk/government/organisations/foreign-commonwealth-development-office|/government/news/;/government/speeches/|1
+united_kingdom|central_bank|بنك إنجلترا|https://www.bankofengland.co.uk/news|/news/|1
+united_kingdom|defence|الدفاع البريطانية|https://www.gov.uk/government/organisations/ministry-of-defence|/government/news/;/government/speeches/|1
+united_states|foreign_affairs|الخارجية الأمريكية|https://www.state.gov/releases|/releases/;/briefings/;/remarks/|1
+united_states|central_bank|الاحتياطي الفيدرالي الأمريكي|https://www.federalreserve.gov/newsevents/pressreleases/{yyyy}-press.htm|/newsevents/pressreleases/|1
+united_states|finance|الخزانة الأمريكية|https://home.treasury.gov/news/press-releases|/news/press-releases/|1
+european_union|council|مجلس الاتحاد الأوروبي|https://www.consilium.europa.eu/en/press/press-releases/|/press/press-releases/|1
+european_union|central_bank|البنك المركزي الأوروبي|https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release|/press/pr/|1
+african_union|commission|مفوضية الاتحاد الأفريقي|https://au.int/en/press-releases|/pressreleases/|1
+african_union|peace_security|مجلس السلم والأمن الأفريقي|https://www.peaceau.org/en/|/article/|1"""
+OFFICIAL_SOURCE_REGISTRY = {}
+for _row in _OFFICIAL_PUBLIC_SOURCES.splitlines():
+    _member, _institution, _name, _url, _paths, _dedicated = _row.split("|")
+    _source_id = f"{_member}:{_institution}:0"
+    _base = FOREIGN_MINISTRY_REGISTRY.get(_member, {}) if _institution == "foreign_affairs" else {}
+    OFFICIAL_SOURCE_REGISTRY[_source_id] = {
+        **_base, "source_id": _source_id, "member_id": _member,
+        "institution": _institution, "scope": "g20", "publisher_name": _name,
+        "domains": ((urlparse(_url).hostname or "").removeprefix("www."),),
+        "index_urls": (_url,), "publication_paths": tuple(filter(None, _paths.split(";"))),
+        "statement_index": _dedicated == "1",
+    }
+    if _institution == "foreign_affairs":
+        FOREIGN_MINISTRY_REGISTRY[_member] = {
+            **_base, "country_aliases": _base.get("country_aliases", (_member.replace("_", " "),)),
+            "adjectives": _base.get("adjectives", ()),
+            **{k: OFFICIAL_SOURCE_REGISTRY[_source_id][k] for k in
+               ("domains", "index_urls", "publication_paths", "publisher_name")},
+        }
+
+
+for _source in OFFICIAL_SOURCE_REGISTRY.values():
+    if _source["member_id"] == "saudi_arabia" and _source["institution"] == "foreign_affairs":
+        _source["date_order"] = "mdy"
+    elif _source["member_id"] in {"germany", "france", "italy", "brazil", "argentina"}:
+        _source["date_order"] = "dmy"
+    _source["date_group_headings"] = _source["source_id"] in {
+        "japan:foreign_affairs:0", "india:central_bank:0",
+        "united_states:central_bank:0", "european_union:council:0",
+    }
 
 
 
@@ -1467,27 +1566,62 @@ def _official_article_links(index_html, index_url, profile, max_links=None):
     except Exception:
         return []
 
+    document = _OfficialDocumentParser(index_html)
     domains = set(profile.get("domains", ()))
     paths = [str(x).strip("/").lower() for x in profile.get("publication_paths", ()) if str(x).strip("/")]
     results = []
     seen = set()
     link_cap = OFFICIAL_INDEX_MAX_LINKS if max_links is None else max(1, int(max_links))
-    for href, title in parser.links:
+    visible_links = []
+    for node in document.nodes:
+        if node["tag"] != "a":
+            continue
+        parent, hidden = node, False
+        while parent:
+            attrs = parent["attrs"]
+            if (parent["tag"] in document.HIDDEN or "hidden" in attrs
+                    or attrs.get("aria-hidden") == "true"
+                    or "display:none" in attrs.get("style", "").replace(" ", "").lower()):
+                hidden = True
+                break
+            parent = parent["parent"]
+        if not hidden:
+            visible_links.append((node["attrs"].get("href", ""), document.visible(node)))
+    for href, title in visible_links:
         absolute = urljoin(index_url, href)
         title = _official_link_title(absolute, title)
+        if len(tokenize(title)) < 3 or normalize_text(title) in {normalize_text("قراءة المزيد"), "read more"}:
+            title = _official_card_title(document, index_url, absolute) or title
         parsed = urlparse(absolute)
         domain = (parsed.hostname or "").lower().replace("www.", "")
         path = (parsed.path or "").lower().strip("/")
-        if not _domain_matches(domain, domains):
+        if parsed.scheme not in {"http", "https"} or not _domain_matches(domain, domains):
+            continue
+        if absolute.split("#", 1)[0].rstrip("/") == index_url.rstrip("/"):
             continue
         if paths and not any(p in path for p in paths):
             continue
         leaf = path.rsplit("/", 1)[-1]
         if not leaf or leaf in {"default.aspx", "index.html", "index.htm", "index"}:
             continue
-        if len(tokenize(title)) < 3:
+        if len(tokenize(title)) < 3 and not (len(title) >= 10 and re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", title)):
             continue
-        key = (absolute.split("#", 1)[0], normalize_text(title))
+        if not paths:
+            hint_profile = {**profile, "resolved_index_url": index_url}
+            if not _official_index_date_hint(index_html, title, hint_profile, absolute, document):
+                # Generic portals must associate links with an actual article card.
+                matching = [n for n in document.nodes if n["tag"] == "a" and urljoin(index_url, n["attrs"].get("href", "")) == absolute]
+                card = False
+                for node in matching:
+                    for _ in range(5):
+                        node = node["parent"]
+                        if not node:
+                            break
+                        if node["tag"] == "article":
+                            card = True
+                if not card and path.rsplit("/", 1)[-1].count("-") < 4:
+                    continue
+        key = absolute.split("#", 1)[0]
         if key in seen:
             continue
         seen.add(key)
@@ -1497,260 +1631,495 @@ def _official_article_links(index_html, index_url, profile, max_links=None):
     return results
 
 
-def _official_index_date_hint(index_html, title, profile):
-    """Read a publication date printed next to an article on a public index.
+class _OfficialDocumentParser(HTMLParser):
+    """Small bounded HTML tree for visible publisher evidence only."""
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr"}
+    HIDDEN = {"script", "style", "noscript", "template", "nav", "footer"}
 
-    This is a fallback for official portals whose article template omits or
-    inconsistently exposes machine-readable publication metadata.  The date
-    must be visibly printed by the same verified publisher next to the exact
-    article title; generic crawl timestamps and modification dates are never
-    accepted.
-    """
-    if not index_html or not title:
-        return None
+    def __init__(self, text):
+        super().__init__(convert_charrefs=True)
+        self.root = {"tag": "root", "attrs": {}, "children": [], "parent": None}
+        self.stack = [self.root]
+        self.nodes = []
+        self.feed(text[:OFFICIAL_MAX_PAGE_BYTES])
+        self.close()
 
-    visible = html.unescape(re.sub(r"<[^>]+>", " ", index_html))
-    visible = re.sub(r"\s+", " ", visible).strip()
-    pos = normalize_text(visible).find(normalize_text(title))
-    if pos < 0:
-        return None
+    def handle_starttag(self, tag, attrs):
+        if len(self.nodes) >= 25000:
+            raise ValueError("official_document_too_complex")
+        # Common HTML optional closing tags.
+        if tag in {"li", "p"} and self.stack[-1]["tag"] == tag:
+            self.stack.pop()
+        node = {"tag": tag, "attrs": dict(attrs), "children": [], "parent": self.stack[-1]}
+        self.stack[-1]["children"].append(node)
+        self.nodes.append(node)
+        if tag not in self.VOID:
+            self.stack.append(node)
 
-    # The publication label/date on the supported official indexes is part of
-    # the same card and follows the headline.  Bound the window so a date from
-    # another card can never be borrowed accidentally.
-    window = visible[pos:pos + max(500, len(title) + 700)]
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i]["tag"] == tag:
+                del self.stack[i:]
+                break
 
-    domains = set(profile.get("domains", ()))
-    if _domain_matches("diplomatie.gouv.fr", domains):
-        fr_months = "|".join(sorted(map(re.escape, _FR_MONTHS), key=len, reverse=True))
-        m = re.search(rf"(\d{{1,2}})\s+({fr_months})\s+(20\d{{2}})", window, flags=re.I)
-        if m:
-            month = _FR_MONTHS.get(m.group(2).lower())
-            if month:
-                try:
-                    return datetime(int(m.group(3)), month, int(m.group(1)), tzinfo=timezone.utc)
-                except ValueError:
-                    return None
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self.VOID:
+            self.handle_endtag(tag)
 
-    # Arabic official pages sometimes print a Gregorian date beside the card.
-    ar_months = "|".join(sorted(map(re.escape, _AR_MONTHS), key=len, reverse=True))
-    m = re.search(rf"(?:الموافق\s*)?(\d{{1,2}})\s+({ar_months})\s+(20\d{{2}})", window, flags=re.I)
-    if m:
+    def handle_data(self, data):
+        self.stack[-1]["children"].append(data)
+
+    @classmethod
+    def visible(cls, node):
+        parts = []
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, str):
+                parts.append(current)
+                continue
+            attrs = current["attrs"]
+            if (current["tag"] in cls.HIDDEN or "hidden" in attrs
+                    or attrs.get("aria-hidden") == "true"
+                    or re.search(r"display\s*:\s*none", attrs.get("style", ""), re.I)):
+                continue
+            pending.extend(reversed(current["children"]))
+        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def _official_calendar_dates(value, date_order=None):
+    """Explicit Gregorian dates; never guess the year or convert Hijri approximately."""
+    value = str(value).translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+    found = set()
+    def add(year, month, day):
         try:
-            return datetime(int(m.group(3)), _AR_MONTHS[m.group(2)], int(m.group(1)), tzinfo=timezone.utc)
-        except (KeyError, ValueError):
-            return None
-    return None
+            found.add(datetime(int(year), int(month), int(day), tzinfo=timezone.utc))
+        except (TypeError, ValueError):
+            pass
+    for year, month, day in re.findall(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", value):
+        add(year, month, day)
+    extra = {}
+    for month_names in (
+        "enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre",
+        "janeiro fevereiro março abril maio junho julho agosto setembro outubro novembro dezembro",
+        "gennaio febbraio marzo aprile maggio giugno luglio agosto settembre ottobre novembre dicembre",
+        "januar februar märz april mai juni juli august september oktober november dezember",
+        "января февраля марта апреля мая июня июля августа сентября октября ноября декабря",
+        "januari februari maret april mei juni juli agustus september oktober november desember",
+        "ocak şubat mart nisan mayıs haziran temmuz ağustos eylül ekim kasım aralık",
+    ):
+        extra.update({name: i for i, name in enumerate(month_names.split(), 1)})
+    extra.update({name[:3]: i for name, i in _EN_MONTHS.items()})
+    extra["sept"] = 9
+    value = re.sub(r"(?<=\d)\.\s", " ", value)
+    value = re.sub(r"\bde\b", " ", value, flags=re.I)
+    value = re.sub(r"([A-Za-z]{3,4})\.", r"\1", value)
+    for year, month, day in re.findall(r"(20\d{2})[年.]\s*(\d{1,2})[月.]\s*(\d{1,2})", value):
+        add(year, month, day)
+    for year, month, day in re.findall(r"(20\d{2})년\s*(\d{1,2})월\s*(\d{1,2})일", value):
+        add(year, month, day)
+    if date_order in {"dmy", "mdy"}:
+        for first, second, year in re.findall(r"\b(\d{1,2})[/.](\d{1,2})[/.](20\d{2})\b", value):
+            add(year, second if date_order == "dmy" else first, first if date_order == "dmy" else second)
+    months = {**extra, **_AR_MONTHS, **_FR_MONTHS, **_EN_MONTHS}
+    names = "|".join(sorted(map(re.escape, months), key=len, reverse=True))
+    for day, month, year in re.findall(rf"(\d{{1,2}})\s+({names})\s+(20\d{{2}})", value, re.I):
+        add(year, months[month.lower()], day)
+    for month, day, year in re.findall(rf"({names})\s+(\d{{1,2}}),?\s+(20\d{{2}})", value, re.I):
+        add(year, months[month.lower()], day)
+    return found
+
+
+def _official_card_title(document, base, target):
+    for anchor in document.nodes:
+        if anchor["tag"] != "a" or urljoin(base, anchor["attrs"].get("href", "")) != target:
+            continue
+        parent = anchor["parent"]
+        for _ in range(5):
+            if not parent or parent["tag"] in {"root", "body", "main", "ul", "ol"}:
+                break
+            pending = [parent]
+            headings = []
+            while pending:
+                node = pending.pop()
+                if isinstance(node, str):
+                    continue
+                if node["tag"] in {"h2", "h3", "h4"}:
+                    headings.append(document.visible(node))
+                pending.extend(node["children"])
+            if len(headings) == 1:
+                return headings[0]
+            if len(headings) > 1:
+                break
+            parent = parent["parent"]
+    return ""
+
+
+def _official_index_date_hint(index_html, title, profile, article_url=None, document=None):
+    """Accept dates only from the smallest card tied to this exact article URL."""
+    if not article_url:
+        return None
+    document = document or _OfficialDocumentParser(index_html)
+    base = profile.get("resolved_index_url", "")
+    target = article_url.split("#", 1)[0]
+    anchors = [n for n in document.nodes if n["tag"] == "a"
+               and urljoin(base, n["attrs"].get("href", "")).split("#", 1)[0] == target]
+    evidence = set()
+    for anchor in anchors:
+        parent = anchor["parent"]
+        for _ in range(5):
+            if not parent or parent["tag"] in {"root", "body", "main", "ul", "ol"}:
+                break
+            text = document.visible(parent)
+            if len(text) > 1800:
+                break
+            date_text = text.replace(document.visible(anchor), "")
+            dates = _official_calendar_dates(date_text, profile.get("date_order"))
+            if not dates and profile.get("member_id") == "turkey" and profile.get("institution") == "foreign_affairs":
+                dates = _official_calendar_dates(document.visible(anchor))
+            if dates:
+                # Any other substantive anchor makes attribution ambiguous.
+                pending = [parent]
+                other = False
+                while pending:
+                    node = pending.pop()
+                    if isinstance(node, str):
+                        continue
+                    if node["tag"] == "a":
+                        href = node["attrs"].get("href", "")
+                        if href and not href.startswith("#"):
+                            url = urljoin(base, href).split("#", 1)[0]
+                            if url != target:
+                                other = True
+                    pending.extend(node["children"])
+                if not other and len(dates) == 1 and not re.search(r"updated|modified|mis à jour|تحديث", text, re.I):
+                    evidence.update(dates)
+                break
+            parent = parent["parent"]
+    if not evidence and profile.get("date_group_headings") and anchors:
+        # A date heading may label several sibling releases (e.g. Japan/RBI).
+        # It must belong to an ancestor of the link, never to a neighbouring card.
+        anchor = anchors[0]
+        ancestors, parent = [], anchor["parent"]
+        while parent:
+            ancestors.append(parent)
+            parent = parent["parent"]
+        for node in document.nodes:
+            if node is anchor:
+                break
+            if node["tag"] not in {"h2", "h3", "h4", "b", "strong", "p", "div"}:
+                continue
+            if not any(node["parent"] is ancestor for ancestor in ancestors):
+                continue
+            value = document.visible(node)
+            if not re.fullmatch(r"(?:[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+20\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2}|20\d{2}-\d{2}-\d{2})", value):
+                continue
+            dates = _official_calendar_dates(value)
+            if len(dates) == 1:
+                evidence = dates
+    return next(iter(evidence)) if len(evidence) == 1 else None
 
 
 def _visible_official_date(text, profile):
-    """Parse publisher-labelled publication dates from official article pages.
-
-    This is intentionally publisher-context aware.  It never treats a generic
-    crawler/index timestamp as publication time.  A publisher may explicitly
-    declare that its on-page ``Updated`` label is the publication timestamp.
-    """
+    """Read visible publication labels, excluding scripts and modification dates."""
     if not text:
         return None
-    visible = html.unescape(re.sub(r"<[^>]+>", " ", text))
-    visible = re.sub(r"\s+", " ", visible).strip()
+    document = _OfficialDocumentParser(text)
+    visible = document.visible(document.root)
+    # Label-specific captures stop before a separate modification timestamp.
+    labels = r"Published(?: on)?|Publié le|Le\s*:|Publicado(?: em| el)?|Pubblicato(?: il)?|Veröffentlicht(?: am)?|تاريخ النشر|نشر بتاريخ|الموافق"
+    for match in re.finditer(rf"(?:{labels})\s*:?\s*(.{{1,65}})", visible, re.I):
+        if re.search(r"updated|modified|mis à jour|تحديث", visible[max(0, match.start() - 20):match.start()], re.I):
+            continue
+        value = re.split(r"updated|modified|mis à jour|تحديث", match.group(1), flags=re.I)[0]
+        dates = _official_calendar_dates(value, profile.get("date_order"))
+        if len(dates) == 1:
+            return next(iter(dates))
+    # Japan prints the release date as a standalone line just after the title.
+    # Restrict this to that publisher and to a small element containing only a date.
+    if _domain_matches("mofa.go.jp", set(profile.get("domains", ()))):
+        for node in document.nodes:
+            if node["tag"] not in {"p", "span", "div", "time"}:
+                continue
+            value = document.visible(node)
+            if re.fullmatch(r"[A-Za-z]+\s+\d{1,2},\s+20\d{2}", value):
+                dates = _official_calendar_dates(value)
+                if len(dates) == 1:
+                    return next(iter(dates))
+    return None
 
-    # Saudi / Arabic government pages commonly print the Gregorian date after
-    # the word "الموافق", even when the listing itself uses Hijri dates.
-    ar_months = "|".join(sorted(map(re.escape, _AR_MONTHS), key=len, reverse=True))
-    m = re.search(rf"الموافق\s*(\d{{1,2}})\s+({ar_months})\s+(20\d{{2}})", visible, flags=re.I)
-    if m:
-        try:
-            return datetime(int(m.group(3)), _AR_MONTHS[m.group(2)], int(m.group(1)), tzinfo=timezone.utc)
-        except Exception:
-            pass
 
-    # France Diplomatie uses an explicit "Le : DD mois YYYY" publication label.
-    fr_months = "|".join(sorted(map(re.escape, _FR_MONTHS), key=len, reverse=True))
-    m = re.search(rf"\bLe\s*:\s*(\d{{1,2}})\s+({fr_months})\s+(20\d{{2}})", visible, flags=re.I)
-    if m:
-        month = _FR_MONTHS.get(m.group(2).lower())
-        if month:
-            return datetime(int(m.group(3)), month, int(m.group(1)), tzinfo=timezone.utc)
+async def _read_official_page(session, url, profile, semaphore):
+    """Public HTML/RSS only, with allowlisted redirects checked before requesting."""
+    async with semaphore:
+        async with asyncio.timeout(OFFICIAL_INDEX_TIMEOUT):
+            for _ in range(4):
+                parsed = urlparse(url)
+                if (parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
+                        or not _domain_matches((parsed.hostname or "").removeprefix("www."), profile["domains"])):
+                    return None
+                timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
+                async with session.get(url, timeout=timeout, allow_redirects=False,
+                                       headers={"User-Agent": "Global-Intel-Bot/2.0"}) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        if not location:
+                            return None
+                        url = urljoin(url, location)
+                        continue
+                    if response.status != 200:
+                        log.info("Official page rejected source=%s status=%s", profile.get("source_id", ""), response.status)
+                        return None
+                    mime = response.headers.get("Content-Type", "").lower()
+                    if mime and not any(t in mime for t in ("html", "xml", "text/plain", "rss", "atom")):
+                        return None
+                    chunks, size = [], 0
+                    async for chunk in response.content.iter_chunked(65536):
+                        size += len(chunk)
+                        if size > OFFICIAL_MAX_PAGE_BYTES:
+                            log.info("Official page rejected source=%s reason=oversized", profile.get("source_id", ""))
+                            return None
+                        chunks.append(chunk)
+                    body = b"".join(chunks).decode(response.charset or "utf-8", errors="replace")
+                    return str(response.url), (response.url.host or "").removeprefix("www."), body
+    return None
 
-    # English official pages often use a Published label.  China MFA's English
-    # newsroom uses Updated as its public release timestamp; that convention is
-    # enabled only for the configured publisher profile.
-    labels = ["Published"]
-    if profile.get("updated_label_is_publication"):
-        labels.append("Updated")
-    label_re = "|".join(labels)
-    m = re.search(
-        rf"\b(?:{label_re})\s*:?\s*([A-Z][a-z]+\s+\d{{1,2}},\s+20\d{{2}}(?:\s+\d{{1,2}}:\d{{2}})?)",
-        visible, flags=re.I,
-    )
-    if m:
-        raw = re.sub(r"\s+\d{1,2}:\d{2}$", "", m.group(1)).strip()
-        dt = parse_date(raw)
-        if dt is not None:
-            return dt
-        em = re.match(r"([A-Za-z]+)\s+(\d{1,2}),\s+(20\d{2})", raw)
-        if em:
-            month = _EN_MONTHS.get(em.group(1).lower())
-            if month:
-                return datetime(int(em.group(3)), month, int(em.group(2)), tzinfo=timezone.utc)
 
-    # Fall back to structured publication metadata already supported globally.
-    return _extract_publication_date_from_html(text)
+def _official_public_alternates(document, base, profile):
+    """Follow only a feed/current-year archive actually advertised on this page."""
+    feeds, archives = [], []
+    year = str(datetime.now(timezone.utc).year)
+    for node in document.nodes:
+        attrs = node["attrs"]
+        href = attrs.get("href", "")
+        if not href or node["tag"] not in {"a", "link"}:
+            continue
+        url = urljoin(base, href).split("#", 1)[0]
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not _domain_matches((parsed.hostname or "").removeprefix("www."), profile["domains"]):
+            continue
+        if url.rstrip("/") == base.rstrip("/"):
+            continue
+        if node["tag"] == "link" and "alternate" in attrs.get("rel", "").lower() and attrs.get("type", "").lower() in {"application/rss+xml", "application/atom+xml"}:
+            feeds.append(url)
+        elif node["tag"] == "a" and document.visible(node).strip() == year and year in parsed.path:
+            if parsed.path.startswith(urlparse(base).path.rsplit("/", 1)[0]):
+                archives.append(url)
+    return list(dict.fromkeys(feeds))[:1], list(dict.fromkeys(archives))[:1]
+
+
+def _official_feed_items(body, profile):
+    """Published RSS/Atom timestamps are evidence; updated-only feeds are excluded."""
+    parsed = feedparser.parse(body)
+    result = []
+    for entry in parsed.entries[:40]:
+        published = parse_date(entry.get("published")) if entry.get("published") else None
+        url, title = entry.get("link", ""), re.sub(r"<[^>]+>", "", html.unescape(entry.get("title", ""))).strip()
+        target = urlparse(url)
+        if not title or published is None or target.scheme not in {"http", "https"}:
+            continue
+        domain = (target.hostname or "").removeprefix("www.")
+        if not _domain_matches(domain, profile["domains"]):
+            continue
+        paths = profile.get("publication_paths", ())
+        if paths and not any(path.lower().strip("/") in target.path.lower() for path in paths):
+            continue
+        item = NewsItem(title=title, original_title=title, url=url,
+            source=profile["publisher_name"], published=published, domain=domain,
+            official=True, trust_score=99.0, official_source_id=profile["source_id"],
+            publication_evidence="publisher_advertised_feed_publication_date")
+        if _is_current_news(item):
+            result.append(classify_item(item))
+    return result
 
 
 async def _fetch_official_article(session, profile, url, title, semaphore, published_hint=None):
     try:
-        async with semaphore:
-            timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
-            async with session.get(url, timeout=timeout, allow_redirects=True,
-                                   headers={"User-Agent": "Global-Intel-Bot/2.0"}) as response:
-                if response.status != 200:
-                    return None
-                final_url = str(response.url)
-                final_domain = (response.url.host or "").lower().replace("www.", "")
-                if not _domain_matches(final_domain, set(profile.get("domains", ()))):
-                    return None
-                body = await response.text(errors="ignore")
-                published = _visible_official_date(body[:700000], profile)
-                if published is None:
-                    # A date visibly printed beside this exact headline on the
-                    # verified public index is valid publisher evidence.  This
-                    # avoids depending on one site's article-template markup.
-                    published = published_hint
-                if published is None:
-                    log.info(
-                        "Official article skipped domain=%s reason=no_publication_date",
-                        final_domain,
-                    )
-                    return None
-                item = NewsItem(
-                    title=title,
-                    original_title=title,
-                    url=final_url,
-                    source=profile.get("publisher_name") or final_domain,
-                    published=published,
-                    domain=final_domain,
-                    official=True,
-                    trust_score=99.0,
-                )
-                if not _is_current_news(item):
-                    log.info(
-                        "Official article skipped domain=%s reason=outside_current_window date=%s",
-                        final_domain, published.date().isoformat(),
-                    )
-                    return None
-                return classify_item(item)
-    except (asyncio.TimeoutError, aiohttp.ClientError):
-        return None
-    except Exception:
-        return None
-
-
-async def _fetch_official_index(session, profile, index_url, semaphore, max_links=None):
-    try:
-        timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
-        async with session.get(index_url, timeout=timeout, allow_redirects=True,
-                               headers={"User-Agent": "Global-Intel-Bot/2.0"}) as response:
-            if response.status != 200:
-                return []
-            final_domain = (response.url.host or "").lower().replace("www.", "")
-            if not _domain_matches(final_domain, set(profile.get("domains", ()))):
-                return []
-            body = await response.text(errors="ignore")
-    except Exception:
-        return []
-
-    links = _official_article_links(body[:900000], index_url, profile, max_links=max_links)
-    log.info(
-        "Official public index domain=%s links=%d",
-        (urlparse(index_url).hostname or "").lower(), len(links),
-    )
-    if not links:
-        return []
-    dated_links = [
-        (url, title, _official_index_date_hint(body[:900000], title, profile))
-        for url, title in links
-    ]
-    tasks = [
-        asyncio.create_task(
-            _fetch_official_article(
-                session, profile, url, title, semaphore, published_hint=published_hint
-            )
+        page = await _read_official_page(session, url, profile, semaphore)
+        if page is None:
+            return None
+        final_url, final_domain, body = page
+        published = _visible_official_date(body, profile)
+        evidence = "visible_article_publication_date"
+        if published is None:
+            published = published_hint
+            evidence = "visible_index_card_date"
+        if published is None:
+            log.info("Official article skipped domain=%s reason=no_publication_date", final_domain)
+            return None
+        item = NewsItem(
+            title=title, original_title=title, url=final_url,
+            source=profile.get("publisher_name") or final_domain,
+            published=published, domain=final_domain, official=True, trust_score=99.0,
+            official_source_id=profile.get("source_id", ""), publication_evidence=evidence,
         )
-        for url, title, published_hint in dated_links
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    return [item for item in results if isinstance(item, NewsItem)]
+        if not _is_current_news(item):
+            log.info("Official article skipped domain=%s reason=outside_current_window date=%s",
+                     final_domain, published.date().isoformat())
+            return None
+        return classify_item(item)
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        log.info("Official article unavailable source=%s", profile.get("source_id", ""))
+        return None
+    except Exception:
+        log.exception("Official article parse failed source=%s", profile.get("source_id", ""))
+        return None
+
+
+async def _fetch_official_index(session, profile, index_url, semaphore, max_links=None, result_sink=None, article_semaphore=None):
+    try:
+        page = await _read_official_page(session, index_url, profile, semaphore)
+        if page is None:
+            return []
+        final_url, _, body = page
+        profile = {**profile, "resolved_index_url": final_url}
+        links = _official_article_links(body, final_url, profile, max_links=max_links)
+        document = _OfficialDocumentParser(body)
+        log.info("Official public index source=%s links=%d", profile.get("source_id", ""), len(links))
+        dated_links = [(url, title, _official_index_date_hint(
+            body, title, profile, article_url=url, document=document)) for url, title in links]
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Official index failed source=%s", profile.get("source_id", ""))
+        return []
+
+    items = []
+    async def collect_alternates():
+        feeds, archives = _official_public_alternates(document, final_url, profile)
+        for url in feeds + (archives if len(links) < 3 else []):
+            try:
+                page = await _read_official_page(session, url, profile, article_semaphore or semaphore)
+                if page is None:
+                    continue
+                alternative_url, _, alternative_body = page
+                if url in feeds:
+                    found = _official_feed_items(alternative_body, profile)
+                    items.extend(found)
+                    if result_sink is not None:
+                        result_sink.extend(found)
+                else:
+                    doc = _OfficialDocumentParser(alternative_body)
+                    child_profile = {**profile, "resolved_index_url": alternative_url}
+                    for article_url, title in _official_article_links(alternative_body, alternative_url, child_profile, max_links):
+                        hint = _official_index_date_hint(alternative_body, title, child_profile, article_url, doc)
+                        if hint is not None:
+                            await collect_one(article_url, title, hint)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.info("Official advertised alternative unavailable source=%s", profile["source_id"])
+
+    async def collect_one(url, title, hint):
+        if hint is not None:
+            # The exact dated public card is sufficient original-publisher evidence.
+            item = NewsItem(title=title, original_title=title, url=url,
+                source=profile["publisher_name"], published=hint,
+                domain=(urlparse(url).hostname or "").removeprefix("www."),
+                official=True, trust_score=99.0, official_source_id=profile["source_id"],
+                publication_evidence="visible_index_card_date")
+            item = classify_item(item) if _is_current_news(item) else None
+        else:
+            if urlparse(url).path.lower().endswith((".pdf", ".xls", ".xlsx", ".zip")):
+                return
+            item = await _fetch_official_article(session, profile, url, title, article_semaphore or semaphore, hint)
+        if item is not None:
+            items.append(item)
+            # Publish each completed article immediately, before sibling tasks finish.
+            if result_sink is not None:
+                result_sink.append(item)
+
+    bounded_links, unknown = [], 0
+    for entry in dated_links:
+        if entry[2] is None:
+            unknown += 1
+            if unknown > 2:
+                continue
+        bounded_links.append(entry)
+    tasks = [asyncio.create_task(collect_alternates())] + [asyncio.create_task(collect_one(*entry)) for entry in bounded_links]
+    try:
+        if tasks:
+            await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        log.info("Official source completed source=%s accepted=%d", profile.get("source_id", ""), len(items))
+    return items
+
+
+def official_source_coverage():
+    return {member: sum(p["member_id"] == member for p in OFFICIAL_SOURCE_REGISTRY.values())
+            for member in sorted(G20_MEMBERS)}
+
+
+def _official_collection_profiles(country_id=None):
+    by_member = {}
+    for profile in OFFICIAL_SOURCE_REGISTRY.values():
+        member = profile["member_id"]
+        if country_id is None or member == country_id:
+            by_member.setdefault(member, []).append(profile)
+    members = sorted(by_member)
+    if members:
+        offset = int(time.time() // ROTATION_WINDOW_SECONDS) % len(members)
+        members = members[offset:] + members[:offset]
+    # One source per member per round, rather than exhausting one member first.
+    return [by_member[m][i] for i in range(max((len(v) for v in by_member.values()), default=0))
+            for m in members if i < len(by_member[m])]
+
+
+async def _collect_official_profiles(profiles, budget, max_links):
+    started = time.monotonic()
+    results = []
+    connector = aiohttp.TCPConnector(limit=OFFICIAL_INDEX_CONCURRENCY + 8, limit_per_host=3, ttl_dns_cache=60)
+    semaphore = asyncio.Semaphore(OFFICIAL_INDEX_CONCURRENCY)
+    article_semaphore = asyncio.Semaphore(8)
+    tasks = []
+    pending_count = 0
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            for profile in profiles:
+                for template in profile["index_urls"]:
+                    tasks.append(asyncio.create_task(_fetch_official_index(
+                        session, profile, _official_index_url(template), semaphore,
+                        max_links=max_links, result_sink=results, article_semaphore=article_semaphore)))
+            if tasks:
+                _, pending = await asyncio.wait(tasks, timeout=budget)
+                pending_count = len(pending)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+    unique = {}
+    for item in results:
+        if _is_current_news(item):
+            unique.setdefault(item.url.split("#", 1)[0], item)
+    result = sorted(unique.values(), key=lambda item: item.published, reverse=True)
+    log.info("Official collection sources=%d completed=%d timed_out=%d accepted=%d elapsed=%.2fs",
+             len(tasks), len(tasks) - pending_count, pending_count, len(result), time.monotonic() - started)
+    return result
 
 
 async def collect_official_publisher_news():
-    """Directly read verified ministry publication indexes, bypassing search-index dates."""
-    profiles = []
-    for country_id in OFFICIAL_INDEX_PUBLISHERS:
-        profile = FOREIGN_MINISTRY_REGISTRY.get(country_id, {})
-        for template in profile.get("index_urls", ()):
-            profiles.append((profile, _official_index_url(template)))
-    if not profiles:
-        return []
-
-    connector = aiohttp.TCPConnector(limit=OFFICIAL_INDEX_CONCURRENCY, limit_per_host=3, ttl_dns_cache=60)
-    semaphore = asyncio.Semaphore(OFFICIAL_INDEX_CONCURRENCY)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            asyncio.create_task(_fetch_official_index(session, profile, index_url, semaphore))
-            for profile, index_url in profiles
-        ]
-        groups = await asyncio.gather(*tasks, return_exceptions=True)
-
-    items = []
-    for group in groups:
-        if isinstance(group, list):
-            items.extend(group)
-    return deduplicate_news(items)
+    profiles = _official_collection_profiles()
+    coverage = official_source_coverage()
+    log.info("Official registry g20_covered=%d g20_total=%d sources=%d",
+             sum(bool(n) for n in coverage.values()), len(coverage), len(profiles))
+    return await _collect_official_profiles(profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS)
 
 
 async def collect_official_institution_news(country_id):
-    """Read one resolved ministry directly from its verified publication indexes.
+    return await _collect_official_profiles(
+        [p for p in _official_collection_profiles(str(country_id or ""))
+         if p["institution"] == "foreign_affairs"],
+        OFFICIAL_INTERACTIVE_BUDGET - 0.5, OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX)
 
-    Interactive institution search must not depend on the background cache or on
-    Google News.  This uses the same registry/index parser as background
-    collection, but only for the country that the entity resolver identified.
-    """
-    profile = FOREIGN_MINISTRY_REGISTRY.get(str(country_id or ""), {})
-    templates = tuple(profile.get("index_urls", ()))
-    if not templates:
-        return []
-
-    index_urls = [_official_index_url(template) for template in templates]
-    connector = aiohttp.TCPConnector(
-        limit=min(OFFICIAL_INDEX_CONCURRENCY, max(2, len(index_urls) * 2)),
-        limit_per_host=3,
-        ttl_dns_cache=60,
-    )
-    semaphore = asyncio.Semaphore(OFFICIAL_INDEX_CONCURRENCY)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            asyncio.create_task(
-                _fetch_official_index(
-                    session, profile, index_url, semaphore,
-                    max_links=OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX,
-                )
-            )
-            for index_url in index_urls
-        ]
-        groups = await asyncio.gather(*tasks, return_exceptions=True)
-
-    items = []
-    for group in groups:
-        if isinstance(group, list):
-            items.extend(group)
-    result = deduplicate_news(items)
-    log.info(
-        "Direct official institution country=%s indexes=%d result=%d",
-        country_id, len(index_urls), len(result),
-    )
-    return result
 
 def _foreign_ministry_country_profile(query):
     nq = normalize_text(query)
@@ -2868,12 +3237,8 @@ async def collect_breaking_news(max_items=30):
     return candidates[:max_items]
 
 
-async def collect_news(max_items=150):
+async def _collect_general_news(max_items=150):
     feeds = {**TRUSTED_FEEDS, **ADDITIONAL_TRUSTED_FEEDS}
-
-    # Direct ministry indexes run in parallel with ordinary feeds.  A slow
-    # government site must never serialize or block the rest of collection.
-    official_index_task = asyncio.create_task(collect_official_publisher_news())
 
     connector = aiohttp.TCPConnector(
         limit=COLLECTION_CONCURRENCY,
@@ -2890,19 +3255,6 @@ async def collect_news(max_items=150):
     for group in groups:
         if isinstance(group, list):
             items.extend(group)
-
-    # Official ministries are read from their own publication indexes first.
-    # Search engines remain a secondary discovery layer because their RSS dates
-    # may describe an index/listing page rather than the underlying release.
-    try:
-        direct_official = await asyncio.wait_for(asyncio.shield(official_index_task), timeout=2.5)
-        items.extend(direct_official)
-    except asyncio.TimeoutError:
-        official_index_task.cancel()
-        await asyncio.gather(official_index_task, return_exceptions=True)
-        log.warning("Official publisher indexes exceeded bounded collection budget; skipped")
-    except Exception as exc:
-        log.warning("Official publisher indexes skipped: %s", exc)
 
     # Do not use generic "أهم الأخبار العالمية" discovery here.
     # Those roundup pages were the direct cause of digest articles
@@ -2965,15 +3317,14 @@ async def collect_news(max_items=150):
                 )
                 for q in discovery_queries
             ]
-            done, pending = await asyncio.wait(
-                discovery_tasks,
-                timeout=DISCOVERY_BUDGET,
-            )
-
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                done, pending = await asyncio.wait(discovery_tasks, timeout=DISCOVERY_BUDGET)
+            finally:
+                unfinished = [task for task in discovery_tasks if not task.done()]
+                for task in unfinished:
+                    task.cancel()
+                if unfinished:
+                    await asyncio.gather(*unfinished, return_exceptions=True)
 
         discovery_added = 0
         for task in done:
@@ -3029,6 +3380,56 @@ async def collect_news(max_items=150):
 
     return items[:max_items]
 
+async def collect_news(max_items=150):
+    """Independent collectors share a deadline below the worker's 25s timeout."""
+    tasks = [asyncio.create_task(_collect_general_news(max_items)),
+             asyncio.create_task(collect_official_publisher_news())]
+    items = []
+    try:
+        done, _ = await asyncio.wait(tasks, timeout=20.0)
+        for task in tasks:
+            if task in done:
+                try:
+                    items.extend(task.result())
+                except Exception:
+                    log.exception("News collector failed")
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    official = [item for item in items if _direct_official_statement(item)]
+    if official:
+        try:
+            await translate_news_titles(official, budget=2.0)
+        except asyncio.TimeoutError:
+            log.info("Official translation budget reached; original titles retained")
+    for item in official:
+        # Neutral date priority for the existing bot's score-based topic filter.
+        age = (datetime.now(timezone.utc).date() - item.published.date()).days
+        item.relevance_score = (4 - age) * 1000 + _official_importance(item)
+    ordered = sorted(official, key=lambda x: (x.published.date(), _official_importance(x), x.published), reverse=True)
+    remaining = [item for item in items if not getattr(item, "official_source_id", "")]
+    # Keep registry provenance when a general feed also carries the same URL.
+    seen, result = set(), []
+    for item in ordered + remaining:
+        key = item.url.split("#", 1)[0]
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result[:max_items]
+
+
+def _official_importance(item):
+    text = normalize_text((item.original_title or item.title) + " " + item.summary)
+    groups = (
+        ("ceasefire", "وقف إطلاق النار", "sanctions", "عقوبات", "emergency", "طوارئ"),
+        ("interest rate", "سعر الفائدة", "monetary policy", "سياسة نقدية", "قرار"),
+        ("joint statement", "بيان مشترك", "agreement", "اتفاق", "security", "أمن"),
+    )
+    return sum(20 for group in groups if any(normalize_text(word) in text for word in group))
+
+
 def build_ai_context(items):
     lines = []
 
@@ -3044,3 +3445,4 @@ def build_ai_context(items):
         )
 
     return "\n\n".join(lines)
+

@@ -755,8 +755,11 @@ def _official_signal(title, summary, item=None):
     document_markers = [
         "بيان رسمي", "تصريح رسمي", "بيان صحفي", "مؤتمر صحفي",
         "المتحدث الرسمي", "المتحدث باسم", "مصدر مسؤول",
-        "official statement", "press statement", "press release",
-        "readout", "remarks by", "briefing by", "spokesperson",
+        "official statement", "press statement", "press release", "joint statement",
+        "media note", "fact sheet", "press conference", "readout", "remarks by",
+        "statement by", "briefing by", "spokesperson", "spokesperson's remarks",
+        "regular press conference", "communique", "communiqué", "declaration",
+        "تصريح", "احاطة", "إحاطة", "مذكرة إعلامية", "مذكره اعلاميه",
     ]
 
     institution_markers = [
@@ -785,8 +788,10 @@ def _official_signal(title, summary, item=None):
         "اجتمع", "اجتمعت", "التقى", "التقت", "اتصال", "لقاء",
         "announced", "said", "confirmed", "stated", "warned",
         "condemned", "denied", "issued", "called for", "welcomed",
-        "met", "meets", "received", "receives", "discussed", "discusses",
-        "held talks", "spoke with",
+        "met", "meets", "meeting", "meeting with", "received", "receives",
+        "discussed", "discusses", "held talks", "spoke with", "courtesy call",
+        "telephone conversation", "phone call", "consultations", "signed", "signing",
+        "visited", "visit", "participated", "participates",
     ]
 
     if any(normalize_text(x) in t for x in document_markers):
@@ -825,20 +830,22 @@ def _official_signal(title, summary, item=None):
 def _direct_official_statement(item):
     """Precision gate for the Official Statements section.
 
-    Government/foreign-ministry publishers may qualify on an official action.
-    Broad institutional newsrooms (for example UN News) require an explicit
-    statement/release marker so ordinary reporting cannot occupy this section.
+    Ministries publish official material under several newsroom forms: releases,
+    remarks, briefings, meetings, courtesy calls, consultations and communiqués.
+    Verified original-publisher provenance therefore carries more weight than a
+    narrow keyword such as ``statement``.  Ordinary media mentions still fail.
     """
     if not _official_signal(item.title, item.summary, item):
         return False
-    if _domain_matches(item.domain, OFFICIAL_SOURCE_DOMAINS):
+    if _official_publisher_provenance(item):
         return True
 
     title = normalize_text(item.title)
     document_markers = (
-        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "مؤتمر صحفي",
-        "official statement", "press statement", "press release",
-        "readout", "remarks by", "briefing by",
+        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "مؤتمر صحفي", "تصريح", "احاطة",
+        "official statement", "press statement", "press release", "joint statement",
+        "media note", "fact sheet", "press conference", "readout", "remarks by",
+        "briefing by", "spokesperson", "communique", "communiqué", "declaration",
     )
     return item.official and any(normalize_text(x) in title for x in document_markers)
 
@@ -1207,33 +1214,44 @@ FOREIGN_MINISTRY_REGISTRY = {
         "country_aliases": ("السعودية", "السعوديه", "المملكة العربية السعودية", "السعودية", "Saudi Arabia", "Saudi"),
         "adjectives": ("السعودية", "السعوديه", "Saudi"),
         "domains": ("mofa.gov.sa",),
+        "publication_paths": ("/ministry/statements", "/ministry/news"),
+        "publication_terms": ("بيان", "تصريح", "وزير الخارجية", "اجتماع", "اتصال"),
     },
     "united_states": {
         "country_aliases": ("الولايات المتحدة", "الولايات المتحده", "أمريكا", "امريكا", "United States", "USA", "U.S.", "US"),
         "adjectives": ("الأمريكية", "الامريكيه", "الأميركية", "الاميركيه", "American", "U.S.", "US"),
         "domains": ("state.gov",),
         "institution_aliases": ("U.S. State Department", "US State Department", "United States Department of State", "Department of State", "State Department"),
+        "publication_paths": ("/releases/", "/briefings/", "/remarks/"),
+        "publication_terms": ("press release", "statement", "readout", "remarks", "briefing", "media note"),
     },
     "united_kingdom": {
         "country_aliases": ("بريطانيا", "المملكة المتحدة", "المملكه المتحده", "United Kingdom", "UK", "Britain"),
         "adjectives": ("البريطانية", "البريطانيه", "British", "UK"),
         "domains": ("gov.uk",),
         "institution_aliases": ("Foreign, Commonwealth & Development Office", "FCDO"),
+        "publication_paths": ("/government/news/", "/government/speeches/", "/government/publications/"),
+        "publication_terms": ("Foreign Commonwealth Development Office", "FCDO", "press release", "statement", "speech"),
     },
     "france": {
         "country_aliases": ("فرنسا", "France"),
         "adjectives": ("الفرنسية", "الفرنسيه", "French"),
         "domains": ("diplomatie.gouv.fr",),
+        "publication_paths": ("/presse/", "/declarations-officielles-et-interventions"),
+        "publication_terms": ("communiqué", "declaration", "déclaration", "point de presse", "entretien"),
     },
     "china": {
         "country_aliases": ("الصين", "China"),
         "adjectives": ("الصينية", "الصينيه", "Chinese"),
         "domains": ("mfa.gov.cn",),
+        "publication_paths": ("/xw/fyrbt/", "/xw/wjbxw/", "/eng/xw/fyrbt/"),
+        "publication_terms": ("spokesperson remarks", "regular press conference", "foreign ministry", "statement"),
     },
     "russia": {
         "country_aliases": ("روسيا", "Russia"),
         "adjectives": ("الروسية", "الروسيه", "Russian"),
         "domains": ("mid.ru",),
+        "publication_terms": ("statement", "briefing", "comment", "meeting", "foreign ministry"),
     },
     "germany": {
         "country_aliases": ("ألمانيا", "المانيا", "Germany"),
@@ -1289,6 +1307,8 @@ FOREIGN_MINISTRY_REGISTRY = {
         "country_aliases": ("اليابان", "Japan"),
         "adjectives": ("اليابانية", "اليابانيه", "Japanese"),
         "domains": ("mofa.go.jp",),
+        "publication_paths": ("/press/release/", "/press/kaiken/"),
+        "publication_terms": ("press release", "meeting", "courtesy call", "statement", "telephone talk"),
     },
     "india": {
         "country_aliases": ("الهند", "India"),
@@ -1361,28 +1381,33 @@ def _foreign_ministry_country_profile(query):
             })
 
         domains = {str(x).lower().strip(".") for x in raw.get("domains", ()) if x}
+        publication_paths = tuple(str(x).strip() for x in raw.get("publication_paths", ()) if str(x).strip())
+        publication_terms = tuple(str(x).strip() for x in raw.get("publication_terms", ()) if str(x).strip())
         search_queries = []
-        # Keep the user's wording, then probe the original publisher with
-        # document-oriented queries.  A bare ``site:domain`` query often
-        # surfaces one stale index page; document terms produce the actual
-        # ministry releases while remaining registry-driven for every country.
-        search_queries.append(query)
-        english_country = next(
-            (x for x in raw.get("country_aliases", ()) if re.search(r"[A-Za-z]", str(x))),
-            "",
-        )
-        if english_country:
-            search_queries.extend([
-                f"{english_country} foreign ministry",
-                f"{english_country} ministry of foreign affairs",
-            ])
+
+        # Institution searches are publisher-first.  Google News may return large
+        # archives for a bare ministry phrase, so every registry-generated probe
+        # is both constrained to the authoritative publisher and pre-filtered to
+        # the live-news window.  The strict publication-date gate below remains
+        # authoritative; ``when`` only improves discovery quality.
+        freshness_probe = f"when:{CURRENT_NEWS_LOOKBACK_DAYS + 1}d"
         for domain in sorted(domains):
-            search_queries.extend([
-                f"site:{domain} press release",
-                f"site:{domain} press statement",
-                f"site:{domain} readout",
-                f"site:{domain} foreign ministry",
-            ])
+            for path in publication_paths[:2]:
+                path = "/" + path.strip("/") + "/"
+                term = publication_terms[0] if publication_terms else "foreign ministry"
+                search_queries.append(f"site:{domain}{path} {term} {freshness_probe}")
+            for term in publication_terms[:4]:
+                search_queries.append(f"site:{domain} {term} {freshness_probe}")
+            if not publication_terms:
+                search_queries.extend([
+                    f"site:{domain} press release {freshness_probe}",
+                    f"site:{domain} statement {freshness_probe}",
+                    f"site:{domain} meeting {freshness_probe}",
+                ])
+
+        # Keep the user's wording only as a final recall fallback.  It must not
+        # displace the authoritative site probes from the bounded query budget.
+        search_queries.append(query)
 
         return {
             "aliases": {x for x in aliases if x},
@@ -1391,6 +1416,8 @@ def _foreign_ministry_country_profile(query):
             "domains": domains,
             "source_aliases": {x for x in source_aliases if x},
             "search_queries": list(dict.fromkeys(x for x in search_queries if x)),
+            "publication_paths": publication_paths,
+            "publication_terms": publication_terms,
             "country_id": country_id,
         }
     return None
@@ -1609,6 +1636,14 @@ def _institution_source_match(item, profile):
     source = normalize_text(item.source)
     source_aliases = profile.get("source_aliases", set())
     return bool(source and any(alias and alias in source for alias in source_aliases))
+
+
+def _official_publisher_provenance(item):
+    """True only when the item is tied to a configured original official publisher."""
+    return (
+        _domain_matches(item.domain, OFFICIAL_SOURCE_DOMAINS)
+        or _domain_matches(getattr(item, "discovery_domain_hint", ""), OFFICIAL_SOURCE_DOMAINS)
+    )
 
 
 def _country_centrality_score(item, query):
@@ -1909,11 +1944,14 @@ async def search_news_online(query, max_results=25):
 
     entity_profile = _query_entity_profile(query)
     institution_domains = set()
-    institution_queries = set()
+    institution_queries = []
     if entity_profile.get("kind") == "institution":
         institution_domains = set(entity_profile.get("domains", set()))
-        institution_queries = set(entity_profile.get("search_queries", []))
-        queries.extend(institution_queries)
+        institution_queries = list(entity_profile.get("search_queries", []))
+        # Reserve the bounded online budget for authoritative publisher probes.
+        # The previous set-based merge destroyed order and could truncate every
+        # site: query before it ran, leaving only broad media searches.
+        queries = institution_queries + [query]
 
     queries = list(dict.fromkeys(queries))[:MAX_ONLINE_QUERIES]
 
@@ -1924,7 +1962,8 @@ async def search_news_online(query, max_results=25):
         match = re.search(r"(?:^|\s)site:([^\s]+)", discovery_query, flags=re.I)
         if not match:
             return ""
-        candidate = match.group(1).lower().strip(".")
+        raw_site = match.group(1).strip()
+        candidate = (urlparse("https://" + raw_site).hostname or raw_site.split("/", 1)[0]).lower().strip(".")
         return candidate if _domain_matches(candidate, institution_domains) else ""
 
     connector = aiohttp.TCPConnector(
@@ -1963,6 +2002,8 @@ async def search_news_online(query, max_results=25):
                 # Broad user/media queries can never manufacture this hint.
                 if site_domain:
                     item.discovery_domain_hint = site_domain
+                    item.official = True
+                    item.trust_score = max(item.trust_score, 98.0)
                 raw_items.append(item)
         except Exception:
             continue
@@ -1977,15 +2018,20 @@ async def search_news_online(query, max_results=25):
     q_tokens = tokenize(query)
     candidates = []
     profile = _query_entity_profile(query)
+    rejected = {"noise": 0, "stale_future": 0, "anchor": 0, "publisher": 0, "relevance": 0}
     for item in raw_items:
         if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
+            rejected["noise"] += 1
             continue
         freshness = _freshness_state(item)
         if freshness in {"stale", "future"}:
+            rejected["stale_future"] += 1
             continue
         if not _country_anchor_match(item, query):
+            rejected["anchor"] += 1
             continue
         if profile.get("kind") == "institution" and not _institution_source_match(item, profile):
+            rejected["publisher"] += 1
             continue
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
@@ -1997,6 +2043,11 @@ async def search_news_online(query, max_results=25):
         )
         if institution_match or official_discovery_match or title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
+        else:
+            rejected["relevance"] += 1
+
+    pre_date_candidates = len(candidates)
+    unknown_before_enrich = sum(1 for item in candidates if _freshness_state(item) == "unknown")
 
     # Missing dates get one bounded chance to prove freshness from the original
     # publisher page. Known stale/future items were already rejected above.
@@ -2004,7 +2055,10 @@ async def search_news_online(query, max_results=25):
     candidates = [item for item in candidates if _is_current_news(item)]
 
     if not candidates:
-        log.info("Online search timing query=%r raw=%d candidates=0 total=%.3fs", query, len(raw_items), time.monotonic() - started)
+        log.info(
+            "Online search timing query=%r raw=%d pre_date=%d unknown=%d candidates=0 rejected=%s total=%.3fs",
+            query, len(raw_items), pre_date_candidates, unknown_before_enrich, rejected, time.monotonic() - started,
+        )
         return []
 
     ranked = rank_search_results(deduplicate_news(candidates), query)[:max_results]

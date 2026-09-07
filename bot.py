@@ -24,6 +24,7 @@ from google.genai import types
 from news_engine import (
     build_ai_context,
     collect_news,
+    collect_breaking_news,
     deduplicate_news,
     is_topic_match,
     search_news,
@@ -75,8 +76,9 @@ MAX_SEARCH_RESULTS = 25
 PER_PAGE = 5
 CACHE_TTL = 300
 
-URGENT_MONITOR_INTERVAL = 180
-URGENT_INITIAL_DELAY = 30
+URGENT_MONITOR_INTERVAL = 30
+URGENT_INITIAL_DELAY = 8
+BREAKING_LANE_TIMEOUT = 8
 MAX_SENT_URGENT_KEYS = 500
 
 if not BOT_TOKEN:
@@ -723,12 +725,37 @@ async def format_urgent_alert(item):
     )
 
 
+async def _run_breaking_lane():
+    """Read only the lightweight direct-feed lane under a hard latency bound."""
+    try:
+        return await asyncio.wait_for(
+            collect_breaking_news(max_items=40),
+            timeout=BREAKING_LANE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.info("Breaking lane timed out; next cycle will retry.")
+    except Exception:
+        log.exception("Breaking lane collection failed.")
+    return []
+
+
+def _merge_breaking_into_cache(items):
+    """Make fresh breaking items visible immediately without forcing full collection."""
+    if not items:
+        return
+    cached = NEWS_CACHE.peek("all_news") or []
+    NEWS_CACHE.set("all_news", deduplicate_news(list(items) + list(cached))[:150])
+
+
 async def initialize_urgent_baseline():
     global URGENT_BASELINE_READY
     if URGENT_BASELINE_READY:
         return
 
-    items = await get_fresh_news(force_refresh=True)
+    # Seed from the lightweight lane only. A restart must not launch the heavy
+    # global collector just to establish which alerts already exist.
+    items = await _run_breaking_lane()
+    _merge_breaking_into_cache(items)
     for item in items:
         if urgent_score(item) >= 8:
             key = urgent_key(item)
@@ -743,10 +770,20 @@ async def urgent_monitor(application):
     await asyncio.sleep(URGENT_INITIAL_DELAY)
 
     while True:
+        started = time.monotonic()
         try:
             if ALERT_USERS:
-                items = await get_fresh_news(force_refresh=True)
-                for item in find_new_urgent_news(items):
+                # Fast lane only: direct public RSS feeds. The heavy collector
+                # stays on its own cadence and can never delay an urgent alert.
+                items = await _run_breaking_lane()
+                _merge_breaking_into_cache(items)
+                alerts = find_new_urgent_news(items)
+                log.info(
+                    "Urgent fast lane items=%d alerts=%d elapsed=%.2fs",
+                    len(items), len(alerts), time.monotonic() - started,
+                )
+
+                for item in alerts:
                     key = urgent_key(item)
                     message = await format_urgent_alert(item)
                     delivered = False
@@ -776,7 +813,10 @@ async def urgent_monitor(application):
         except Exception:
             log.exception("Urgent monitor error.")
 
-        await asyncio.sleep(URGENT_MONITOR_INTERVAL)
+        # Start-to-start cadence: a slow network cycle does not accumulate drift,
+        # while still guaranteeing at least a short pause between feed polls.
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(5, URGENT_MONITOR_INTERVAL - elapsed))
 
 
 async def post_init(application):

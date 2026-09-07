@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -27,6 +28,9 @@ LOCAL_SEARCH_TRANSLATION_BUDGET = 0.6
 SEARCH_TRANSLATION_RESULT_CAP = 10
 DISCOVERY_BUDGET = 6
 ROTATION_WINDOW_SECONDS = 300
+DATE_ENRICH_TIMEOUT = 2.5
+DATE_ENRICH_CONCURRENCY = 6
+DATE_ENRICH_MAX_CANDIDATES = 12
 
 # Current-news policy: the live platform contains only today and the previous
 # three UTC calendar days. Historical research belongs to a separate path.
@@ -1037,6 +1041,31 @@ def _entry_publisher(entry, fallback_source):
         return publisher
     return fallback_source
 
+def _entry_source_domain(entry):
+    """Return the publisher domain embedded by discovery feeds when available.
+
+    Google News article links are wrappers, but its RSS ``source`` element
+    normally carries the publisher URL.  Using that domain prevents a media
+    article that merely mentions a ministry from impersonating the ministry.
+    """
+    raw = entry.get("source")
+    candidates = []
+    if isinstance(raw, dict):
+        candidates.extend((raw.get("href"), raw.get("url"), raw.get("link")))
+    elif raw:
+        for attr in ("href", "url", "link"):
+            try:
+                candidates.append(getattr(raw, attr, None))
+            except Exception:
+                pass
+    for value in candidates:
+        if not value:
+            continue
+        domain = (urlparse(str(value)).netloc or "").lower().replace("www.", "")
+        if domain:
+            return domain
+    return ""
+
 
 def _query_intent(query):
     nq = normalize_text(query)
@@ -1312,12 +1341,18 @@ def _foreign_ministry_country_profile(query):
             continue
 
         aliases = set(institution_aliases)
+        source_aliases = set(institution_aliases)
         for country in country_terms:
             aliases.update({
                 normalize_text(f"وزارة الخارجية {country}"),
                 normalize_text(f"وزارة خارجيه {country}"),
                 normalize_text(f"الخارجية {country}"),
                 normalize_text(f"{country} وزارة الخارجية"),
+                normalize_text(f"{country} foreign ministry"),
+                normalize_text(f"{country} ministry of foreign affairs"),
+                normalize_text(f"ministry of foreign affairs {country}"),
+            })
+            source_aliases.update({
                 normalize_text(f"{country} foreign ministry"),
                 normalize_text(f"{country} ministry of foreign affairs"),
                 normalize_text(f"ministry of foreign affairs {country}"),
@@ -1343,6 +1378,7 @@ def _foreign_ministry_country_profile(query):
             "exclude": set(),
             "kind": "institution",
             "domains": domains,
+            "source_aliases": {x for x in source_aliases if x},
             "search_queries": list(dict.fromkeys(x for x in search_queries if x)),
             "country_id": country_id,
         }
@@ -1539,6 +1575,22 @@ def _country_anchor_match(item, query):
 
     return any(term and term in haystack for term in aliases)
 
+def _institution_source_match(item, profile):
+    """For a named institution, require the original institution publisher.
+
+    Mentions in a newspaper headline are not institution-originated releases.
+    This rule is data-driven from the institution registry and therefore applies
+    uniformly to every configured country.
+    """
+    if profile.get("kind") != "institution":
+        return True
+    domains = profile.get("domains", set())
+    if domains and _domain_matches(item.domain, domains):
+        return True
+    source = normalize_text(item.source)
+    source_aliases = profile.get("source_aliases", set())
+    return bool(source and any(alias and alias in source for alias in source_aliases))
+
 
 def _country_centrality_score(item, query):
     """Measure whether the resolved entity is the subject or a side detail."""
@@ -1589,11 +1641,11 @@ def _current_news_cutoff(now=None):
     return today - timedelta(days=CURRENT_NEWS_LOOKBACK_DAYS)
 
 
-def _is_current_news(item, now=None):
-    """Strict live-news gate: undated or older items never enter current news."""
+def _freshness_state(item, now=None):
+    """Return current/stale/future/unknown without doing network I/O."""
     published = item.published
     if published is None:
-        return False
+        return "unknown"
     try:
         if published.tzinfo is None:
             published = published.replace(tzinfo=timezone.utc)
@@ -1604,12 +1656,131 @@ def _is_current_news(item, now=None):
             now = now.replace(tzinfo=timezone.utc)
         else:
             now = now.astimezone(timezone.utc)
-        # Reject obviously future-dated entries too.
         if published > now:
-            return False
-        return published >= _current_news_cutoff(now)
+            return "future"
+        return "current" if published >= _current_news_cutoff(now) else "stale"
     except Exception:
-        return False
+        return "unknown"
+
+
+def _is_current_news(item, now=None):
+    """Authoritative live-news gate after any bounded date enrichment."""
+    return _freshness_state(item, now) == "current"
+
+
+def _jsonld_date_published(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).lower() == "datepublished":
+                dt = parse_date(child)
+                if dt is not None:
+                    return dt
+        for child in value.values():
+            dt = _jsonld_date_published(child)
+            if dt is not None:
+                return dt
+    elif isinstance(value, list):
+        for child in value:
+            dt = _jsonld_date_published(child)
+            if dt is not None:
+                return dt
+    return None
+
+
+def _extract_publication_date_from_html(text):
+    """Extract explicit publication time; dateModified alone is never accepted."""
+    if not text:
+        return None
+
+    # JSON-LD datePublished is the strongest portable signal.
+    for raw in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        text, flags=re.I | re.S,
+    ):
+        try:
+            payload = json.loads(html.unescape(raw).strip())
+        except Exception:
+            continue
+        dt = _jsonld_date_published(payload)
+        if dt is not None:
+            return dt
+
+    # Explicit publication meta fields.  Deliberately exclude modified-time keys.
+    meta_patterns = (
+        r'<meta[^>]+(?:property|name|itemprop)=["\'](?:article:published_time|datePublished|datepublished|pubdate|publish-date|publish_date|publication_date|date)["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name|itemprop)=["\'](?:article:published_time|datePublished|datepublished|pubdate|publish-date|publish_date|publication_date|date)["\']',
+    )
+    for pattern in meta_patterns:
+        for value in re.findall(pattern, text, flags=re.I):
+            dt = parse_date(html.unescape(value).strip())
+            if dt is not None:
+                return dt
+
+    # HTML5 time element, but only when it is explicitly publication-oriented
+    # or when there is no modified marker in the element itself.
+    for tag in re.findall(r'<time\b[^>]*datetime=["\'][^"\']+["\'][^>]*>', text, flags=re.I):
+        if re.search(r'updated|modified', tag, flags=re.I):
+            continue
+        match = re.search(r'datetime=["\']([^"\']+)', tag, flags=re.I)
+        if match:
+            dt = parse_date(html.unescape(match.group(1)).strip())
+            if dt is not None:
+                return dt
+    return None
+
+
+async def _fetch_publication_date(session, item, semaphore):
+    """Best-effort original-page publication-date verification."""
+    if not item.url:
+        return None
+    try:
+        async with semaphore:
+            timeout = aiohttp.ClientTimeout(
+                total=DATE_ENRICH_TIMEOUT, connect=min(FETCH_CONNECT_TIMEOUT, DATE_ENRICH_TIMEOUT)
+            )
+            async with session.get(
+                item.url, timeout=timeout, allow_redirects=True,
+                headers={"User-Agent": "Global-Intel-Bot/2.0"},
+            ) as response:
+                if response.status != 200:
+                    return None
+                final_domain = (response.url.host or "").lower().replace("www.", "")
+                # A Google News wrapper is not the publisher page; never use its
+                # metadata as evidence that an article is current.
+                if final_domain == "news.google.com" or final_domain.endswith(".news.google.com"):
+                    return None
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if "html" not in content_type and "xhtml" not in content_type:
+                    return None
+                body = await response.text(errors="ignore")
+                return _extract_publication_date_from_html(body[:700000])
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return None
+    except Exception:
+        return None
+
+
+async def _enrich_unknown_dates(items, limit=DATE_ENRICH_MAX_CANDIDATES):
+    """Verify dates only for a bounded set of promising unknown-date items."""
+    unknown = [item for item in items if _freshness_state(item) == "unknown"][:limit]
+    if not unknown:
+        return items
+
+    connector = aiohttp.TCPConnector(
+        limit=DATE_ENRICH_CONCURRENCY, limit_per_host=2, ttl_dns_cache=60
+    )
+    semaphore = asyncio.Semaphore(DATE_ENRICH_CONCURRENCY)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            asyncio.create_task(_fetch_publication_date(session, item, semaphore))
+            for item in unknown
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for item, result in zip(unknown, results):
+        if isinstance(result, datetime):
+            item.published = result
+    return items
 
 
 def _displayable_arabic(item):
@@ -1645,6 +1816,7 @@ def parse_entry(entry, source, category="general"):
     published = _entry_date(entry)
 
     publisher = _entry_publisher(entry, source)
+    publisher_domain = _entry_source_domain(entry)
 
     item = NewsItem(
         title=title,
@@ -1654,6 +1826,7 @@ def parse_entry(entry, source, category="general"):
         summary=summary,
         published=published,
         category=category,
+        domain=publisher_domain,
     )
     return classify_item(item)
 
@@ -1757,22 +1930,32 @@ async def search_news_online(query, max_results=25):
     # avoidable O(n^2) delay on the interactive path.
     q_tokens = tokenize(query)
     candidates = []
+    profile = _query_entity_profile(query)
     for item in raw_items:
         if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
             continue
-        if not _is_current_news(item):
+        freshness = _freshness_state(item)
+        if freshness in {"stale", "future"}:
             continue
         if not _country_anchor_match(item, query):
+            continue
+        if profile.get("kind") == "institution" and not _institution_source_match(item, profile):
             continue
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
-        institution_match = (
-            _query_entity_profile(query).get("kind") == "institution"
-            and _country_anchor_match(item, query)
+        institution_match = profile.get("kind") == "institution"
+        official_discovery_match = (
+            profile.get("kind") == "official_discovery"
+            and _direct_official_statement(item)
         )
-        if institution_match or title_hits or original_hits or summary_hits >= 2:
+        if institution_match or official_discovery_match or title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
+
+    # Missing dates get one bounded chance to prove freshness from the original
+    # publisher page. Known stale/future items were already rejected above.
+    candidates = await _enrich_unknown_dates(candidates)
+    candidates = [item for item in candidates if _is_current_news(item)]
 
     if not candidates:
         log.info("Online search timing query=%r raw=%d candidates=0 total=%.3fs", query, len(raw_items), time.monotonic() - started)
@@ -1909,6 +2092,7 @@ async def search_news(items, query, max_results=25):
     started = time.monotonic()
     q_tokens = tokenize(query)
     candidates = []
+    profile = _query_entity_profile(query)
 
     # Do NOT deduplicate the whole cache here. Relevance gates are much cheaper
     # and normally reduce the working set dramatically.
@@ -1919,14 +2103,13 @@ async def search_news(items, query, max_results=25):
             continue
         if not _country_anchor_match(item, query):
             continue
+        if profile.get("kind") == "institution" and not _institution_source_match(item, profile):
+            continue
 
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
-        institution_match = (
-            _query_entity_profile(query).get("kind") == "institution"
-            and _country_anchor_match(item, query)
-        )
+        institution_match = profile.get("kind") == "institution"
         if institution_match or title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
 
@@ -2069,6 +2252,11 @@ async def collect_news(max_items=150):
 
     except Exception:
         log.exception("Discovery failed; returning available direct-feed news.")
+
+    # Unknown-date candidates are verified once, in a bounded concurrent pass,
+    # before the authoritative current-news gate.  This keeps strict freshness
+    # without silently discarding otherwise valid current publisher pages.
+    items = await _enrich_unknown_dates(items)
 
     # Canonicalize every foreign title before the final event-level dedup.
     # This prevents the same story arriving in Arabic and English from being

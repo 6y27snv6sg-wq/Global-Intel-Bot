@@ -9,8 +9,9 @@ import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import aiohttp
 import feedparser
@@ -31,6 +32,10 @@ ROTATION_WINDOW_SECONDS = 300
 DATE_ENRICH_TIMEOUT = 2.5
 DATE_ENRICH_CONCURRENCY = 6
 DATE_ENRICH_MAX_CANDIDATES = 12
+OFFICIAL_INDEX_TIMEOUT = 3.0
+OFFICIAL_INDEX_CONCURRENCY = 8
+OFFICIAL_INDEX_MAX_LINKS = 4
+OFFICIAL_INDEX_PUBLISHERS = ("saudi_arabia", "china", "japan", "france")
 
 # Current-news policy: the live platform contains only today and the previous
 # three UTC calendar days. Historical research belongs to a separate path.
@@ -1216,6 +1221,11 @@ FOREIGN_MINISTRY_REGISTRY = {
         "domains": ("mofa.gov.sa",),
         "publication_paths": ("/ministry/statements", "/ministry/news"),
         "publication_terms": ("بيان", "تصريح", "وزير الخارجية", "اجتماع", "اتصال"),
+        "publisher_name": "وزارة الخارجية السعودية",
+        "index_urls": (
+            "https://www.mofa.gov.sa/ar/ministry/statements/Pages/default.aspx",
+            "https://www.mofa.gov.sa/ar/ministry/news/Pages/default.aspx",
+        ),
     },
     "united_states": {
         "country_aliases": ("الولايات المتحدة", "الولايات المتحده", "أمريكا", "امريكا", "United States", "USA", "U.S.", "US"),
@@ -1239,6 +1249,8 @@ FOREIGN_MINISTRY_REGISTRY = {
         "domains": ("diplomatie.gouv.fr",),
         "publication_paths": ("/presse/", "/declarations-officielles-et-interventions"),
         "publication_terms": ("communiqué", "declaration", "déclaration", "point de presse", "entretien"),
+        "publisher_name": "France Diplomatie",
+        "index_urls": ("https://www.diplomatie.gouv.fr/fr/presse/espace-presse/declarations-officielles-et-interventions",),
     },
     "china": {
         "country_aliases": ("الصين", "China"),
@@ -1246,6 +1258,9 @@ FOREIGN_MINISTRY_REGISTRY = {
         "domains": ("mfa.gov.cn",),
         "publication_paths": ("/xw/fyrbt/", "/xw/wjbxw/", "/eng/xw/fyrbt/"),
         "publication_terms": ("spokesperson remarks", "regular press conference", "foreign ministry", "statement"),
+        "publisher_name": "Ministry of Foreign Affairs of China",
+        "index_urls": ("https://www.mfa.gov.cn/eng/xw/fyrbt/",),
+        "updated_label_is_publication": True,
     },
     "russia": {
         "country_aliases": ("روسيا", "Russia"),
@@ -1309,6 +1324,8 @@ FOREIGN_MINISTRY_REGISTRY = {
         "domains": ("mofa.go.jp",),
         "publication_paths": ("/press/release/", "/press/kaiken/"),
         "publication_terms": ("press release", "meeting", "courtesy call", "statement", "telephone talk"),
+        "publisher_name": "Ministry of Foreign Affairs of Japan",
+        "index_urls": ("https://www.mofa.go.jp/press/release/{yyyymm}_index.html",),
     },
     "india": {
         "country_aliases": ("الهند", "India"),
@@ -1337,6 +1354,233 @@ FOREIGN_MINISTRY_REGISTRY = {
     },
 }
 
+
+
+_AR_MONTHS = {
+    "يناير": 1, "فبراير": 2, "مارس": 3, "أبريل": 4, "ابريل": 4,
+    "مايو": 5, "يونيو": 6, "يوليو": 7, "أغسطس": 8, "اغسطس": 8,
+    "سبتمبر": 9, "أكتوبر": 10, "اكتوبر": 10, "نوفمبر": 11, "ديسمبر": 12,
+}
+_EN_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+_FR_MONTHS = {
+    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4,
+    "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
+    "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
+}
+
+
+class _OfficialAnchorParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self._href = None
+        self._text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        attrs = dict(attrs)
+        self._href = attrs.get("href")
+        self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() != "a" or self._href is None:
+            return
+        title = re.sub(r"\s+", " ", " ".join(self._text)).strip()
+        if self._href and title:
+            self.links.append((self._href.strip(), title))
+        self._href = None
+        self._text = []
+
+
+def _official_index_url(template, now=None):
+    now = now or datetime.now(timezone.utc)
+    return str(template).format(yyyymm=now.strftime("%Y%m"), yyyy=now.strftime("%Y"), mm=now.strftime("%m"))
+
+
+def _official_article_links(index_html, index_url, profile):
+    """Extract article links from a verified ministry publication index."""
+    parser = _OfficialAnchorParser()
+    try:
+        parser.feed(index_html or "")
+    except Exception:
+        return []
+
+    domains = set(profile.get("domains", ()))
+    paths = [str(x).strip("/").lower() for x in profile.get("publication_paths", ()) if str(x).strip("/")]
+    results = []
+    seen = set()
+    for href, title in parser.links:
+        absolute = urljoin(index_url, href)
+        parsed = urlparse(absolute)
+        domain = (parsed.hostname or "").lower().replace("www.", "")
+        path = (parsed.path or "").lower().strip("/")
+        if not _domain_matches(domain, domains):
+            continue
+        if paths and not any(p in path for p in paths):
+            continue
+        leaf = path.rsplit("/", 1)[-1]
+        if not leaf or leaf in {"default.aspx", "index.html", "index.htm", "index"}:
+            continue
+        if len(tokenize(title)) < 3:
+            continue
+        key = (absolute.split("#", 1)[0], normalize_text(title))
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((absolute.split("#", 1)[0], title))
+        if len(results) >= OFFICIAL_INDEX_MAX_LINKS:
+            break
+    return results
+
+
+def _visible_official_date(text, profile):
+    """Parse publisher-labelled publication dates from official article pages.
+
+    This is intentionally publisher-context aware.  It never treats a generic
+    crawler/index timestamp as publication time.  A publisher may explicitly
+    declare that its on-page ``Updated`` label is the publication timestamp.
+    """
+    if not text:
+        return None
+    visible = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    visible = re.sub(r"\s+", " ", visible).strip()
+
+    # Saudi / Arabic government pages commonly print the Gregorian date after
+    # the word "الموافق", even when the listing itself uses Hijri dates.
+    ar_months = "|".join(sorted(map(re.escape, _AR_MONTHS), key=len, reverse=True))
+    m = re.search(rf"الموافق\s*(\d{{1,2}})\s+({ar_months})\s+(20\d{{2}})", visible, flags=re.I)
+    if m:
+        try:
+            return datetime(int(m.group(3)), _AR_MONTHS[m.group(2)], int(m.group(1)), tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+    # France Diplomatie uses an explicit "Le : DD mois YYYY" publication label.
+    fr_months = "|".join(sorted(map(re.escape, _FR_MONTHS), key=len, reverse=True))
+    m = re.search(rf"\bLe\s*:\s*(\d{{1,2}})\s+({fr_months})\s+(20\d{{2}})", visible, flags=re.I)
+    if m:
+        month = _FR_MONTHS.get(m.group(2).lower())
+        if month:
+            return datetime(int(m.group(3)), month, int(m.group(1)), tzinfo=timezone.utc)
+
+    # English official pages often use a Published label.  China MFA's English
+    # newsroom uses Updated as its public release timestamp; that convention is
+    # enabled only for the configured publisher profile.
+    labels = ["Published"]
+    if profile.get("updated_label_is_publication"):
+        labels.append("Updated")
+    label_re = "|".join(labels)
+    m = re.search(
+        rf"\b(?:{label_re})\s*:?\s*([A-Z][a-z]+\s+\d{{1,2}},\s+20\d{{2}}(?:\s+\d{{1,2}}:\d{{2}})?)",
+        visible, flags=re.I,
+    )
+    if m:
+        raw = re.sub(r"\s+\d{1,2}:\d{2}$", "", m.group(1)).strip()
+        dt = parse_date(raw)
+        if dt is not None:
+            return dt
+        em = re.match(r"([A-Za-z]+)\s+(\d{1,2}),\s+(20\d{2})", raw)
+        if em:
+            month = _EN_MONTHS.get(em.group(1).lower())
+            if month:
+                return datetime(int(em.group(3)), month, int(em.group(2)), tzinfo=timezone.utc)
+
+    # Fall back to structured publication metadata already supported globally.
+    return _extract_publication_date_from_html(text)
+
+
+async def _fetch_official_article(session, profile, url, title, semaphore):
+    try:
+        async with semaphore:
+            timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
+            async with session.get(url, timeout=timeout, allow_redirects=True,
+                                   headers={"User-Agent": "Global-Intel-Bot/2.0"}) as response:
+                if response.status != 200:
+                    return None
+                final_url = str(response.url)
+                final_domain = (response.url.host or "").lower().replace("www.", "")
+                if not _domain_matches(final_domain, set(profile.get("domains", ()))):
+                    return None
+                body = await response.text(errors="ignore")
+                published = _visible_official_date(body[:700000], profile)
+                if published is None:
+                    return None
+                item = NewsItem(
+                    title=title,
+                    original_title=title,
+                    url=final_url,
+                    source=profile.get("publisher_name") or final_domain,
+                    published=published,
+                    domain=final_domain,
+                    official=True,
+                    trust_score=99.0,
+                )
+                if not _is_current_news(item):
+                    return None
+                return classify_item(item)
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return None
+    except Exception:
+        return None
+
+
+async def _fetch_official_index(session, profile, index_url, semaphore):
+    try:
+        timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
+        async with session.get(index_url, timeout=timeout, allow_redirects=True,
+                               headers={"User-Agent": "Global-Intel-Bot/2.0"}) as response:
+            if response.status != 200:
+                return []
+            final_domain = (response.url.host or "").lower().replace("www.", "")
+            if not _domain_matches(final_domain, set(profile.get("domains", ()))):
+                return []
+            body = await response.text(errors="ignore")
+    except Exception:
+        return []
+
+    links = _official_article_links(body[:900000], index_url, profile)
+    if not links:
+        return []
+    tasks = [
+        asyncio.create_task(_fetch_official_article(session, profile, url, title, semaphore))
+        for url, title in links
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return [item for item in results if isinstance(item, NewsItem)]
+
+
+async def collect_official_publisher_news():
+    """Directly read verified ministry publication indexes, bypassing search-index dates."""
+    profiles = []
+    for country_id in OFFICIAL_INDEX_PUBLISHERS:
+        profile = FOREIGN_MINISTRY_REGISTRY.get(country_id, {})
+        for template in profile.get("index_urls", ()):
+            profiles.append((profile, _official_index_url(template)))
+    if not profiles:
+        return []
+
+    connector = aiohttp.TCPConnector(limit=OFFICIAL_INDEX_CONCURRENCY, limit_per_host=3, ttl_dns_cache=60)
+    semaphore = asyncio.Semaphore(OFFICIAL_INDEX_CONCURRENCY)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            asyncio.create_task(_fetch_official_index(session, profile, index_url, semaphore))
+            for profile, index_url in profiles
+        ]
+        groups = await asyncio.gather(*tasks, return_exceptions=True)
+
+    items = []
+    for group in groups:
+        if isinstance(group, list):
+            items.extend(group)
+    return deduplicate_news(items)
 
 def _foreign_ministry_country_profile(query):
     nq = normalize_text(query)
@@ -2297,6 +2541,10 @@ async def hybrid_search_news(items, query, max_results=25):
 async def collect_news(max_items=150):
     feeds = {**TRUSTED_FEEDS, **ADDITIONAL_TRUSTED_FEEDS}
 
+    # Direct ministry indexes run in parallel with ordinary feeds.  A slow
+    # government site must never serialize or block the rest of collection.
+    official_index_task = asyncio.create_task(collect_official_publisher_news())
+
     connector = aiohttp.TCPConnector(
         limit=COLLECTION_CONCURRENCY,
         limit_per_host=2,
@@ -2312,6 +2560,19 @@ async def collect_news(max_items=150):
     for group in groups:
         if isinstance(group, list):
             items.extend(group)
+
+    # Official ministries are read from their own publication indexes first.
+    # Search engines remain a secondary discovery layer because their RSS dates
+    # may describe an index/listing page rather than the underlying release.
+    try:
+        direct_official = await asyncio.wait_for(asyncio.shield(official_index_task), timeout=2.5)
+        items.extend(direct_official)
+    except asyncio.TimeoutError:
+        official_index_task.cancel()
+        await asyncio.gather(official_index_task, return_exceptions=True)
+        log.warning("Official publisher indexes exceeded bounded collection budget; skipped")
+    except Exception as exc:
+        log.warning("Official publisher indexes skipped: %s", exc)
 
     # Do not use generic "أهم الأخبار العالمية" discovery here.
     # Those roundup pages were the direct cause of digest articles
@@ -2343,10 +2604,10 @@ async def collect_news(max_items=150):
         "site:tass.com Russia world news",
 
         # Official-source discovery is kept separate from general media discovery.
-        "site:mofa.gov.sa وزارة الخارجية السعودية",
-        "site:state.gov foreign policy statement",
-        "site:mfa.gov.cn foreign ministry statement",
-        "site:mofa.go.jp foreign ministry statement",
+        "site:mofa.gov.sa/ar/ministry/statements بيان وزارة الخارجية السعودية",
+        "site:state.gov/releases press release State Department",
+        "site:mfa.gov.cn/eng/xw/fyrbt Foreign Ministry press conference",
+        "site:mofa.go.jp/press/release foreign ministry press release",
     ]
 
     try:

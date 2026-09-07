@@ -28,6 +28,10 @@ SEARCH_TRANSLATION_RESULT_CAP = 10
 DISCOVERY_BUDGET = 6
 ROTATION_WINDOW_SECONDS = 300
 
+# Current-news policy: the live platform contains only today and the previous
+# three UTC calendar days. Historical research belongs to a separate path.
+CURRENT_NEWS_LOOKBACK_DAYS = 3
+
 TRUSTED_FEEDS = {
     "الجزيرة": "https://www.aljazeera.net/aljazeerarss/a7c1866f-6829-4883-8441-358d731800bc/43316f44-8e12-4320-b4c2-a22f6654b321",
     "سكاي نيوز عربية": "https://www.skynewsarabia.com/rss/v1/news.xml",
@@ -1113,6 +1117,187 @@ def _known_country_names():
     return {normalize_text(x) for x in names if normalize_text(x)}
 
 
+
+# Foreign-ministry entity registry. This is data-driven: the resolver applies
+# the same institution + country rule to every configured country rather than
+# special-casing the country that exposed a bug.
+FOREIGN_MINISTRY_REGISTRY = {
+    "saudi_arabia": {
+        "country_aliases": ("السعودية", "السعوديه", "المملكة العربية السعودية", "السعودية", "Saudi Arabia", "Saudi"),
+        "adjectives": ("السعودية", "السعوديه", "Saudi"),
+        "domains": ("mofa.gov.sa",),
+    },
+    "united_states": {
+        "country_aliases": ("الولايات المتحدة", "الولايات المتحده", "أمريكا", "امريكا", "United States", "USA", "U.S.", "US"),
+        "adjectives": ("الأمريكية", "الامريكيه", "الأميركية", "الاميركيه", "American", "U.S.", "US"),
+        "domains": ("state.gov",),
+        "institution_aliases": ("U.S. State Department", "US State Department", "United States Department of State", "Department of State", "State Department"),
+    },
+    "united_kingdom": {
+        "country_aliases": ("بريطانيا", "المملكة المتحدة", "المملكه المتحده", "United Kingdom", "UK", "Britain"),
+        "adjectives": ("البريطانية", "البريطانيه", "British", "UK"),
+        "domains": ("gov.uk",),
+        "institution_aliases": ("Foreign, Commonwealth & Development Office", "FCDO"),
+    },
+    "france": {
+        "country_aliases": ("فرنسا", "France"),
+        "adjectives": ("الفرنسية", "الفرنسيه", "French"),
+        "domains": ("diplomatie.gouv.fr",),
+    },
+    "china": {
+        "country_aliases": ("الصين", "China"),
+        "adjectives": ("الصينية", "الصينيه", "Chinese"),
+        "domains": ("mfa.gov.cn",),
+    },
+    "russia": {
+        "country_aliases": ("روسيا", "Russia"),
+        "adjectives": ("الروسية", "الروسيه", "Russian"),
+        "domains": ("mid.ru",),
+    },
+    "germany": {
+        "country_aliases": ("ألمانيا", "المانيا", "Germany"),
+        "adjectives": ("الألمانية", "الالمانيه", "German"),
+        "domains": ("auswaertiges-amt.de",),
+    },
+    "italy": {
+        "country_aliases": ("إيطاليا", "ايطاليا", "Italy"),
+        "adjectives": ("الإيطالية", "الايطاليه", "Italian"),
+        "domains": ("esteri.it",),
+    },
+    "spain": {
+        "country_aliases": ("إسبانيا", "اسبانيا", "Spain"),
+        "adjectives": ("الإسبانية", "الاسبانيه", "Spanish"),
+        "domains": ("exteriores.gob.es",),
+    },
+    "turkey": {
+        "country_aliases": ("تركيا", "Turkey", "Türkiye"),
+        "adjectives": ("التركية", "التركيه", "Turkish"),
+        "domains": ("mfa.gov.tr",),
+    },
+    "egypt": {
+        "country_aliases": ("مصر", "Egypt"),
+        "adjectives": ("المصرية", "المصريه", "Egyptian"),
+        "domains": ("mfa.gov.eg",),
+    },
+    "uae": {
+        "country_aliases": ("الإمارات", "الامارات", "الإمارات العربية المتحدة", "United Arab Emirates", "UAE"),
+        "adjectives": ("الإماراتية", "الاماراتيه", "Emirati", "UAE"),
+        "domains": ("mofa.gov.ae",),
+    },
+    "qatar": {
+        "country_aliases": ("قطر", "Qatar"),
+        "adjectives": ("القطرية", "القطريه", "Qatari"),
+        "domains": ("mofa.gov.qa",),
+    },
+    "kuwait": {
+        "country_aliases": ("الكويت", "Kuwait"),
+        "adjectives": ("الكويتية", "الكويتيه", "Kuwaiti"),
+        "domains": ("mofa.gov.kw",),
+    },
+    "bahrain": {
+        "country_aliases": ("البحرين", "Bahrain"),
+        "adjectives": ("البحرينية", "البحرينيه", "Bahraini"),
+        "domains": ("mofa.gov.bh",),
+    },
+    "oman": {
+        "country_aliases": ("عمان", "سلطنة عمان", "سلطنه عمان", "Oman"),
+        "adjectives": ("العمانية", "العمانيه", "Omani"),
+        "domains": ("fm.gov.om",),
+    },
+    "japan": {
+        "country_aliases": ("اليابان", "Japan"),
+        "adjectives": ("اليابانية", "اليابانيه", "Japanese"),
+        "domains": ("mofa.go.jp",),
+    },
+    "india": {
+        "country_aliases": ("الهند", "India"),
+        "adjectives": ("الهندية", "الهنديه", "Indian"),
+        "domains": ("mea.gov.in",),
+    },
+    "south_korea": {
+        "country_aliases": ("كوريا الجنوبية", "كوريا الجنوبيه", "South Korea", "Republic of Korea"),
+        "adjectives": ("الكورية الجنوبية", "الكوريه الجنوبيه", "South Korean", "Korean"),
+        "domains": ("mofa.go.kr",),
+    },
+    "australia": {
+        "country_aliases": ("أستراليا", "استراليا", "Australia"),
+        "adjectives": ("الأسترالية", "الاستراليه", "Australian"),
+        "domains": ("dfat.gov.au",),
+    },
+    "canada": {
+        "country_aliases": ("كندا", "Canada"),
+        "adjectives": ("الكندية", "الكنديه", "Canadian"),
+        "domains": ("international.gc.ca",),
+    },
+    "ukraine": {
+        "country_aliases": ("أوكرانيا", "اوكرانيا", "Ukraine"),
+        "adjectives": ("الأوكرانية", "الاوكرانيه", "Ukrainian"),
+        "domains": ("mfa.gov.ua",),
+    },
+}
+
+
+def _foreign_ministry_country_profile(query):
+    nq = normalize_text(query)
+    foreign_markers = (
+        normalize_text("وزارة الخارجية"), normalize_text("وزارة خارجيه"),
+        normalize_text("الخارجية"), "foreign ministry",
+        "ministry of foreign affairs", "state department",
+        "foreign commonwealth development office", "fcdo",
+    )
+    if not any(marker in nq for marker in foreign_markers):
+        return None
+
+    for country_id, raw in FOREIGN_MINISTRY_REGISTRY.items():
+        country_terms = {
+            normalize_text(x)
+            for x in raw.get("country_aliases", ()) + raw.get("adjectives", ())
+            if normalize_text(x)
+        }
+        institution_aliases = {
+            normalize_text(x) for x in raw.get("institution_aliases", ())
+            if normalize_text(x)
+        }
+        if not any(term in nq for term in country_terms) and not any(term in nq for term in institution_aliases):
+            continue
+
+        aliases = set(institution_aliases)
+        for country in country_terms:
+            aliases.update({
+                normalize_text(f"وزارة الخارجية {country}"),
+                normalize_text(f"وزارة خارجيه {country}"),
+                normalize_text(f"الخارجية {country}"),
+                normalize_text(f"{country} وزارة الخارجية"),
+                normalize_text(f"{country} foreign ministry"),
+                normalize_text(f"{country} ministry of foreign affairs"),
+                normalize_text(f"ministry of foreign affairs {country}"),
+            })
+
+        domains = {str(x).lower().strip(".") for x in raw.get("domains", ()) if x}
+        search_queries = []
+        # Keep the user's wording and add stable English/official-domain discovery.
+        search_queries.append(query)
+        english_country = next(
+            (x for x in raw.get("country_aliases", ()) if re.search(r"[A-Za-z]", str(x))),
+            "",
+        )
+        if english_country:
+            search_queries.extend([
+                f"{english_country} foreign ministry",
+                f"{english_country} ministry of foreign affairs",
+            ])
+        search_queries.extend(f"site:{domain}" for domain in domains)
+
+        return {
+            "aliases": {x for x in aliases if x},
+            "exclude": set(),
+            "kind": "institution",
+            "domains": domains,
+            "search_queries": list(dict.fromkeys(x for x in search_queries if x)),
+            "country_id": country_id,
+        }
+    return None
+
 # Explicit disambiguation only where one valid geopolitical entity name is a
 # strict substring of another. The resolver remains generic for all other
 # entities; these profiles prevent false positives that token matching cannot
@@ -1181,12 +1366,11 @@ def _country_aliases_from_query(query):
 
 
 def _institution_entity_profile(query):
-    """Resolve compound institutional queries as one entity, not loose tokens.
+    """Resolve foreign-ministry searches as one country-bound institution."""
+    configured = _foreign_ministry_country_profile(query)
+    if configured:
+        return configured
 
-    The first high-value pattern is foreign ministries because official-source
-    searches frequently use forms such as "وزارة الخارجية السعودية". The
-    generated aliases are country-aware and work across Arabic/English wording.
-    """
     nq = normalize_text(query)
     foreign_markers = (
         normalize_text("وزارة الخارجية"), normalize_text("الخارجية"),
@@ -1211,17 +1395,13 @@ def _institution_entity_profile(query):
             normalize_text(f"ministry of foreign affairs {country}"),
         })
 
-    # Common official shorthand for Saudi MFA; derived as an alias of the same
-    # institution rather than a separate keyword rule.
-    if any(x in countries for x in {normalize_text("السعودية"), normalize_text("Saudi Arabia"), normalize_text("Saudi")}):
-        aliases.update(normalize_text(x) for x in (
-            "الخارجية السعودية", "وزارة الخارجية السعودية",
-            "وزارة الخارجية بالمملكة العربية السعودية",
-            "Saudi Foreign Ministry", "Saudi Ministry of Foreign Affairs",
-        ))
-
-    return {"aliases": {x for x in aliases if x}, "exclude": set(), "kind": "institution"}
-
+    return {
+        "aliases": {x for x in aliases if x},
+        "exclude": set(),
+        "kind": "institution",
+        "domains": set(),
+        "search_queries": [],
+    }
 
 def _is_broad_official_discovery_query(query):
     """Official discovery queries are topics, not one atomic named entity."""
@@ -1286,7 +1466,10 @@ def _query_country_terms(query):
 
 
 def _entity_haystack(item):
-    return normalize_text(f"{item.title} {item.original_title} {item.summary}")
+    return normalize_text(
+        f"{item.title} {item.original_title} {item.summary} "
+        f"{item.source} {item.domain} {item.url}"
+    )
 
 
 def _country_anchor_match(item, query):
@@ -1299,6 +1482,11 @@ def _country_anchor_match(item, query):
     haystack = _entity_haystack(item)
     if any(term and term in haystack for term in profile["exclude"]):
         return False
+
+    domains = profile.get("domains", set())
+    if domains and _domain_matches(item.domain, domains):
+        return True
+
     return any(term and term in haystack for term in aliases)
 
 
@@ -1338,6 +1526,42 @@ def _country_centrality_score(item, query):
     return best
 
 
+
+def _current_news_cutoff(now=None):
+    """UTC midnight of the oldest calendar day allowed in the live product."""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    return today - timedelta(days=CURRENT_NEWS_LOOKBACK_DAYS)
+
+
+def _is_current_news(item, now=None):
+    """Strict live-news gate: undated or older items never enter current news."""
+    published = item.published
+    if published is None:
+        return False
+    try:
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        else:
+            published = published.astimezone(timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
+        # Reject obviously future-dated entries too.
+        if published > now:
+            return False
+        return published >= _current_news_cutoff(now)
+    except Exception:
+        return False
+
+
 def _displayable_arabic(item):
     """User-facing search results must have an Arabic-suitable headline."""
     return not _needs_arabic_translation(item.title)
@@ -1348,6 +1572,8 @@ def _post_translation_search_filter(items, query):
     clean = []
     for item in items:
         if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
+            continue
+        if not _is_current_news(item):
             continue
         if not _country_anchor_match(item, query):
             continue
@@ -1439,6 +1665,10 @@ async def search_news_online(query, max_results=25):
         if normalize_text(key) in normalized:
             queries.extend(aliases[:3])
 
+    entity_profile = _query_entity_profile(query)
+    if entity_profile.get("kind") == "institution":
+        queries.extend(entity_profile.get("search_queries", []))
+
     queries = list(dict.fromkeys(queries))[:MAX_ONLINE_QUERIES]
 
     connector = aiohttp.TCPConnector(
@@ -1480,12 +1710,18 @@ async def search_news_online(query, max_results=25):
     for item in raw_items:
         if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
             continue
+        if not _is_current_news(item):
+            continue
         if not _country_anchor_match(item, query):
             continue
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
-        if title_hits or original_hits or summary_hits >= 2:
+        institution_match = (
+            _query_entity_profile(query).get("kind") == "institution"
+            and _country_anchor_match(item, query)
+        )
+        if institution_match or title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
 
     if not candidates:
@@ -1629,13 +1865,19 @@ async def search_news(items, query, max_results=25):
     for item in items:
         if _is_digest(item.title) or _is_non_article_result(item) or _hard_low_value(item):
             continue
+        if not _is_current_news(item):
+            continue
         if not _country_anchor_match(item, query):
             continue
 
         title_hits = len(q_tokens & tokenize(item.title))
         original_hits = len(q_tokens & tokenize(item.original_title))
         summary_hits = len(q_tokens & tokenize(item.summary))
-        if title_hits or original_hits or summary_hits >= 2:
+        institution_match = (
+            _query_entity_profile(query).get("kind") == "institution"
+            and _country_anchor_match(item, query)
+        )
+        if institution_match or title_hits or original_hits or summary_hits >= 2:
             candidates.append(item)
 
     if not candidates:
@@ -1777,7 +2019,7 @@ async def collect_news(max_items=150):
     items = await translate_news_titles(items)
     items = [
         item for item in deduplicate_news(items)
-        if not _is_digest(item.title)
+        if not _is_digest(item.title) and _is_current_news(item)
     ]
 
     items.sort(

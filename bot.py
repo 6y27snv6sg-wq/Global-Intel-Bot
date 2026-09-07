@@ -131,6 +131,8 @@ BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
+USER_SEEN_TOPIC_EVENTS: Dict[str, List[Any]] = {}
+MAX_SEEN_TOPIC_EVENTS = 120
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
@@ -826,6 +828,36 @@ def same_news_event(a, b):
     )
 
 
+
+
+def _topic_event_seen(user_id, topic_key, item):
+    """Return True when this user has already been shown the same event in a topic."""
+    seen_key = f"{user_id}:{topic_key}"
+    seen = USER_SEEN_TOPIC_EVENTS.get(seen_key, [])
+    matcher = same_urgent_event if topic_key == "urg" else same_news_event
+    return any(matcher(item, prior) for prior in seen)
+
+
+def _filter_unseen_topic_events(user_id, topic_key, items):
+    """Keep only events not previously displayed to this user for this topic."""
+    return [item for item in items if not _topic_event_seen(user_id, topic_key, item)]
+
+
+def _remember_topic_events(user_id, topic_key, items):
+    """Record displayed events with bounded per-user/topic memory."""
+    if not items:
+        return
+    seen_key = f"{user_id}:{topic_key}"
+    existing = USER_SEEN_TOPIC_EVENTS.setdefault(seen_key, [])
+    matcher = same_urgent_event if topic_key == "urg" else same_news_event
+    for item in items:
+        if any(matcher(item, prior) for prior in existing):
+            continue
+        existing.append(item)
+    if len(existing) > MAX_SEEN_TOPIC_EVENTS:
+        del existing[:-MAX_SEEN_TOPIC_EVENTS]
+
+
 def _merge_event_sources(primary, duplicate):
     """Preserve corroborating publishers on the representative event item."""
     values = list(getattr(primary, "alternate_sources", None) or [])
@@ -1210,7 +1242,7 @@ async def start(update, context):
     )
 
 
-async def send_topic_update(message, key, previous_results):
+async def send_topic_update(message, key, previous_results, user_id=None):
     """Refresh a topic in the background and send only meaningful additions."""
     try:
         fresh = await get_fresh_news(force_refresh=True)
@@ -1224,6 +1256,8 @@ async def send_topic_update(message, key, previous_results):
             if urgent_key(item) not in previous_keys
         ]
         additions = deduplicate_events(additions, limit=PER_PAGE)
+        if user_id is not None:
+            additions = _filter_unseen_topic_events(user_id, key, additions)
 
         if not additions:
             return
@@ -1243,6 +1277,8 @@ async def send_topic_update(message, key, previous_results):
             disable_web_page_preview=True,
             parse_mode="HTML",
         )
+        if user_id is not None:
+            _remember_topic_events(user_id, key, additions)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -1263,9 +1299,11 @@ async def show_topic(query, user_id, key, page):
     try:
         # Page 1 takes a fresh snapshot from the already-populated shared cache.
         # Later pages must use that same snapshot for stable, instant pagination.
+        raw_results = []
         if page == 1:
             cached = get_cached_news_view()
-            results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+            raw_results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+            results = _filter_unseen_topic_events(user_id, key, raw_results)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
         else:
@@ -1296,15 +1334,31 @@ async def show_topic(query, user_id, key, page):
                 disable_web_page_preview=True,
                 parse_mode="HTML",
             )
+            start = (page - 1) * PER_PAGE
+            _remember_topic_events(user_id, key, results[start:start + PER_PAGE])
 
             # A populated section is already useful. Do not launch a forced
             # refresh merely because the user opened it or pressed "المزيد".
             # Only a sparse first page may request background enrichment.
             if page == 1 and len(results) < PER_PAGE:
                 track_task(
-                    send_topic_update(query.message, key, results),
+                    send_topic_update(query.message, key, results, user_id),
                     f"topic-refresh-{user_id}-{key}",
                 )
+            return
+
+        # The topic has cached stories, but this user has already seen them.
+        # Do not resend the same event; search for genuine additions in background.
+        if page == 1 and raw_results:
+            await query.message.reply_text(
+                f"<b>{safe_html(TOPICS[key][0])}</b>\n\n"
+                "لا توجد أخبار جديدة منذ آخر عرض.",
+                parse_mode="HTML",
+            )
+            track_task(
+                send_topic_update(query.message, key, raw_results, user_id),
+                f"topic-refresh-{user_id}-{key}",
+            )
             return
 
         # No cached result exists. Only page 1 may start background discovery.
@@ -1316,7 +1370,7 @@ async def show_topic(query, user_id, key, page):
                 parse_mode="HTML",
             )
             track_task(
-                send_topic_update(query.message, key, []),
+                send_topic_update(query.message, key, [], user_id),
                 f"topic-refresh-{user_id}-{key}",
             )
         else:

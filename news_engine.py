@@ -1362,7 +1362,10 @@ def _foreign_ministry_country_profile(query):
 
         domains = {str(x).lower().strip(".") for x in raw.get("domains", ()) if x}
         search_queries = []
-        # Keep the user's wording and add stable English/official-domain discovery.
+        # Keep the user's wording, then probe the original publisher with
+        # document-oriented queries.  A bare ``site:domain`` query often
+        # surfaces one stale index page; document terms produce the actual
+        # ministry releases while remaining registry-driven for every country.
         search_queries.append(query)
         english_country = next(
             (x for x in raw.get("country_aliases", ()) if re.search(r"[A-Za-z]", str(x))),
@@ -1373,7 +1376,13 @@ def _foreign_ministry_country_profile(query):
                 f"{english_country} foreign ministry",
                 f"{english_country} ministry of foreign affairs",
             ])
-        search_queries.extend(f"site:{domain}" for domain in domains)
+        for domain in sorted(domains):
+            search_queries.extend([
+                f"site:{domain} press release",
+                f"site:{domain} press statement",
+                f"site:{domain} readout",
+                f"site:{domain} foreign ministry",
+            ])
 
         return {
             "aliases": {x for x in aliases if x},
@@ -1899,10 +1908,24 @@ async def search_news_online(query, max_results=25):
             queries.extend(aliases[:3])
 
     entity_profile = _query_entity_profile(query)
+    institution_domains = set()
+    institution_queries = set()
     if entity_profile.get("kind") == "institution":
-        queries.extend(entity_profile.get("search_queries", []))
+        institution_domains = set(entity_profile.get("domains", set()))
+        institution_queries = set(entity_profile.get("search_queries", []))
+        queries.extend(institution_queries)
 
     queries = list(dict.fromkeys(queries))[:MAX_ONLINE_QUERIES]
+
+    def _institution_query_domain(discovery_query):
+        """Return authoritative provenance only for registry-generated site queries."""
+        if not institution_domains or discovery_query not in institution_queries:
+            return ""
+        match = re.search(r"(?:^|\s)site:([^\s]+)", discovery_query, flags=re.I)
+        if not match:
+            return ""
+        candidate = match.group(1).lower().strip(".")
+        return candidate if _domain_matches(candidate, institution_domains) else ""
 
     connector = aiohttp.TCPConnector(
         limit=MAX_ONLINE_QUERIES,
@@ -1911,6 +1934,7 @@ async def search_news_online(query, max_results=25):
     )
     async with aiohttp.ClientSession(connector=connector) as session:
         task_queries = {}
+        task_domain_hints = {}
         tasks = []
         for q in queries:
             task = asyncio.create_task(
@@ -1918,6 +1942,7 @@ async def search_news_online(query, max_results=25):
             )
             tasks.append(task)
             task_queries[task] = q
+            task_domain_hints[task] = _institution_query_domain(q)
         done, pending = await asyncio.wait(tasks, timeout=ONLINE_SEARCH_BUDGET)
         for task in pending:
             task.cancel()
@@ -1931,11 +1956,11 @@ async def search_news_online(query, max_results=25):
             if not isinstance(group, list):
                 continue
             discovery_query = task_queries.get(task, "")
-            site_match = re.match(r"^\s*site:([^\s]+)\s*$", discovery_query, flags=re.I)
-            site_domain = site_match.group(1).lower().strip(".") if site_match else ""
+            site_domain = task_domain_hints.get(task, "")
             for item in group:
-                # Preserve exact discovery provenance only for pure site:domain
-                # queries.  It is never inferred from a broad query or title.
+                # Preserve publisher provenance only for a registry-generated
+                # site query whose domain belongs to the resolved institution.
+                # Broad user/media queries can never manufacture this hint.
                 if site_domain:
                     item.discovery_domain_hint = site_domain
                 raw_items.append(item)

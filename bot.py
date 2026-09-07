@@ -61,6 +61,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("pro_news_bot")
+# httpx includes the full Telegram bot URL at INFO level. Besides producing a
+# large amount of I/O during callbacks, that URL contains the bot credential.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
@@ -128,6 +131,7 @@ class SimpleCache:
 
 NEWS_CACHE = SimpleCache(CACHE_TTL)
 BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
+NEWS_VIEW_CACHE = SimpleCache(CACHE_TTL)
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
@@ -387,8 +391,11 @@ async def _run_news_collection():
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
         if items:
-            items = deduplicate_events(items, limit=150)
+            # news_engine already returns a bounded canonical collection. A
+            # second all-pairs dedup here previously consumed another 10-17s.
+            items = list(items[:150])
             NEWS_CACHE.set("all_news", items)
+            _refresh_news_view_cache()
             return items
     except asyncio.TimeoutError:
         log.warning("News collection timed out; keeping last available cache.")
@@ -416,26 +423,58 @@ async def collect_and_cache_news():
             NEWS_COLLECTION_TASK = None
 
 
+def _merge_cached_lanes(breaking, broad, limit=150):
+    """Merge two already-deduplicated lanes without an all-pairs cache scan."""
+    result = list(breaking or [])
+    fast_count = len(result)
+    urls = {
+        str(getattr(item, "url", "") or "").split("#", 1)[0].strip().lower(): item
+        for item in result
+        if str(getattr(item, "url", "") or "").strip()
+    }
+    for item in broad or []:
+        url = str(getattr(item, "url", "") or "").split("#", 1)[0].strip().lower()
+        if url and url in urls:
+            _merge_event_sources(urls[url], item)
+            continue
+        matched = next((kept for kept in result[:fast_count]
+                        if same_news_event(item, kept)), None)
+        if matched is not None:
+            _merge_event_sources(matched, item)
+            continue
+        result.append(item)
+        if url:
+            urls[url] = item
+        if len(result) >= limit:
+            break
+    return result[:limit]
+
+
+def _refresh_news_view_cache():
+    view = _merge_cached_lanes(
+        BREAKING_CACHE.peek("breaking_news") or [],
+        NEWS_CACHE.peek("all_news") or [],
+        150,
+    )
+    NEWS_VIEW_CACHE.set("all_news_view", view)
+    return view
+
+
 def get_cached_news_view(limit=150):
-    """Read-only UI view: breaking overlay + broad cache, without TTL mutation."""
-    breaking = BREAKING_CACHE.get("breaking_news") or []
-    broad = NEWS_CACHE.peek("all_news") or []
-    return deduplicate_events(list(breaking) + list(broad), limit=limit)
+    """Read the prepared UI view; callback paths do no global deduplication."""
+    view = NEWS_VIEW_CACHE.peek("all_news_view")
+    if view is None:
+        view = _refresh_news_view_cache()
+    return list(view[:limit])
 
 
 async def get_fresh_news(force_refresh=False):
     if not force_refresh:
         cached = NEWS_CACHE.get("all_news")
         if cached is not None:
-            return deduplicate_events(
-                list(BREAKING_CACHE.get("breaking_news") or []) + list(cached),
-                limit=150,
-            )
-    items = await collect_and_cache_news()
-    return deduplicate_events(
-        list(BREAKING_CACHE.get("breaking_news") or []) + list(items or []),
-        limit=150,
-    )
+            return get_cached_news_view()
+    await collect_and_cache_news()
+    return get_cached_news_view()
 
 
 def topic_filter(items, topic_key, max_results=25):
@@ -1101,15 +1140,16 @@ async def _run_breaking_lane():
     return []
 
 
-def _merge_breaking_into_cache(items):
+async def _merge_breaking_into_cache(items):
     """Update the fast overlay as canonical events, not raw feed-cycle headlines."""
     if not items:
         return
     cached = BREAKING_CACHE.get("breaking_news") or []
-    BREAKING_CACHE.set(
-        "breaking_news",
-        deduplicate_urgent_events(list(items) + list(cached), limit=80),
+    merged = await asyncio.to_thread(
+        deduplicate_urgent_events, list(items) + list(cached), 80
     )
+    BREAKING_CACHE.set("breaking_news", merged)
+    _refresh_news_view_cache()
 
 
 async def initialize_urgent_baseline():
@@ -1120,7 +1160,7 @@ async def initialize_urgent_baseline():
     # Seed from the lightweight lane only. A restart must not launch the heavy
     # global collector just to establish which alerts already exist.
     items = await _run_breaking_lane()
-    _merge_breaking_into_cache(items)
+    await _merge_breaking_into_cache(items)
     for item in items:
         # Baseline only publishable events. A weak single-source signal is not
         # marked as sent, so a later corroborating source can still trigger it.
@@ -1144,7 +1184,7 @@ async def urgent_monitor(application):
                 # Fast lane only: direct public RSS feeds. The heavy collector
                 # stays on its own cadence and can never delay an urgent alert.
                 items = await _run_breaking_lane()
-                _merge_breaking_into_cache(items)
+                await _merge_breaking_into_cache(items)
                 alerts = find_new_urgent_news(items)
                 publishable = sum(
                     1 for item in deduplicate_urgent_events(items)
@@ -1246,7 +1286,9 @@ async def send_topic_update(message, key, previous_results, user_id=None):
     """Refresh a topic in the background and send only meaningful additions."""
     try:
         fresh = await get_fresh_news(force_refresh=True)
-        current = topic_filter(fresh, key, MAX_SEARCH_RESULTS)
+        current = await asyncio.to_thread(
+            topic_filter, fresh, key, MAX_SEARCH_RESULTS
+        )
         if not current:
             return
 
@@ -1255,7 +1297,9 @@ async def send_topic_update(message, key, previous_results, user_id=None):
             item for item in current
             if urgent_key(item) not in previous_keys
         ]
-        additions = deduplicate_events(additions, limit=PER_PAGE)
+        additions = await asyncio.to_thread(
+            deduplicate_events, additions, PER_PAGE
+        )
         if user_id is not None:
             additions = _filter_unseen_topic_events(user_id, key, additions)
 
@@ -1302,7 +1346,9 @@ async def show_topic(query, user_id, key, page):
         raw_results = []
         if page == 1:
             cached = get_cached_news_view()
-            raw_results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+            raw_results = await asyncio.to_thread(
+                topic_filter, cached, key, MAX_SEARCH_RESULTS
+            )
             results = _filter_unseen_topic_events(user_id, key, raw_results)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
@@ -1310,7 +1356,9 @@ async def show_topic(query, user_id, key, page):
             results = USER_TOPIC_RESULTS.get(snapshot_key, [])
             if not results:
                 cached = NEWS_CACHE.peek("all_news") or []
-                results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+                results = await asyncio.to_thread(
+                    topic_filter, cached, key, MAX_SEARCH_RESULTS
+                )
                 if results:
                     USER_TOPIC_RESULTS[snapshot_key] = list(results)
 

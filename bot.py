@@ -380,6 +380,7 @@ async def _run_news_collection():
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
         if items:
+            items = deduplicate_events(items, limit=150)
             NEWS_CACHE.set("all_news", items)
             return items
     except asyncio.TimeoutError:
@@ -451,9 +452,10 @@ def topic_filter(items, topic_key, max_results=25):
         scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return deduplicate_news(
-        [item for _, item in scored[:max_results * 2]]
-    )[:max_results]
+    return deduplicate_events(
+        [item for _, item in scored[:max_results * 2]],
+        limit=max_results,
+    )
 
 
 def generate_base_report(
@@ -623,6 +625,15 @@ URGENT_STRONG_TERMS = {
     "اندلاع القتال", "اندلاع اشتباكات", "إطلاق النار", "اغتيال",
 }
 
+# Generic newsroom labels are discovery hints, not enough by themselves to
+# justify an alert. A concrete event term, official/high-authority source, or
+# independent corroboration must carry the publication decision.
+URGENT_GENERIC_TERMS = {"عاجل", "طارئ"}
+URGENT_SINGLE_SOURCE_TRUST = 94
+URGENT_EXCEPTIONAL_SOURCE_TRUST = 92
+URGENT_EXCEPTIONAL_SCORE = 13
+URGENT_CORROBORATION_MIN_TRUST = 82
+
 
 def urgent_score(item):
     title = normalize_text(get_item_title(item))
@@ -686,32 +697,252 @@ def urgent_key(item):
     return normalize_text(get_item_title(item))[:500]
 
 
+EVENT_DEDUP_STOPWORDS = URGENT_KEY_STOPWORDS | {
+    "مصدر", "مصادر", "رسمي", "رسميه", "تصريح", "بيان", "اعلان",
+    "اعلن", "اعلنت", "يعلن", "تقول", "قالت", "قال", "اكد", "اكدت",
+    "reports", "report", "says", "said", "official", "statement",
+    "according", "via", "live", "developing", "exclusive",
+}
+
+
+def news_event_tokens(item):
+    """Meaningful headline tokens used for display-level event clustering.
+
+    Engine deduplication intentionally stays conservative.  This second layer is
+    stricter about repeated coverage of the same event so the user sees one
+    representative story while corroborating publishers are retained as
+    alternate sources.
+    """
+    title = normalize_text(get_item_title(item))
+    return {
+        token for token in title.split()
+        if len(token) >= 3 and token not in EVENT_DEDUP_STOPWORDS
+    }
+
+
+def news_event_numbers(item):
+    """Extract material numbers so different casualty/price updates stay separate."""
+    return set(re.findall(r"(?<!\w)\d{2,}(?!\w)", normalize_text(get_item_title(item))))
+
+
+def _published_seconds(item):
+    value = getattr(item, "published", None)
+    try:
+        return float(value.timestamp()) if value else None
+    except Exception:
+        return None
+
+
+def same_news_event(a, b):
+    """High-precision event duplicate check for differently worded headlines.
+
+    It requires strong lexical overlap and, when both timestamps are available,
+    temporal proximity.  Conflicting material numbers prevent accidental merging
+    of later factual updates (for example a changed casualty count).
+    """
+    na = normalize_text(get_item_title(a))
+    nb = normalize_text(get_item_title(b))
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+
+    ta = news_event_tokens(a)
+    tb = news_event_tokens(b)
+    if not ta or not tb:
+        return False
+
+    nums_a = news_event_numbers(a)
+    nums_b = news_event_numbers(b)
+    if nums_a and nums_b and nums_a.isdisjoint(nums_b):
+        return False
+
+    common = ta & tb
+    smaller = min(len(ta), len(tb))
+    union = ta | tb
+    containment = len(common) / max(1, smaller)
+    jaccard = len(common) / max(1, len(union))
+
+    pa = _published_seconds(a)
+    pb = _published_seconds(b)
+    if pa is not None and pb is not None and abs(pa - pb) > 24 * 3600:
+        # Exact/near-exact syndicated headlines can cross midnight, but a weaker
+        # match after a full day is more likely to be a genuine follow-up.
+        return len(common) >= 5 and containment >= 0.85 and jaccard >= 0.70
+
+    return (
+        (len(common) >= 4 and containment >= 0.72)
+        or (len(common) >= 5 and jaccard >= 0.52)
+        or (len(common) >= 3 and containment >= 0.88)
+    )
+
+
+def _merge_event_sources(primary, duplicate):
+    """Preserve corroborating publishers on the representative event item."""
+    values = list(getattr(primary, "alternate_sources", None) or [])
+    values.append(get_item_source(duplicate))
+    values.extend(list(getattr(duplicate, "alternate_sources", None) or []))
+
+    primary_marker = normalize_text(get_item_source(primary))
+    seen = {primary_marker} if primary_marker else set()
+    merged = []
+    for value in values:
+        label = str(value or "").strip()
+        marker = normalize_text(label)
+        if not marker or marker in seen:
+            continue
+        seen.add(marker)
+        merged.append(label)
+
+    try:
+        setattr(primary, "alternate_sources", merged)
+    except Exception:
+        pass
+
+
+def deduplicate_events(items, limit=None):
+    """Collapse repeated coverage into one event without discarding corroboration."""
+    base = list(deduplicate_news(items or []))
+    unique = []
+    for item in base:
+        matched = None
+        for kept in unique:
+            if same_news_event(item, kept):
+                matched = kept
+                break
+        if matched is not None:
+            _merge_event_sources(matched, item)
+            continue
+        unique.append(item)
+        if limit is not None and len(unique) >= limit:
+            # Do not stop early: later duplicates may add corroborating sources to
+            # already-kept events.  The slice is applied after the full pass.
+            pass
+    return unique[:limit] if limit is not None else unique
+
+
+def urgent_source_names(item):
+    """Return unique publisher labels preserved by engine-level deduplication."""
+    values = [get_item_source(item)] + list(
+        getattr(item, "alternate_sources", None) or []
+    )
+    seen = set()
+    result = []
+    for value in values:
+        label = str(value or "").strip()
+        marker = normalize_text(label)
+        if not marker or marker in seen:
+            continue
+        seen.add(marker)
+        result.append(label)
+    return result
+
+
+def urgent_concrete_signal_count(item):
+    """Count event-bearing urgent terms while ignoring generic alert labels."""
+    title = normalize_text(get_item_title(item))
+    summary = normalize_text(get_item_summary(item))
+    count = 0
+    for term in URGENT_STRONG_TERMS - URGENT_GENERIC_TERMS:
+        needle = normalize_text(term)
+        if needle and (needle in title or needle in summary):
+            count += 1
+    return count
+
+
+def urgent_precision_state(item):
+    """Decide whether a breaking signal is publishable without sacrificing trust.
+
+    Returns a short state label or None. The gate deliberately separates
+    discovery speed from publication confidence:
+      - original official/high-authority publishers can publish immediately
+        when the headline contains a concrete event signal;
+      - two preserved independent publishers corroborating the same event can
+        publish when the primary source is at least established-news quality;
+      - a single very strong major-news report may publish only when both source
+        trust and event intensity are exceptional.
+    Generic words such as "عاجل" alone never satisfy the gate.
+    """
+    score = urgent_score(item)
+    if score < 8:
+        return None
+
+    concrete = urgent_concrete_signal_count(item)
+    if concrete <= 0:
+        return None
+
+    trust = float(getattr(item, "trust_score", 0) or 0)
+    official = bool(getattr(item, "official", False))
+    source_count = len(urgent_source_names(item))
+
+    if official and trust >= URGENT_SINGLE_SOURCE_TRUST:
+        return "official"
+
+    if trust >= URGENT_SINGLE_SOURCE_TRUST:
+        return "high_authority"
+
+    if source_count >= 2 and trust >= URGENT_CORROBORATION_MIN_TRUST:
+        return "corroborated"
+
+    if (
+        trust >= URGENT_EXCEPTIONAL_SOURCE_TRUST
+        and score >= URGENT_EXCEPTIONAL_SCORE
+        and concrete >= 2
+    ):
+        return "exceptional_single"
+
+    return None
+
+
 def find_new_urgent_news(items, limit=3):
     candidates = []
-    for item in deduplicate_news(items):
+    for item in deduplicate_events(items):
         score = urgent_score(item)
+        state = urgent_precision_state(item)
         key = urgent_key(item)
-        if score >= 8 and key and key not in SENT_URGENT_KEYS:
-            candidates.append((score, item))
+        if state and key and key not in SENT_URGENT_KEYS:
+            candidates.append((score, state, item))
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates.sort(
+        key=lambda x: (
+            x[0],
+            float(getattr(x[2], "trust_score", 0) or 0),
+            len(urgent_source_names(x[2])),
+        ),
+        reverse=True,
+    )
 
     # Keep one representative per event even when publishers use different
     # wording. Higher urgency/trust stays first because candidates are ranked.
     unique = []
-    for _, item in candidates:
+    for _, state, item in candidates:
         if any(same_urgent_event(item, kept) for kept in unique):
             continue
+        setattr(item, "_urgent_precision_state", state)
         unique.append(item)
         if len(unique) >= limit:
             break
     return unique
 
 
+def urgent_verification_label(item):
+    state = getattr(item, "_urgent_precision_state", "") or urgent_precision_state(item)
+    if state == "official":
+        return "مصدر رسمي"
+    if state == "corroborated":
+        return "تأكيد متعدد المصادر"
+    if state == "high_authority":
+        return "مصدر عالي الموثوقية"
+    if state == "exceptional_single":
+        return "مصدر رئيسي • إشارة قوية"
+    return "مراجعة آلية"
+
+
 async def format_urgent_alert(item):
     # Titles are already canonicalized/translated by news_engine.
     title = get_item_title(item)
     source = get_item_source(item)
+    verification = urgent_verification_label(item)
     url = build_safe_link(
         get_item_title(item),
         source,
@@ -720,6 +951,7 @@ async def format_urgent_alert(item):
     return (
         f"{visual('urgent')} <b>تنبيه عاجل</b>\n\n"
         f"<b>{safe_html(title)}</b>\n\n"
+        f"✓ {safe_html(verification)}\n"
         f"📍 المصدر: <code>{safe_html(source)}</code>\n"
         f'<a href="{safe_html(url)}">🔗 قراءة الخبر</a>'
     )
@@ -744,7 +976,10 @@ def _merge_breaking_into_cache(items):
     if not items:
         return
     cached = NEWS_CACHE.peek("all_news") or []
-    NEWS_CACHE.set("all_news", deduplicate_news(list(items) + list(cached))[:150])
+    NEWS_CACHE.set(
+        "all_news",
+        deduplicate_events(list(items) + list(cached), limit=150),
+    )
 
 
 async def initialize_urgent_baseline():
@@ -757,7 +992,9 @@ async def initialize_urgent_baseline():
     items = await _run_breaking_lane()
     _merge_breaking_into_cache(items)
     for item in items:
-        if urgent_score(item) >= 8:
+        # Baseline only publishable events. A weak single-source signal is not
+        # marked as sent, so a later corroborating source can still trigger it.
+        if urgent_precision_state(item):
             key = urgent_key(item)
             if key:
                 SENT_URGENT_KEYS.append(key)
@@ -778,9 +1015,13 @@ async def urgent_monitor(application):
                 items = await _run_breaking_lane()
                 _merge_breaking_into_cache(items)
                 alerts = find_new_urgent_news(items)
+                publishable = sum(
+                    1 for item in deduplicate_events(items)
+                    if urgent_precision_state(item)
+                )
                 log.info(
-                    "Urgent fast lane items=%d alerts=%d elapsed=%.2fs",
-                    len(items), len(alerts), time.monotonic() - started,
+                    "Urgent precision lane items=%d publishable=%d alerts=%d elapsed=%.2fs",
+                    len(items), publishable, len(alerts), time.monotonic() - started,
                 )
 
                 for item in alerts:
@@ -882,7 +1123,7 @@ async def send_topic_update(message, key, previous_results):
             item for item in current
             if urgent_key(item) not in previous_keys
         ]
-        additions = deduplicate_news(additions)[:PER_PAGE]
+        additions = deduplicate_events(additions, limit=PER_PAGE)
 
         if not additions:
             return
@@ -1054,14 +1295,17 @@ async def progressive_online_search(
                 pass
         return
 
-    online = deduplicate_news(online or [])
+    online = deduplicate_events(online or [], limit=MAX_SEARCH_RESULTS)
     local_keys = {urgent_key(item) for item in local_results}
     additions = [
         item for item in online
         if urgent_key(item) not in local_keys
     ]
 
-    merged = deduplicate_news(local_results + additions)[:MAX_SEARCH_RESULTS]
+    merged = deduplicate_events(
+        local_results + additions,
+        limit=MAX_SEARCH_RESULTS,
+    )
     USER_SEARCH_RESULTS[user_id] = merged
     USER_SEARCH_QUERY[user_id] = raw_query
 
@@ -1328,7 +1572,7 @@ async def handle_user_message(update, context):
                 query_text,
                 MAX_SEARCH_RESULTS,
             )
-            local_results = deduplicate_news(local_results)
+            local_results = deduplicate_events(local_results, limit=MAX_SEARCH_RESULTS)
 
             USER_SEARCH_QUERY[user_id] = text
 

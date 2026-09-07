@@ -1921,8 +1921,26 @@ async def fetch_feed(session, source, url):
         log.warning("Feed failed; skipped %s: %s", source, exc)
         return []
 
+def _ensure_live_google_query(query):
+    """Constrain every Google News discovery probe to the live-news window.
+
+    The product has no historical-search path: only today plus the previous
+    three calendar days are eligible. Google News otherwise frequently returns
+    deep archive matches for broad and site: queries, which are then correctly
+    rejected by the strict freshness gate. Applying ``when:4d`` at discovery
+    time reduces archive noise without weakening the authoritative publication
+    date check.
+    """
+    text = str(query or "").strip()
+    if not text:
+        return text
+    if re.search(r"(?:^|\s)when:\d+d(?:\s|$)", text, flags=re.I):
+        return text
+    return f"{text} when:{CURRENT_NEWS_LOOKBACK_DAYS + 1}d"
+
+
 def google_news_url(query):
-    q = urllib.parse.quote_plus(query)
+    q = urllib.parse.quote_plus(_ensure_live_google_query(query))
     return f"https://news.google.com/rss/search?q={q}&hl=ar&gl=SA&ceid=SA:ar"
 
 async def search_news_online(query, max_results=25):
@@ -1954,6 +1972,10 @@ async def search_news_online(query, max_results=25):
         queries = institution_queries + [query]
 
     queries = list(dict.fromkeys(queries))[:MAX_ONLINE_QUERIES]
+
+    # google_news_url() applies the same live window to every query, including
+    # generic category/background discovery. Institution-generated queries may
+    # already contain the constraint; _ensure_live_google_query is idempotent.
 
     def _institution_query_domain(discovery_query):
         """Return authoritative provenance only for registry-generated site queries."""

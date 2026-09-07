@@ -68,6 +68,7 @@ MAJOR_NEWS_DOMAINS = {
     "channelnewsasia.com": 90, "euronews.com": 88,
     "africanews.com": 88, "nhk.or.jp": 88, "abc.net.au": 88,
     "cbc.ca": 88, "skynews.com": 88,
+    "cgtn.com": 90, "cctv.com": 89, "rt.com": 88, "tass.com": 90,
 }
 
 OFFICIAL_DOMAIN_HINTS = (
@@ -815,6 +816,27 @@ def _official_signal(title, summary, item=None):
 
     return False
 
+def _direct_official_statement(item):
+    """Precision gate for the Official Statements section.
+
+    Government/foreign-ministry publishers may qualify on an official action.
+    Broad institutional newsrooms (for example UN News) require an explicit
+    statement/release marker so ordinary reporting cannot occupy this section.
+    """
+    if not _official_signal(item.title, item.summary, item):
+        return False
+    if _domain_matches(item.domain, OFFICIAL_SOURCE_DOMAINS):
+        return True
+
+    title = normalize_text(item.title)
+    document_markers = (
+        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "مؤتمر صحفي",
+        "official statement", "press statement", "press release",
+        "readout", "remarks by", "briefing by",
+    )
+    return item.official and any(normalize_text(x) in title for x in document_markers)
+
+
 def classify_item(item):
     title = normalize_text(item.title)
     summary = normalize_text(item.summary)
@@ -879,7 +901,7 @@ def is_topic_match(item, topic_key):
         return _security_signal(title, summary)
 
     if topic_key == "forg":
-        return _official_signal(title, summary, item)
+        return _direct_official_statement(item)
 
     if topic_key == "urg":
         return (
@@ -960,13 +982,41 @@ def deduplicate_news(items):
     return unique
 
 def parse_date(value):
+    """Parse common RSS/Atom date representations without trusting missing dates."""
     if not value:
         return None
     try:
-        dt = parsedate_to_datetime(value)
+        # feedparser may expose time.struct_time for *_parsed fields.
+        if hasattr(value, "tm_year"):
+            import calendar
+            return datetime.fromtimestamp(calendar.timegm(value), tz=timezone.utc)
+        if isinstance(value, (tuple, list)) and len(value) >= 6:
+            import calendar
+            return datetime.fromtimestamp(calendar.timegm(tuple(value[:9])), tz=timezone.utc)
+        text = str(value).strip()
+        dt = parsedate_to_datetime(text)
         return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
-        return None
+        # ISO-8601 is common in Atom/JSON-derived feeds and is not accepted by
+        # parsedate_to_datetime in every form.
+        try:
+            text = str(value).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(text)
+            return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+
+def _entry_date(entry):
+    """Resolve publication time from standard RSS/Atom fields, strongest first."""
+    for key in (
+        "published_parsed", "updated_parsed", "created_parsed",
+        "published", "updated", "created", "date", "dc_date",
+    ):
+        dt = parse_date(entry.get(key))
+        if dt is not None:
+            return dt
+    return None
 
 
 def _entry_publisher(entry, fallback_source):
@@ -1592,7 +1642,7 @@ def parse_entry(entry, source, category="general"):
     summary = html.unescape(
         str(entry.get("summary", "") or entry.get("description", "") or "")
     )
-    published = parse_date(entry.get("published") or entry.get("updated") or "")
+    published = _entry_date(entry)
 
     publisher = _entry_publisher(entry, source)
 
@@ -1979,6 +2029,13 @@ async def collect_news(max_items=150):
         "site:abc.net.au/news Australia world news",
         "site:cbc.ca/news Canada world news",
         "site:skynews.com world breaking news",
+
+        # China / Russia: major television and national newsrooms.
+        # Site discovery is used instead of guessing unstable RSS endpoints.
+        "site:cgtn.com China world breaking news",
+        "site:cctv.com China world news",
+        "site:rt.com Russia world breaking news",
+        "site:tass.com Russia world news",
 
         # Official-source discovery is kept separate from general media discovery.
         "site:mofa.gov.sa وزارة الخارجية السعودية",

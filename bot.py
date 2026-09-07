@@ -124,6 +124,7 @@ class SimpleCache:
 
 
 NEWS_CACHE = SimpleCache(CACHE_TTL)
+BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
@@ -409,14 +410,26 @@ async def collect_and_cache_news():
             NEWS_COLLECTION_TASK = None
 
 
+def get_cached_news_view(limit=150):
+    """Read-only UI view: breaking overlay + broad cache, without TTL mutation."""
+    breaking = BREAKING_CACHE.peek("breaking_news") or []
+    broad = NEWS_CACHE.peek("all_news") or []
+    return deduplicate_events(list(breaking) + list(broad), limit=limit)
+
+
 async def get_fresh_news(force_refresh=False):
     if not force_refresh:
         cached = NEWS_CACHE.get("all_news")
         if cached is not None:
-            return cached
-
+            return deduplicate_events(
+                list(BREAKING_CACHE.peek("breaking_news") or []) + list(cached),
+                limit=150,
+            )
     items = await collect_and_cache_news()
-    return items or []
+    return deduplicate_events(
+        list(BREAKING_CACHE.peek("breaking_news") or []) + list(items or []),
+        limit=150,
+    )
 
 
 def topic_filter(items, topic_key, max_results=25):
@@ -972,13 +985,13 @@ async def _run_breaking_lane():
 
 
 def _merge_breaking_into_cache(items):
-    """Make fresh breaking items visible immediately without forcing full collection."""
+    """Update the fast overlay without touching broad-news cache freshness."""
     if not items:
         return
-    cached = NEWS_CACHE.peek("all_news") or []
-    NEWS_CACHE.set(
-        "all_news",
-        deduplicate_events(list(items) + list(cached), limit=150),
+    cached = BREAKING_CACHE.peek("breaking_news") or []
+    BREAKING_CACHE.set(
+        "breaking_news",
+        deduplicate_events(list(items) + list(cached), limit=80),
     )
 
 
@@ -1164,7 +1177,7 @@ async def show_topic(query, user_id, key, page):
         # Page 1 takes a fresh snapshot from the already-populated shared cache.
         # Later pages must use that same snapshot for stable, instant pagination.
         if page == 1:
-            cached = NEWS_CACHE.peek("all_news") or []
+            cached = get_cached_news_view()
             results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
@@ -1404,7 +1417,7 @@ async def button_handler(update, context):
     if data == "refresh":
         await safe_query_answer(query, "🔄 بدأ التحديث", show_alert=False)
 
-        cached = NEWS_CACHE.peek("all_news") or []
+        cached = get_cached_news_view()
         await query.message.reply_text(
             f"{status_visual('monitoring')} <b>تحديث التغطية</b>\n\n"
             f"● المتاح الآن: {len(cached)} خبر\n"

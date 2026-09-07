@@ -1582,6 +1582,44 @@ async def collect_official_publisher_news():
             items.extend(group)
     return deduplicate_news(items)
 
+
+async def collect_official_institution_news(country_id):
+    """Read one resolved ministry directly from its verified publication indexes.
+
+    Interactive institution search must not depend on the background cache or on
+    Google News.  This uses the same registry/index parser as background
+    collection, but only for the country that the entity resolver identified.
+    """
+    profile = FOREIGN_MINISTRY_REGISTRY.get(str(country_id or ""), {})
+    templates = tuple(profile.get("index_urls", ()))
+    if not templates:
+        return []
+
+    index_urls = [_official_index_url(template) for template in templates]
+    connector = aiohttp.TCPConnector(
+        limit=min(OFFICIAL_INDEX_CONCURRENCY, max(2, len(index_urls) * 2)),
+        limit_per_host=3,
+        ttl_dns_cache=60,
+    )
+    semaphore = asyncio.Semaphore(OFFICIAL_INDEX_CONCURRENCY)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            asyncio.create_task(_fetch_official_index(session, profile, index_url, semaphore))
+            for index_url in index_urls
+        ]
+        groups = await asyncio.gather(*tasks, return_exceptions=True)
+
+    items = []
+    for group in groups:
+        if isinstance(group, list):
+            items.extend(group)
+    result = deduplicate_news(items)
+    log.info(
+        "Direct official institution country=%s indexes=%d result=%d",
+        country_id, len(index_urls), len(result),
+    )
+    return result
+
 def _foreign_ministry_country_profile(query):
     nq = normalize_text(query)
     foreign_markers = (
@@ -2207,9 +2245,18 @@ async def search_news_online(query, max_results=25):
     entity_profile = _query_entity_profile(query)
     institution_domains = set()
     institution_queries = []
+    direct_official_task = None
     if entity_profile.get("kind") == "institution":
         institution_domains = set(entity_profile.get("domains", set()))
         institution_queries = list(entity_profile.get("search_queries", []))
+        country_id = entity_profile.get("country_id")
+        if country_id and FOREIGN_MINISTRY_REGISTRY.get(country_id, {}).get("index_urls"):
+            # Run the original publisher in parallel with Google discovery.
+            # This makes an explicit ministry search independent of cache state
+            # and search-engine index dates.
+            direct_official_task = asyncio.create_task(
+                collect_official_institution_news(country_id)
+            )
         # Reserve the bounded online budget for authoritative publisher probes.
         # The previous set-based merge destroyed order and could truncate every
         # site: query before it ran, leaving only broad media searches.
@@ -2273,6 +2320,19 @@ async def search_news_online(query, max_results=25):
                 raw_items.append(item)
         except Exception:
             continue
+
+    if direct_official_task is not None:
+        try:
+            direct_items = await asyncio.wait_for(
+                asyncio.shield(direct_official_task), timeout=2.5
+            )
+            raw_items.extend(direct_items)
+        except asyncio.TimeoutError:
+            direct_official_task.cancel()
+            await asyncio.gather(direct_official_task, return_exceptions=True)
+            log.warning("Direct official institution lookup exceeded bounded search budget")
+        except Exception as exc:
+            log.warning("Direct official institution lookup skipped: %s", exc)
 
     if not raw_items:
         log.info("Online search timing query=%r raw=0 total=%.3fs", query, time.monotonic() - started)

@@ -35,6 +35,8 @@ DATE_ENRICH_MAX_CANDIDATES = 12
 OFFICIAL_INDEX_TIMEOUT = 3.0
 OFFICIAL_INDEX_CONCURRENCY = 8
 OFFICIAL_INDEX_MAX_LINKS = 4
+OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 2
+OFFICIAL_INTERACTIVE_BUDGET = 5.5
 OFFICIAL_INDEX_PUBLISHERS = ("saudi_arabia", "china", "japan", "france")
 
 # Current-news policy: the live platform contains only today and the previous
@@ -1433,7 +1435,7 @@ def _official_link_title(href, anchor_title):
     return leaf if len(tokenize(leaf)) >= 3 else title
 
 
-def _official_article_links(index_html, index_url, profile):
+def _official_article_links(index_html, index_url, profile, max_links=None):
     """Extract article links from a verified ministry publication index."""
     parser = _OfficialAnchorParser()
     try:
@@ -1445,6 +1447,7 @@ def _official_article_links(index_html, index_url, profile):
     paths = [str(x).strip("/").lower() for x in profile.get("publication_paths", ()) if str(x).strip("/")]
     results = []
     seen = set()
+    link_cap = OFFICIAL_INDEX_MAX_LINKS if max_links is None else max(1, int(max_links))
     for href, title in parser.links:
         absolute = urljoin(index_url, href)
         title = _official_link_title(absolute, title)
@@ -1465,9 +1468,55 @@ def _official_article_links(index_html, index_url, profile):
             continue
         seen.add(key)
         results.append((absolute.split("#", 1)[0], title))
-        if len(results) >= OFFICIAL_INDEX_MAX_LINKS:
+        if len(results) >= link_cap:
             break
     return results
+
+
+def _official_index_date_hint(index_html, title, profile):
+    """Read a publication date printed next to an article on a public index.
+
+    This is a fallback for official portals whose article template omits or
+    inconsistently exposes machine-readable publication metadata.  The date
+    must be visibly printed by the same verified publisher next to the exact
+    article title; generic crawl timestamps and modification dates are never
+    accepted.
+    """
+    if not index_html or not title:
+        return None
+
+    visible = html.unescape(re.sub(r"<[^>]+>", " ", index_html))
+    visible = re.sub(r"\s+", " ", visible).strip()
+    pos = normalize_text(visible).find(normalize_text(title))
+    if pos < 0:
+        return None
+
+    # The publication label/date on the supported official indexes is part of
+    # the same card and follows the headline.  Bound the window so a date from
+    # another card can never be borrowed accidentally.
+    window = visible[pos:pos + max(500, len(title) + 700)]
+
+    domains = set(profile.get("domains", ()))
+    if _domain_matches("diplomatie.gouv.fr", domains):
+        fr_months = "|".join(sorted(map(re.escape, _FR_MONTHS), key=len, reverse=True))
+        m = re.search(rf"(\d{{1,2}})\s+({fr_months})\s+(20\d{{2}})", window, flags=re.I)
+        if m:
+            month = _FR_MONTHS.get(m.group(2).lower())
+            if month:
+                try:
+                    return datetime(int(m.group(3)), month, int(m.group(1)), tzinfo=timezone.utc)
+                except ValueError:
+                    return None
+
+    # Arabic official pages sometimes print a Gregorian date beside the card.
+    ar_months = "|".join(sorted(map(re.escape, _AR_MONTHS), key=len, reverse=True))
+    m = re.search(rf"(?:الموافق\s*)?(\d{{1,2}})\s+({ar_months})\s+(20\d{{2}})", window, flags=re.I)
+    if m:
+        try:
+            return datetime(int(m.group(3)), _AR_MONTHS[m.group(2)], int(m.group(1)), tzinfo=timezone.utc)
+        except (KeyError, ValueError):
+            return None
+    return None
 
 
 def _visible_official_date(text, profile):
@@ -1526,7 +1575,7 @@ def _visible_official_date(text, profile):
     return _extract_publication_date_from_html(text)
 
 
-async def _fetch_official_article(session, profile, url, title, semaphore):
+async def _fetch_official_article(session, profile, url, title, semaphore, published_hint=None):
     try:
         async with semaphore:
             timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
@@ -1541,6 +1590,15 @@ async def _fetch_official_article(session, profile, url, title, semaphore):
                 body = await response.text(errors="ignore")
                 published = _visible_official_date(body[:700000], profile)
                 if published is None:
+                    # A date visibly printed beside this exact headline on the
+                    # verified public index is valid publisher evidence.  This
+                    # avoids depending on one site's article-template markup.
+                    published = published_hint
+                if published is None:
+                    log.info(
+                        "Official article skipped domain=%s reason=no_publication_date",
+                        final_domain,
+                    )
                     return None
                 item = NewsItem(
                     title=title,
@@ -1553,6 +1611,10 @@ async def _fetch_official_article(session, profile, url, title, semaphore):
                     trust_score=99.0,
                 )
                 if not _is_current_news(item):
+                    log.info(
+                        "Official article skipped domain=%s reason=outside_current_window date=%s",
+                        final_domain, published.date().isoformat(),
+                    )
                     return None
                 return classify_item(item)
     except (asyncio.TimeoutError, aiohttp.ClientError):
@@ -1561,7 +1623,7 @@ async def _fetch_official_article(session, profile, url, title, semaphore):
         return None
 
 
-async def _fetch_official_index(session, profile, index_url, semaphore):
+async def _fetch_official_index(session, profile, index_url, semaphore, max_links=None):
     try:
         timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
         async with session.get(index_url, timeout=timeout, allow_redirects=True,
@@ -1575,16 +1637,24 @@ async def _fetch_official_index(session, profile, index_url, semaphore):
     except Exception:
         return []
 
-    links = _official_article_links(body[:900000], index_url, profile)
+    links = _official_article_links(body[:900000], index_url, profile, max_links=max_links)
     log.info(
         "Official public index domain=%s links=%d",
         (urlparse(index_url).hostname or "").lower(), len(links),
     )
     if not links:
         return []
-    tasks = [
-        asyncio.create_task(_fetch_official_article(session, profile, url, title, semaphore))
+    dated_links = [
+        (url, title, _official_index_date_hint(body[:900000], title, profile))
         for url, title in links
+    ]
+    tasks = [
+        asyncio.create_task(
+            _fetch_official_article(
+                session, profile, url, title, semaphore, published_hint=published_hint
+            )
+        )
+        for url, title, published_hint in dated_links
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return [item for item in results if isinstance(item, NewsItem)]
@@ -1637,7 +1707,12 @@ async def collect_official_institution_news(country_id):
     semaphore = asyncio.Semaphore(OFFICIAL_INDEX_CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
-            asyncio.create_task(_fetch_official_index(session, profile, index_url, semaphore))
+            asyncio.create_task(
+                _fetch_official_index(
+                    session, profile, index_url, semaphore,
+                    max_links=OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX,
+                )
+            )
             for index_url in index_urls
         ]
         groups = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2357,7 +2432,7 @@ async def search_news_online(query, max_results=25):
     if direct_official_task is not None:
         try:
             direct_items = await asyncio.wait_for(
-                asyncio.shield(direct_official_task), timeout=2.5
+                asyncio.shield(direct_official_task), timeout=OFFICIAL_INTERACTIVE_BUDGET
             )
             raw_items.extend(direct_items)
         except asyncio.TimeoutError:

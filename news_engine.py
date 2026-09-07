@@ -39,6 +39,9 @@ ROTATION_WINDOW_SECONDS = 300
 DATE_ENRICH_TIMEOUT = 2.5
 DATE_ENRICH_CONCURRENCY = 6
 DATE_ENRICH_MAX_CANDIDATES = 12
+DATE_ENRICH_BUDGET = 2.5
+GENERAL_TRANSLATION_BUDGET = 2.0
+GENERAL_CANDIDATE_CAP = 100
 OFFICIAL_INDEX_TIMEOUT = 3.0
 OFFICIAL_INDEX_CONCURRENCY = 16
 OFFICIAL_INDEX_MAX_LINKS = 12
@@ -2597,7 +2600,8 @@ async def _fetch_publication_date(session, item, semaphore):
         return None
 
 
-async def _enrich_unknown_dates(items, limit=DATE_ENRICH_MAX_CANDIDATES):
+async def _enrich_unknown_dates(items, limit=DATE_ENRICH_MAX_CANDIDATES,
+                                budget=DATE_ENRICH_BUDGET):
     """Verify dates only for a bounded set of promising unknown-date items."""
     unknown = [item for item in items if _freshness_state(item) == "unknown"][:limit]
     if not unknown:
@@ -2612,11 +2616,19 @@ async def _enrich_unknown_dates(items, limit=DATE_ENRICH_MAX_CANDIDATES):
             asyncio.create_task(_fetch_publication_date(session, item, semaphore))
             for item in unknown
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for item, result in zip(unknown, results):
-        if isinstance(result, datetime):
-            item.published = result
+        task_items = dict(zip(tasks, unknown))
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=budget)
+            for task in done:
+                result = task.result() if not task.cancelled() else None
+                if isinstance(result, datetime):
+                    task_items[task].published = result
+        finally:
+            unfinished = [task for task in tasks if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
     return items
 
 
@@ -2735,15 +2747,12 @@ async def fetch_feed(session, source, url):
         # breaking polling, 10+ feedparser jobs contend for the GIL and can make
         # even the Home button appear frozen for ~20 seconds.  A tiny dedicated
         # pool isolates parser CPU from Telegram's event loop.
-        async with _FEED_PARSE_SEMAPHORE:
-            loop = asyncio.get_running_loop()
-            parse_future = loop.run_in_executor(
-                _FEED_PARSE_EXECUTOR, feedparser.parse, data
-            )
-            parsed = await asyncio.wait_for(
-                parse_future,
-                timeout=FEED_PARSE_TIMEOUT,
-            )
+        async with asyncio.timeout(FEED_PARSE_TIMEOUT):
+            async with _FEED_PARSE_SEMAPHORE:
+                loop = asyncio.get_running_loop()
+                parsed = await loop.run_in_executor(
+                    _FEED_PARSE_EXECUTOR, feedparser.parse, data
+                )
         items = []
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)
@@ -3354,6 +3363,24 @@ async def _collect_general_news(max_items=150):
     except Exception:
         log.exception("Discovery failed; returning available direct-feed news.")
 
+    # Bound work before verification, translation and semantic dedup. Discovery
+    # can otherwise delay completed official results past the cache timeout.
+    by_url = {}
+    for item in items:
+        key = item.url.split("#", 1)[0].strip().lower()
+        if not key:
+            continue
+        existing = by_url.get(key)
+        if existing is None or item.trust_score > existing.trust_score:
+            by_url[key] = item
+    items = list(by_url.values())
+    items.sort(key=lambda item: (
+        1 if _freshness_state(item) == "current" else 0,
+        float(item.trust_score or 0),
+        item.published.timestamp() if item.published else 0,
+    ), reverse=True)
+    items = items[:GENERAL_CANDIDATE_CAP]
+
     # Unknown-date candidates are verified once, in a bounded concurrent pass,
     # before the authoritative current-news gate.  This keeps strict freshness
     # without silently discarding otherwise valid current publisher pages.
@@ -3362,7 +3389,6 @@ async def _collect_general_news(max_items=150):
     # Canonicalize every foreign title before the final event-level dedup.
     # This prevents the same story arriving in Arabic and English from being
     # emitted twice merely because the source language differs.
-    items = await translate_news_titles(items)
     items = [
         item for item in deduplicate_news(items)
         if not _is_digest(item.title) and _is_current_news(item)
@@ -3377,13 +3403,15 @@ async def _collect_general_news(max_items=150):
         ),
         reverse=True,
     )
+    items = items[:max_items]
+    items = await translate_news_titles(items, budget=GENERAL_TRANSLATION_BUDGET)
 
-    return items[:max_items]
+    return items
 
 async def collect_news(max_items=150):
     """Independent collectors share a deadline below the worker's 25s timeout."""
-    tasks = [asyncio.create_task(_collect_general_news(max_items)),
-             asyncio.create_task(collect_official_publisher_news())]
+    tasks = [asyncio.create_task(_collect_general_news(max_items), name="general-news"),
+             asyncio.create_task(collect_official_publisher_news(), name="official-news")]
     items = []
     try:
         done, _ = await asyncio.wait(tasks, timeout=20.0)
@@ -3417,6 +3445,8 @@ async def collect_news(max_items=150):
         if key not in seen:
             seen.add(key)
             result.append(item)
+    log.info("News collection completed official=%d general=%d returned=%d",
+             len(ordered), len(remaining), min(len(result), max_items))
     return result[:max_items]
 
 
@@ -3445,4 +3475,3 @@ def build_ai_context(items):
         )
 
     return "\n\n".join(lines)
-

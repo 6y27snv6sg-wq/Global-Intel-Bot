@@ -20,6 +20,10 @@ log = logging.getLogger("news_engine")
 
 FETCH_TIMEOUT = 4
 FETCH_CONNECT_TIMEOUT = 2
+FEED_PARSE_TIMEOUT = 1.5
+MAX_FEED_BYTES = 1_500_000
+FEED_CIRCUIT_FAILURES = 3
+FEED_CIRCUIT_COOLDOWN = 600
 COLLECTION_CONCURRENCY = 20
 MAX_FEED_ITEMS = 30
 MAX_ONLINE_QUERIES = 6
@@ -44,6 +48,8 @@ OFFICIAL_INDEX_PUBLISHERS = ("saudi_arabia", "china", "japan", "france")
 # for frequent lightweight polling and deliberately excludes Google discovery,
 # official page crawling, date enrichment, and AI analysis.
 BREAKING_FEED_CONCURRENCY = 12
+
+_FEED_FAILURE_STATE = {}
 BREAKING_TRANSLATION_BUDGET = 1.2
 BREAKING_MAX_PER_FEED = 12
 
@@ -2282,8 +2288,47 @@ def parse_entry(entry, source, category="general"):
     )
     return classify_item(item)
 
+def _feed_circuit_open(source):
+    state = _FEED_FAILURE_STATE.get(source)
+    if not state:
+        return False
+    failures, blocked_until = state
+    now = time.monotonic()
+    if blocked_until and now < blocked_until:
+        return True
+    if blocked_until and now >= blocked_until:
+        _FEED_FAILURE_STATE.pop(source, None)
+    return False
+
+
+def _record_feed_success(source):
+    _FEED_FAILURE_STATE.pop(source, None)
+
+
+def _record_feed_failure(source):
+    failures, blocked_until = _FEED_FAILURE_STATE.get(source, (0, 0.0))
+    failures += 1
+    if failures >= FEED_CIRCUIT_FAILURES:
+        blocked_until = time.monotonic() + FEED_CIRCUIT_COOLDOWN
+        failures = 0
+        log.warning(
+            "Feed circuit opened for %s; cooldown=%ss",
+            source, FEED_CIRCUIT_COOLDOWN,
+        )
+    _FEED_FAILURE_STATE[source] = (failures, blocked_until)
+
+
 async def fetch_feed(session, source, url):
-    """Fetch one source in isolation; a failed source never blocks collection."""
+    """Fetch one source without allowing parsing/network stalls to block Telegram.
+
+    RSS parsing is CPU/synchronous work in feedparser.  Running it directly in the
+    event loop previously meant an 8-second asyncio timeout could not fire until a
+    malformed/large feed finished parsing.  Parse off-thread, cap feed bytes, and
+    apply a short circuit breaker to repeatedly failing sources.
+    """
+    if _feed_circuit_open(source):
+        return []
+
     try:
         timeout = aiohttp.ClientTimeout(
             total=FETCH_TIMEOUT,
@@ -2298,25 +2343,37 @@ async def fetch_feed(session, source, url):
         ) as response:
             if response.status != 200:
                 log.warning("Feed HTTP %s: %s", response.status, source)
+                _record_feed_failure(source)
                 return []
-            data = await response.read()
+            data = await response.content.read(MAX_FEED_BYTES + 1)
+            if len(data) > MAX_FEED_BYTES:
+                log.warning("Feed too large; skipped: %s", source)
+                _record_feed_failure(source)
+                return []
 
-        parsed = feedparser.parse(data)
+        parsed = await asyncio.wait_for(
+            asyncio.to_thread(feedparser.parse, data),
+            timeout=FEED_PARSE_TIMEOUT,
+        )
         items = []
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)
             if item:
                 items.append(item)
+        _record_feed_success(source)
         return items
 
     except asyncio.TimeoutError:
         log.warning("Feed timeout; skipped: %s", source)
+        _record_feed_failure(source)
         return []
     except aiohttp.ClientError as exc:
         log.warning("Feed connection error; skipped %s: %s", source, exc)
+        _record_feed_failure(source)
         return []
     except Exception as exc:
         log.warning("Feed failed; skipped %s: %s", source, exc)
+        _record_feed_failure(source)
         return []
 
 def _ensure_live_google_query(query):

@@ -645,6 +645,7 @@ class NewsItem:
     official: bool = False
     search_text: str = ""
     alternate_sources: Optional[List[str]] = None
+    discovery_domain_hint: str = ""
 
     def __post_init__(self):
         self.title = (self.title or "").strip()
@@ -658,6 +659,7 @@ class NewsItem:
         ]
         self.summary = re.sub(r"<[^>]+>", " ", self.summary or "").strip()
         self.domain = (self.domain or urlparse(self.url).netloc or "").lower().replace("www.", "")
+        self.discovery_domain_hint = (self.discovery_domain_hint or "").lower().strip(".").replace("www.", "")
         combined = f"{self.title} {self.summary}"
         self.region = self.region or detect_region(combined)
         self.official = self.official or is_official_source(self.source, self.domain)
@@ -1570,22 +1572,30 @@ def _country_anchor_match(item, query):
         return False
 
     domains = profile.get("domains", set())
-    if domains and _domain_matches(item.domain, domains):
+    if domains and (
+        _domain_matches(item.domain, domains)
+        or _domain_matches(getattr(item, "discovery_domain_hint", ""), domains)
+    ):
         return True
 
     return any(term and term in haystack for term in aliases)
 
 def _institution_source_match(item, profile):
-    """For a named institution, require the original institution publisher.
+    """For a named institution, require evidence of the original publisher.
 
-    Mentions in a newspaper headline are not institution-originated releases.
-    This rule is data-driven from the institution registry and therefore applies
-    uniformly to every configured country.
+    Google News RSS frequently omits the publisher URL from ``source`` even
+    when the discovery query itself is an explicit ``site:official-domain``
+    query.  In that case the bounded discovery provenance is valid publisher
+    evidence; ordinary media results remain rejected.  This is registry-driven
+    and therefore applies uniformly to every configured institution.
     """
     if profile.get("kind") != "institution":
         return True
     domains = profile.get("domains", set())
-    if domains and _domain_matches(item.domain, domains):
+    if domains and (
+        _domain_matches(item.domain, domains)
+        or _domain_matches(getattr(item, "discovery_domain_hint", ""), domains)
+    ):
         return True
     source = normalize_text(item.source)
     source_aliases = profile.get("source_aliases", set())
@@ -1900,12 +1910,14 @@ async def search_news_online(query, max_results=25):
         ttl_dns_cache=60,
     )
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            asyncio.create_task(
+        task_queries = {}
+        tasks = []
+        for q in queries:
+            task = asyncio.create_task(
                 fetch_feed(session, f"بحث: {q}", google_news_url(q))
             )
-            for q in queries
-        ]
+            tasks.append(task)
+            task_queries[task] = q
         done, pending = await asyncio.wait(tasks, timeout=ONLINE_SEARCH_BUDGET)
         for task in pending:
             task.cancel()
@@ -1916,8 +1928,17 @@ async def search_news_online(query, max_results=25):
     for task in done:
         try:
             group = task.result()
-            if isinstance(group, list):
-                raw_items.extend(group)
+            if not isinstance(group, list):
+                continue
+            discovery_query = task_queries.get(task, "")
+            site_match = re.match(r"^\s*site:([^\s]+)\s*$", discovery_query, flags=re.I)
+            site_domain = site_match.group(1).lower().strip(".") if site_match else ""
+            for item in group:
+                # Preserve exact discovery provenance only for pure site:domain
+                # queries.  It is never inferred from a broad query or title.
+                if site_domain:
+                    item.discovery_domain_hint = site_domain
+                raw_items.append(item)
         except Exception:
             continue
 

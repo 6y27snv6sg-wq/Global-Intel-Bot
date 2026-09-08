@@ -2,10 +2,12 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import re
 import time
 import urllib.parse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,13 +44,19 @@ DATE_ENRICH_MAX_CANDIDATES = 12
 DATE_ENRICH_BUDGET = 2.5
 GENERAL_TRANSLATION_BUDGET = 2.0
 GENERAL_CANDIDATE_CAP = 100
-OFFICIAL_INDEX_TIMEOUT = 3.0
+OFFICIAL_INDEX_TIMEOUT = 4.5
 OFFICIAL_INDEX_CONCURRENCY = 24
 OFFICIAL_INDEX_MAX_LINKS = 12
+OFFICIAL_MAX_ITEMS_PER_INDEX = 4
 OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 6
 OFFICIAL_INTERACTIVE_BUDGET = 5.5
-OFFICIAL_COLLECTION_BUDGET = 12.0
+OFFICIAL_COLLECTION_BUDGET = 16.0
 OFFICIAL_MAX_PAGE_BYTES = 900_000
+OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE = 3
+OFFICIAL_CACHE_ITEMS_PER_SOURCE = 20
+OFFICIAL_DISCOVERY_BUDGET = 4.0
+OFFICIAL_DISCOVERY_CONCURRENCY = 10
+OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE = 8
 
 # Fast breaking-news lane: direct publisher feeds only.  This path is designed
 # for frequent lightweight polling and deliberately excludes Google discovery,
@@ -56,6 +64,8 @@ OFFICIAL_MAX_PAGE_BYTES = 900_000
 BREAKING_FEED_CONCURRENCY = 12
 
 _FEED_FAILURE_STATE = {}
+_OFFICIAL_PROFILE_ROUND = 0
+_OFFICIAL_RESULT_CACHE = {}
 # feedparser is pure-Python and can monopolize the GIL when many feeds parse at once.
 # Keep RSS parsing on a small dedicated pool so background collectors cannot starve
 # Telegram callbacks or the main asyncio loop.
@@ -63,7 +73,6 @@ _FEED_PARSE_EXECUTOR = ThreadPoolExecutor(
     max_workers=FEED_PARSE_WORKERS,
     thread_name_prefix="feed-parser",
 )
-_FEED_PARSE_SEMAPHORE = asyncio.Semaphore(FEED_PARSE_WORKERS)
 BREAKING_TRANSLATION_BUDGET = 1.2
 BREAKING_MAX_PER_FEED = 12
 
@@ -145,7 +154,11 @@ ECON_TERMS = [
     "economic","markets","market","stocks","equities","stock exchange",
     "inflation","interest rates","gold","dollar","usd","bitcoin","crypto",
     "investment","bonds","budget","gdp","central bank","exports","imports",
-    "earnings","acquisition",
+    "earnings","acquisition", "reserve bank", "monetary policy",
+    "liquidity adjustment facility", "liquidity facility", "reverse repo",
+    "repo rate", "open market operation",
+    "بنك احتياطي", "سياسة نقدية", "تسهيلات السيولة", "إعادة الشراء",
+    "عمليات السوق المفتوحة",
 ]
 
 ECON_EXCLUDE = [
@@ -153,6 +166,11 @@ ECON_EXCLUDE = [
     "انتشال","إنقاذ عمال","منجم","نفق","فيضانات","طقس",
     "rescue","earthquake","death","funeral","accident","drowning","flood",
     "weather",
+    # A passing economic reference in the summary must not move a primarily
+    # humanitarian, rights or conflict story onto the Economy desk.
+    "حقوق الانسان", "حقوق الإنسان", "انساني", "إنساني", "لاجئين",
+    "الحرب", "نزاع", "ضحايا", "human rights", "humanitarian",
+    "refugees", "war in", "war on", "war against", "conflict", "victims",
 ]
 
 SECURITY_TERMS = [
@@ -163,7 +181,10 @@ SECURITY_TERMS = [
     "military","army","forces","defense","defence","security","weapons","weapon",
     "missile","missiles","airstrike","airstrike","strike","attack","fighting",
     "battle","battles","combat","drone","drones","ammunition","air defense",
-    "military operation","troops","navy","warship",
+    "military operation","troops","navy","warship", "targeted", "targeting",
+    "houthi", "houthis", "حوثي", "الحوثي",
+    "الحوثيون", "الحوثيين", "حرب",
+    "war in", "war on", "war against", "conflict",
 ]
 
 SECURITY_SOCIAL_EXCLUDE = [
@@ -206,6 +227,22 @@ LOW_VALUE_HARD_TERMS = [
     "مشاهدة مباشرة", "مشاهدة البث المباشر", "مشاهدة مباراة",
     "شاهد المباراة", "رابط المباراة", "روابط المباراة", "live stream",
     "watch live", "streaming link", "live score", "نتيجة مباشرة",
+    # Compromised government subdomains and SEO spam must never inherit the
+    # trust of their parent public-sector suffix.
+    "sexy", "xxx", "porn", "فيديو مسرب", "مسرب فيديو",
+    "تسريب مقاطع", "الفيديو الكامل", "رابط الفيديو الأصلي",
+    "دراما قصيرة", "علاقة عاطفية", "شاهد على الهاتف المحمول",
+    "free short drama", "watch on mobile",
+    # Embassy services, commercial listings and ceremonial award publicity are
+    # official-site content but not intelligence-grade official statements.
+    "مزاد السفارة", "مزاد الكتروني", "مزاد إلكتروني",
+    "embassy auction", "online auction",
+    "جوائز تجربة العملاء", "جائزة تجربة العملاء",
+    "customer experience award", "customer experience awards",
+    # Legacy archive pages can be newly indexed today even though the release
+    # itself is historical.  These retired institution names are conclusive
+    # evidence that the page is not a current Saudi Central Bank statement.
+    "مؤسسة النقد العربي السعودي", "saudi arabian monetary agency",
 ]
 
 SPORT_TERMS = [
@@ -281,6 +318,20 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s\u0600-\u06FF-]", " ", text)).strip()
 
 
+def _looks_mojibake(value):
+    """Detect broken UTF-8/Windows-codepage text before it reaches Telegram."""
+    text = str(value or "")
+    if not text:
+        return False
+    if re.search(r"[\x80-\x9f]", text):
+        return True
+    severe = ("ï¿½", "â€", "Ãƒ", "Ø§Ù", "Ù„Ø", "Ů„", "Ř§", "Ř±")
+    if any(marker in text for marker in severe):
+        return True
+    markers = ("Ã", "Â", "Ø", "Ù", "Ů", "Ř")
+    return sum(text.count(marker) for marker in markers) >= 3
+
+
 # Arabic display/normalization layer.
 # This uses the public Google Translate endpoint only for title translation.
 # Gemini is deliberately NOT used here.
@@ -300,6 +351,18 @@ def _needs_arabic_translation(title: str) -> bool:
     return latin >= 3 and latin > arabic
 
 
+def _translation_input(title: str) -> str:
+    """Remove redundant parenthesized acronyms before machine translation.
+
+    Publisher headlines commonly spell out a term and then append an acronym,
+    e.g. ``Liquidity Adjustment Facility (LAF)``. Translators may reinterpret
+    that acronym as an unrelated organization. The full phrase is retained, so
+    stripping only the parenthesized acronym loses no headline meaning.
+    """
+    text = str(title or "").strip()
+    return re.sub(r"(?<=\w)\s*\([A-Z][A-Z0-9&.-]{1,9}\)", "", text).strip()
+
+
 async def translate_title_to_arabic(session, title: str) -> str:
     title = (title or "").strip()
     if not _needs_arabic_translation(title):
@@ -315,7 +378,7 @@ async def translate_title_to_arabic(session, title: str) -> str:
         "sl": "auto",
         "tl": "ar",
         "dt": "t",
-        "q": title,
+        "q": _translation_input(title),
     }
 
     for attempt in range(1):
@@ -723,8 +786,13 @@ def detect_region(text):
     return ""
 
 def _domain_matches(domain, candidates):
+    # Registry domains are exact publisher hosts.  Treating every subdomain of
+    # a broad government host (for example *.gov.br) as the same publisher lets
+    # unrelated or compromised municipal sites impersonate a ministry.
     d = (domain or "").lower().split(":")[0].split("/")[0].strip(".")
-    return any(d == candidate or d.endswith("." + candidate) for candidate in candidates)
+    d = d.removeprefix("www.")
+    return any(d == str(candidate or "").lower().strip(".").removeprefix("www.")
+               for candidate in candidates)
 
 def is_official_source(source, domain):
     # Official status is determined from the publisher domain, not from words
@@ -761,12 +829,22 @@ def _is_digest(title):
     n = normalize_text(title)
     return any(normalize_text(term) in n for term in DIGEST_TERMS)
 
+def _security_term_score(value):
+    """Count security meaning without matching أمن inside words like الثامن."""
+    n = normalize_text(value)
+    ambiguous = normalize_text("أمن")
+    score = score_terms(n, [term for term in SECURITY_TERMS
+                            if normalize_text(term) != ambiguous])
+    score += len(re.findall(r"(?<!\w)(?:امن|الامن)(?!\w)", n))
+    return score
+
+
 def _security_signal(title, summary=""):
     t = normalize_text(title)
     s = normalize_text(summary)
     if any(normalize_text(x) in t for x in SECURITY_SOCIAL_EXCLUDE):
         return False
-    return score_terms(t, SECURITY_TERMS) >= 1 or score_terms(s, SECURITY_TERMS) >= 2
+    return _security_term_score(t) >= 1 or _security_term_score(s) >= 2
 
 def _economy_signal(title, summary=""):
     t = normalize_text(title)
@@ -894,91 +972,217 @@ def _direct_official_statement(item):
                 and _official_signal(item.original_title or item.title, item.summary, item))
 
 
-def classify_item(item):
-    title = normalize_text(item.title)
-    summary = normalize_text(item.summary)
-    text = f"{title} {summary}"
+URGENT_SECTION_TERMS = [
+    "عاجل", "خبر عاجل", "تحذير عاجل", "حالة طوارئ", "إخلاء فوري",
+    "breaking", "breaking news", "urgent", "state of emergency",
+    "emergency declared", "immediate evacuation",
+    "زلزال", "earthquake", "تسونامي", "tsunami",
+]
 
-    if _is_digest(item.title):
-        item.category = "general"
-        return item
+URGENT_RETROSPECTIVE_TERMS = [
+    "ذكرى", "الذكري", "anniversary", "years since", "year since",
+    "اعاده الاعمار", "إعادة الإعمار", "reconstruction progress",
+]
 
-    econ = (score_terms(title, ECON_TERMS) * 3
-            + score_terms(summary, ECON_TERMS))
-    if score_terms(text, ECON_EXCLUDE):
-        econ -= 5
+URGENT_METAPHOR_PATTERNS = [
+    r"زلزال\s+(?:الاقتراع|انتخابي|سياسي|الانتخابات)",
+    r"(?:electoral|political)\s+earthquake",
+]
 
-    sec = (score_terms(title, SECURITY_TERMS) * 3
-           + score_terms(summary, SECURITY_TERMS))
-    if score_terms(title, SECURITY_SOCIAL_EXCLUDE):
-        sec -= 12
+URGENT_LIVE_EVENT_TERMS = [
+    "قتل", "قتيل", "قتلى", "مصاب", "اصابه", "إصابة", "ضحايا",
+    "غاره", "غارة", "غارات", "قصف", "هجوم", "انفجار", "اخلاء", "إخلاء",
+    "يضرب", "ضرب", "وقع", "هزه", "هزة", "بقوه", "بقوة", "تحذير",
+    "killed", "dead", "injured", "casualties", "airstrike", "attack",
+    "explosion", "evacuation", "hits", "strikes", "magnitude", "warning",
+]
 
-    official = (score_terms(title, OFFICIAL_TERMS) * 3
-                + score_terms(summary, OFFICIAL_TERMS))
-    if item.official:
-        official += 2
 
-    urgent = (score_terms(title, URGENT_TERMS) * 2
-              + score_terms(summary, URGENT_TERMS))
+def _urgent_section_signal(title, summary=""):
+    """Admit live emergencies, not anniversaries, analysis or metaphors."""
+    t = normalize_text(title)
+    s = normalize_text(summary)
+    combined = f"{t} {s}"
 
-    # Explicit category assignment. Security/social and official stories
-    # must not be promoted to economy merely because they mention oil/energy.
-    if _security_signal(title, summary) and sec >= max(econ, official, 4):
-        item.category = "secu"
-    elif _official_signal(title, summary, item) and official >= max(econ, sec, 4):
-        item.category = "forg"
-    elif _economy_signal(title, summary) and econ >= max(sec, official, 4):
-        item.category = "econ"
-    elif urgent >= 4:
-        item.category = "urg"
-    else:
-        item.category = "general"
-
-    return item
-
-def is_topic_match(item, topic_key):
-    title = item.title or ""
-    summary = item.summary or ""
-
-    # This is intentionally the first gate for every section.
-    # Generic digest articles can never enter any section.
-    if _is_digest(title):
+    if score_terms(combined, URGENT_RETROSPECTIVE_TERMS):
+        return False
+    if any(re.search(pattern, t, re.I) for pattern in URGENT_METAPHOR_PATTERNS):
         return False
 
-    if topic_key == "econ":
-        # Section classification uses title/summary only.
-        # It NEVER uses source/search_text.
-        return _economy_signal(title, summary) and not (
-            _security_signal(title, summary)
-            and score_terms(normalize_text(title), SECURITY_TERMS) >= 1
-            and score_terms(normalize_text(title), ECON_TERMS) <= 1
-        )
+    emergency = score_terms(t, (
+        "حاله طوارئ", "حالة طوارئ", "اخلاء فوري", "إخلاء فوري",
+        "state of emergency", "emergency declared", "immediate evacuation",
+        "تسونامي", "tsunami",
+    )) >= 1
+    if emergency:
+        return True
 
-    if topic_key == "secu":
-        return _security_signal(title, summary)
+    explicit = score_terms(t, ("عاجل", "خبر عاجل", "breaking", "breaking news", "urgent")) >= 1
+    live_title = score_terms(t, URGENT_LIVE_EVENT_TERMS)
+    if explicit and live_title >= 1:
+        return True
 
-    if topic_key == "forg":
-        return _direct_official_statement(item)
+    disaster = score_terms(t, ("زلزال", "earthquake")) >= 1
+    if disaster and live_title >= 1:
+        return True
 
-    if topic_key == "urg":
-        return (
-            score_terms(title, URGENT_TERMS) >= 1
-            or score_terms(summary, URGENT_TERMS) >= 2
-        )
-
-    if topic_key == "gulf":
-        text = normalize_text(f"{title} {summary}")
-        gulf = REGIONS["الشرق الأوسط"]
-        return any(normalize_text(x) in text for x in gulf)
-
-    if topic_key == "wrld":
-        text = normalize_text(f"{title} {summary}")
-        return bool(item.region) or any(
-            normalize_text(x) in text
-            for x in ["امريكا","الولايات المتحده","اوروبا","الصين","روسيا","اوكرانيا","الهند","اليابان"]
-        )
-
+    # A summary can never manufacture urgency by repeating generic disaster
+    # words beneath an analytical headline.
     return False
+
+ROUTINE_INSTITUTIONAL_PATTERNS = [
+    # Internal staffing, fellowships and ceremonial publicity. Central-bank
+    # market operations are not noise: they belong exclusively to Economy.
+    r"\bappoints? (?:a )?new (?:chief financial officer|finance director)\b",
+    r"\bnational armaments director appoints\b",
+    r"\bfellowship (?:programme|program)\b",
+    r"\byouth fellowship\b",
+    r"\b(?:to celebrate|commemorates?|marks?) (?:the )?.{0,35}\banniversary\b",
+    r"\b(?:takes? (?:his|her|its|the) seat|assumes? office)\b",
+    r"\battend(?:ed|s|ing)? (?:the )?(?:opening|inauguration) (?:ceremony|of)\b",
+    r"\bيعين مديرا ماليا جديدا\b",
+    r"\bبرنامج زماله الشباب\b",
+    r"\b(?:للاحتفال|يحتفل|سيحتفل|يحيي) .{0,35}\بالذكري\b",
+    r"\bيشغل مقعده\b",
+    r"\b(?:حضر|تحضر|يحضر|شارك|تشارك|يشارك) .{0,55}\bحفل افتتاح\b",
+]
+
+SUBSTANTIVE_POLICY_TERMS = [
+    "strategy", "policy", "decision", "interest rate", "rate decision",
+    "sanctions", "agreement", "treaty", "ceasefire", "legislation",
+    "budget", "security", "defence", "defense", "military", "emergency",
+    "استراتيجية", "سياسة", "قرار", "سعر الفائدة", "عقوبات", "اتفاق",
+    "معاهدة", "وقف إطلاق النار", "تشريع", "ميزانية", "أمن", "دفاع",
+    "عسكري", "طوارئ",
+]
+
+
+def _classification_text(item):
+    """Use trustworthy pre-translation text for every section decision."""
+    original = str(getattr(item, "original_title", "") or "").strip()
+    title = original or str(getattr(item, "title", "") or "").strip()
+    summary = str(getattr(item, "summary", "") or "").strip()
+    return title, summary
+
+
+def _routine_institutional_noise(item, title, summary):
+    """Reject routine publisher notices while retaining substantive policy."""
+    text = normalize_text(f"{title} {summary}")
+    if not any(re.search(pattern, text, re.I) for pattern in ROUTINE_INSTITUTIONAL_PATTERNS):
+        return False
+    return score_terms(text, SUBSTANTIVE_POLICY_TERMS) == 0
+
+
+def _verified_official_profile(item):
+    """Return original-publisher provenance used to route specialist desks."""
+    source_id = str(getattr(item, "official_source_id", "") or "")
+    profile = OFFICIAL_SOURCE_REGISTRY.get(source_id)
+    if not profile or not getattr(item, "publication_evidence", ""):
+        return None
+    if not _is_current_news(item) or not _domain_matches(item.domain, profile["domains"]):
+        return None
+    return profile
+
+
+def _exclusive_topic_key(item):
+    """Assign exactly one specialist section, or None for general noise."""
+    title, summary = _classification_text(item)
+    if not title or _is_digest(title) or _hard_low_value(item):
+        return None
+    if _routine_institutional_noise(item, title, summary):
+        return None
+
+    normalized_title = normalize_text(title)
+    normalized_summary = normalize_text(summary)
+
+    # Keep urgent deliberately narrow. Ordinary attack/missile coverage stays
+    # on the security desk unless it explicitly signals a live emergency.
+    if _urgent_section_signal(title, summary):
+        return "urg"
+
+    security = _security_signal(title, summary)
+    economy = _economy_signal(title, summary)
+    security_title_hits = _security_term_score(normalized_title)
+    economy_title_hits = score_terms(normalized_title, ECON_TERMS)
+
+    # Verified institution provenance outranks incidental vocabulary.  A
+    # foreign-ministry meeting does not become an Economy story merely because
+    # exports or investment were discussed; likewise central-bank and defence
+    # releases belong to their specialist desks.  This rule is registry-driven
+    # and therefore applies uniformly to every configured country.
+    official_profile = _verified_official_profile(item)
+    if official_profile:
+        institution = official_profile.get("institution", "")
+        if institution in {"defence", "peace_security"}:
+            return "secu"
+        if institution in {"central_bank", "finance", "economy"}:
+            return "econ"
+        if institution == "foreign_affairs":
+            return "secu" if security else "forg"
+
+    # A clear headline owns the routing decision. Feed summaries sometimes
+    # contain navigation text or adjacent-story fragments; those fragments may
+    # help classify an otherwise neutral headline, but they must never move an
+    # explicitly financial headline to Security (or the reverse).
+    if economy_title_hits and not security_title_hits:
+        return "econ"
+    if security_title_hits and not economy_title_hits:
+        return "secu"
+
+    if security and economy:
+        security_score = (
+            _security_term_score(normalized_title) * 3
+            + _security_term_score(normalized_summary)
+        )
+        economy_score = (
+            score_terms(normalized_title, ECON_TERMS) * 3
+            + score_terms(normalized_summary, ECON_TERMS)
+        )
+        if score_terms(normalized_title, SECURITY_SOCIAL_EXCLUDE):
+            security_score -= 12
+        if score_terms(f"{normalized_title} {normalized_summary}", ECON_EXCLUDE):
+            economy_score -= 5
+        return "secu" if security_score >= economy_score else "econ"
+    if security:
+        return "secu"
+    if economy:
+        return "econ"
+
+    # Official is a provenance desk for releases that do not belong to a more
+    # specific specialist desk. Thus defence releases go only to Security and
+    # central-bank releases go only to Economy, while diplomatic/government
+    # statements remain here.
+    if _direct_official_statement(item):
+        return "forg"
+
+    # Regional/world desks are fallbacks after the specialist desks.
+    # Recompute geography from the same original evidence. ``item.region`` may
+    # have been inferred from a later display translation and is not evidence.
+    region = detect_region(f"{title} {summary}")
+    if region == "الشرق الأوسط":
+        return "gulf"
+    if region:
+        return "wrld"
+
+    world_markers = [
+        "الأمم المتحدة", "الاتحاد الأوروبي", "الاتحاد الأفريقي", "الناتو",
+        "united nations", "european union", "african union", "nato",
+        "دولي", "عالمي", "international", "global",
+    ]
+    if score_terms(f"{normalized_title} {normalized_summary}", world_markers):
+        return "wrld"
+    return None
+
+
+def classify_item(item):
+    item.category = _exclusive_topic_key(item) or "general"
+    return item
+
+
+def is_topic_match(item, topic_key):
+    if topic_key not in {"econ", "forg", "urg", "gulf", "wrld", "secu"}:
+        return False
+    return _exclusive_topic_key(item) == topic_key
 
 def deduplicate_news(items):
     """Global event-level deduplication with source preservation.
@@ -1129,8 +1333,17 @@ def _query_intent(query):
 
 
 def _hard_low_value(item):
+    if _looks_mojibake(item.title) or _looks_mojibake(item.original_title) or _looks_mojibake(item.source):
+        return True
+    raw = f"{item.title} {item.original_title} {item.summary}"
+    if "🔞" in raw:
+        return True
     text = normalize_text(f"{item.title} {item.original_title}")
-    return any(normalize_text(term) in text for term in LOW_VALUE_HARD_TERMS)
+    return any(
+        normalized and normalized in text
+        for term in LOW_VALUE_HARD_TERMS
+        for normalized in (normalize_text(term),)
+    )
 
 
 def _content_value_adjustment(item, query):
@@ -1206,6 +1419,7 @@ def _semantic_event_match(a, b):
 
 def _is_non_article_result(item):
     """Reject homepages, section pages and generic portal entries."""
+    raw_title = html.unescape(str(item.title or "")).strip()
     title = normalize_text(item.title)
     original = normalize_text(item.original_title)
     combined = f"{title} {original}"
@@ -1218,7 +1432,22 @@ def _is_non_article_result(item):
         "الرئيسيه",
         "الرئيسية",
         "ministry of foreign affairs",
+        "official portal",
+        "البوابة الرسمية",
     )
+
+    # Public news indexes occasionally surface a bare domain (or the same
+    # domain repeated around separators) as if it were a current article.
+    # This rule is institution-agnostic and therefore protects every registry
+    # source, not only a ministry that happened to expose the problem.
+    without_domains = re.sub(
+        r"(?i)(?:https?://)?(?:www\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[a-z0-9_./%-]*)?",
+        " ",
+        raw_title,
+    )
+    without_domains = re.sub(r"[\s\-|:–—_/.,()\[\]]+", "", without_domains)
+    if not without_domains:
+        return True
 
     parsed = urlparse(item.url or "")
     path = (parsed.path or "").strip("/")
@@ -1228,7 +1457,10 @@ def _is_non_article_result(item):
         article_signals = (
             "يدين", "تدين", "يعرب", "تعلن", "اعلنت", "أعلنت", "بيان",
             "تصريح", "اجتماع", "استقبل", "بحث", "ناقش", "اتصال",
+            "يؤكد", "تؤكد", "أكد", "اكد", "وقعت", "يوقع", "توقيع",
+            "زيارة", "يزور",
             "condemns", "statement", "meeting", "announces", "minister",
+            "confirms", "confirmed", "signs", "signed", "visits", "visited",
         )
         if not any(normalize_text(x) in combined for x in article_signals):
             return True
@@ -1450,7 +1682,64 @@ united_states|finance|الخزانة الأمريكية|https://home.treasury.go
 european_union|council|مجلس الاتحاد الأوروبي|https://www.consilium.europa.eu/en/press/press-releases/|/press/press-releases/|1
 european_union|central_bank|البنك المركزي الأوروبي|https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release|/press/pr/|1
 african_union|commission|مفوضية الاتحاد الأفريقي|https://au.int/en/press-releases|/pressreleases/|1
-african_union|peace_security|مجلس السلم والأمن الأفريقي|https://www.peaceau.org/en/|/article/|1"""
+african_union|peace_security|مجلس السلم والأمن الأفريقي|https://www.peaceau.org/en/|/article/|1
+argentina|government|الحكومة الأرجنتينية|https://www.argentina.gob.ar/noticias|/noticias/|0
+argentina|defence|الدفاع الأرجنتينية|https://www.argentina.gob.ar/defensa/noticias|/defensa/noticias/|1
+argentina|economy|الاقتصاد الأرجنتينية|https://www.argentina.gob.ar/economia/noticias|/economia/noticias/|1
+australia|government|رئاسة الوزراء الأسترالية|https://www.pm.gov.au/media|/media/|1
+australia|defence|الدفاع الأسترالية|https://www.defence.gov.au/news-events/releases|/news-events/releases/|1
+australia|finance|الخزانة الأسترالية|https://treasury.gov.au/media-release|/media-release/|1
+brazil|central_bank|البنك المركزي البرازيلي|https://www.bcb.gov.br/en/about/pressreleases|/pressreleases/|1
+brazil|defence|الدفاع البرازيلية|https://www.gov.br/defesa/pt-br/centrais-de-conteudo/noticias|/noticias/|1
+brazil|finance|المالية البرازيلية|https://www.gov.br/fazenda/pt-br/assuntos/noticias|/assuntos/noticias/|1
+canada|defence|الدفاع الكندية|https://www.canada.ca/en/department-national-defence/news.html|/department-national-defence/news/|1
+canada|finance|المالية الكندية|https://www.canada.ca/en/department-finance/news.html|/department-finance/news/|1
+china|central_bank|بنك الشعب الصيني|https://www.pbc.gov.cn/en/3688110/index.html|/en/|0
+china|defence|الدفاع الصينية|https://eng.mod.gov.cn/xb/News_213114/|/news_213114/|0
+china|finance|المالية الصينية|https://www.mof.gov.cn/en/News/|/en/news/|0
+france|defence|الدفاع الفرنسية|https://www.defense.gouv.fr/actualites|/actualites/|0
+france|finance|الاقتصاد والمالية الفرنسية|https://www.economie.gouv.fr/actualites|/actualites/|0
+germany|government|الحكومة الألمانية|https://www.bundesregierung.de/breg-en/news|/breg-en/news/|0
+germany|defence|الدفاع الألمانية|https://www.bmvg.de/en/news|/en/|0
+germany|finance|المالية الألمانية|https://www.bundesfinanzministerium.de/Content/EN/Standardartikel/Press_Room/Press-Releases/press-releases.html|/press-releases/|1
+india|government|رئاسة الوزراء الهندية|https://www.pmindia.gov.in/en/news_updates/|/news_updates/|1
+india|defence|الدفاع الهندية|https://www.pib.gov.in/AllRel.aspx?reg=3&lang=2|pressrelease|1
+india|finance|المالية الهندية|https://www.finmin.gov.in/news|/news/|0
+indonesia|government|الرئاسة الإندونيسية|https://www.presidenri.go.id/siaran-pers/|/siaran-pers/|1
+indonesia|defence|الدفاع الإندونيسية|https://www.kemhan.go.id/category/berita|/category/berita/|0
+indonesia|finance|المالية الإندونيسية|https://www.kemenkeu.go.id/informasi-publik/publikasi/berita-utama|/berita-utama/|0
+italy|government|الحكومة الإيطالية|https://www.governo.it/en/media|/en/|0
+italy|defence|الدفاع الإيطالية|https://www.difesa.it/eng/primo-piano/Pagine/default.aspx|/eng/primo-piano/|0
+italy|finance|الاقتصاد والمالية الإيطالية|https://www.mef.gov.it/en/ufficio-stampa/comunicati/|/ufficio-stampa/comunicati/|1
+japan|government|رئاسة الوزراء اليابانية|https://japan.kantei.go.jp/ongoingtopics/index.html|/ongoingtopics/|0
+japan|defence|الدفاع اليابانية|https://www.mod.go.jp/en/article/|/en/article/|0
+japan|finance|المالية اليابانية|https://www.mof.go.jp/english/policy/index.htm|/english/|0
+mexico|government|الرئاسة المكسيكية|https://www.gob.mx/presidencia/archivo/prensa|/presidencia/prensa/|1
+mexico|defence|الدفاع المكسيكية|https://www.gob.mx/defensa/archivo/prensa|/defensa/prensa/|1
+mexico|central_bank|بنك المكسيك|https://www.banxico.org.mx/publications-and-press/|/publications-and-press/|0
+russia|government|الحكومة الروسية|https://government.ru/en/news/|/en/news/|0
+russia|defence|الدفاع الروسية|https://eng.mil.ru/en/news_page/country.htm|/news_page/|0
+russia|finance|المالية الروسية|https://minfin.gov.ru/en/press-center/|/press-center/|0
+saudi_arabia|government|وكالة الأنباء السعودية|https://www.spa.gov.sa/en|/en/|0
+saudi_arabia|defence|الدفاع السعودية|https://www.mod.gov.sa/MediaCenter/Pages/default.aspx|/mediacenter/|0
+saudi_arabia|finance|المالية السعودية|https://www.mof.gov.sa/en/mediacenter/news/Pages/default.aspx|/mediacenter/news/|1
+south_africa|government|رئاسة جنوب أفريقيا|https://www.thepresidency.gov.za/press-statements|/press-statements/|1
+south_africa|defence|الدفاع الجنوب أفريقية|https://www.dod.mil.za/news|/news/|0
+south_africa|finance|الخزانة الجنوب أفريقية|https://www.treasury.gov.za/comm_media/press/|/comm_media/press/|1
+south_korea|government|رئاسة كوريا الجنوبية|https://www.president.go.kr/newsroom/|/newsroom/|0
+south_korea|defence|الدفاع الكورية الجنوبية|https://www.mnd.go.kr/mbshome/mbs/mndEN/subview.jsp?id=mndEN_020100000000|/mnden/|0
+south_korea|finance|الاقتصاد والمالية الكورية|https://english.mofe.go.kr/pc/selectTbPressCenterList.do?boardCd=N0001|/pc/|1
+turkey|government|الرئاسة التركية|https://www.tccb.gov.tr/en/news/542/|/en/news/|0
+turkey|defence|الدفاع التركية|https://www.msb.gov.tr/SlaytHaber/|/slaythaber/|0
+turkey|finance|الخزانة والمالية التركية|https://www.hmb.gov.tr/haberler|/haberler/|0
+united_kingdom|government|رئاسة الوزراء البريطانية|https://www.gov.uk/government/organisations/prime-ministers-office-10-downing-street|/government/news/;/government/speeches/|1
+united_kingdom|finance|الخزانة البريطانية|https://www.gov.uk/government/organisations/hm-treasury|/government/news/;/government/publications/|1
+united_states|government|البيت الأبيض|https://www.whitehouse.gov/briefing-room/|/briefing-room/|1
+united_states|defence|الدفاع الأمريكية|https://www.defense.gov/News/Releases/|/news/releases/|1
+european_union|commission|المفوضية الأوروبية|https://ec.europa.eu/commission/presscorner/home/en|/commission/presscorner/|1
+european_union|foreign_affairs|جهاز العمل الخارجي الأوروبي|https://www.eeas.europa.eu/eeas/press-material_en|/eeas/|1
+european_union|defence|وكالة الدفاع الأوروبية|https://eda.europa.eu/news-and-events/news|/news-and-events/news/|0
+african_union|official_agency|وكالة نيباد للتنمية|https://www.nepad.org/news|/news/|0"""
 OFFICIAL_SOURCE_REGISTRY = {}
 for _row in _OFFICIAL_PUBLIC_SOURCES.splitlines():
     _member, _institution, _name, _url, _paths, _dedicated = _row.split("|")
@@ -1472,9 +1761,56 @@ for _row in _OFFICIAL_PUBLIC_SOURCES.splitlines():
         }
 
 
+# High-value regional layer outside G20. These are public publisher pages and
+# follow the same strict date/provenance gates as the core registry.
+_OFFICIAL_STRATEGIC_EXTENSIONS = {
+    "uae": ("الخارجية الإماراتية", "https://www.mofa.gov.ae/en/mediahub/news", ("/mediahub/news/",)),
+    "qatar": ("الخارجية القطرية", "https://mofa.gov.qa/", ()),
+    "kuwait": ("الخارجية الكويتية", "https://www.mofa.gov.kw/", ()),
+    "bahrain": ("الخارجية البحرينية", "https://www.mofa.gov.bh/", ()),
+    "oman": ("الخارجية العمانية", "https://www.fm.gov.om/", ()),
+    "egypt": ("الخارجية المصرية", "https://www.mfa.gov.eg/", ()),
+}
+for _member, (_name, _url, _paths) in _OFFICIAL_STRATEGIC_EXTENSIONS.items():
+    _source_id = f"{_member}:foreign_affairs:0"
+    _base = FOREIGN_MINISTRY_REGISTRY.get(_member, {})
+    _domain = (urlparse(_url).hostname or "").removeprefix("www.")
+    OFFICIAL_SOURCE_REGISTRY[_source_id] = {
+        **_base,
+        "source_id": _source_id,
+        "member_id": _member,
+        "institution": "foreign_affairs",
+        "scope": "strategic_extension",
+        "publisher_name": _name,
+        "domains": (_domain,),
+        "index_urls": (_url,),
+        "publication_paths": _paths,
+        "statement_index": True,
+    }
+    FOREIGN_MINISTRY_REGISTRY[_member] = {
+        **_base,
+        "country_aliases": _base.get("country_aliases", (_member.replace("_", " "),)),
+        "adjectives": _base.get("adjectives", ()),
+        "domains": (_domain,),
+        "index_urls": (_url,),
+        "publication_paths": _paths,
+        "publisher_name": _name,
+    }
+
+
 for _source in OFFICIAL_SOURCE_REGISTRY.values():
     if _source["member_id"] == "saudi_arabia" and _source["institution"] == "foreign_affairs":
-        _source["date_order"] = "mdy"
+        # The public Saudi portal separates ministry news from statements.
+        # Both are first-party publication indexes and use the same strict
+        # visible-date verification applied to every other official source.
+        _source["index_urls"] = (
+            "https://www.mofa.gov.sa/ar/ministry/statements/Pages/default.aspx",
+            "https://www.mofa.gov.sa/ar/ministry/news/Pages/default.aspx",
+        )
+        _source["publication_paths"] = ("/ministry/statements/", "/ministry/news/")
+        _source["date_order"] = "dmy"
+    elif _source["member_id"] in _OFFICIAL_STRATEGIC_EXTENSIONS:
+        _source["date_order"] = "dmy"
     elif _source["member_id"] in {"germany", "france", "italy", "brazil", "argentina"}:
         _source["date_order"] = "dmy"
     _source["date_group_headings"] = _source["source_id"] in {
@@ -1498,6 +1834,52 @@ _FR_MONTHS = {
     "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
     "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
 }
+
+_HIJRI_MONTHS = {
+    "محرم": 1, "المحرم": 1,
+    "صفر": 2,
+    "ربيع الأول": 3, "ربيع الاول": 3, "ربيع أول": 3, "ربيع اول": 3,
+    "ربيع الثاني": 4, "ربيع الآخر": 4, "ربيع الاخر": 4,
+    "جمادى الأولى": 5, "جمادى الاولى": 5, "جمادى الأول": 5, "جمادى الاول": 5,
+    "جمادى الآخرة": 6, "جمادى الاخرة": 6, "جمادى الثانية": 6,
+    "رجب": 7, "شعبان": 8, "رمضان": 9,
+    "شوال": 10,
+    "ذو القعدة": 11, "ذي القعدة": 11, "ذو القعده": 11, "ذي القعده": 11,
+    "ذو الحجة": 12, "ذي الحجة": 12, "ذو الحجه": 12, "ذي الحجه": 12,
+}
+
+
+def _jdn_to_gregorian(jdn):
+    """Convert an integer Julian day number to a proleptic Gregorian date."""
+    a = int(jdn) + 32044
+    b = (4 * a + 3) // 146097
+    c = a - (146097 * b) // 4
+    d = (4 * c + 3) // 1461
+    e = c - (1461 * d) // 4
+    m = (5 * e + 2) // 153
+    day = e - (153 * m + 2) // 5 + 1
+    month = m + 3 - 12 * (m // 10)
+    year = 100 * b + d - 4800 + m // 10
+    return datetime(year, month, day, tzinfo=timezone.utc)
+
+
+def _hijri_to_gregorian(year, month, day):
+    """Convert an explicit civil-Hijri date; return None for invalid input.
+
+    Official publishers can differ by one day at month boundaries.  We do not
+    infer a missing component, and the normal current-news window provides the
+    final safety gate after conversion.
+    """
+    try:
+        year, month, day = int(year), int(month), int(day)
+        if not (1300 <= year <= 1600 and 1 <= month <= 12 and 1 <= day <= 30):
+            return None
+        month_days = math.ceil(29.5 * (month - 1))
+        jdn = (day + month_days + (year - 1) * 354
+               + (3 + 11 * year) // 30 + 1948439 - 1)
+        return _jdn_to_gregorian(jdn)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 class _OfficialAnchorParser(HTMLParser):
@@ -1693,7 +2075,7 @@ class _OfficialDocumentParser(HTMLParser):
 
 
 def _official_calendar_dates(value, date_order=None):
-    """Explicit Gregorian dates; never guess the year or convert Hijri approximately."""
+    """Extract explicit Gregorian and civil-Hijri dates without guessing fields."""
     value = str(value).translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
     found = set()
     def add(year, month, day):
@@ -1703,6 +2085,23 @@ def _official_calendar_dates(value, date_order=None):
             pass
     for year, month, day in re.findall(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", value):
         add(year, month, day)
+    # A four-digit 13xx-16xx year makes numeric Hijri dates unambiguous.
+    for year, month, day in re.findall(r"(?<!\d)(1[3-6]\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)", value):
+        converted = _hijri_to_gregorian(year, month, day)
+        if converted is not None:
+            found.add(converted)
+    for day, month, year in re.findall(r"(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](1[3-6]\d{2})(?!\d)", value):
+        converted = _hijri_to_gregorian(year, month, day)
+        if converted is not None:
+            found.add(converted)
+    hijri_names = "|".join(sorted(map(re.escape, _HIJRI_MONTHS), key=len, reverse=True))
+    hijri_separators = r"(?:\s+|\s*[/.-]\s*)"
+    for day, month, year in re.findall(
+            rf"(?<!\d)(\d{{1,2}}){hijri_separators}({hijri_names}){hijri_separators}(1[3-6]\d{{2}})(?:\s*(?:هـ|هجرية|هجري|ه))?(?!\d)",
+            value, re.I):
+        converted = _hijri_to_gregorian(year, _HIJRI_MONTHS[month], day)
+        if converted is not None:
+            found.add(converted)
     extra = {}
     for month_names in (
         "enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre",
@@ -1783,9 +2182,18 @@ def _official_index_date_hint(index_html, title, profile, article_url=None, docu
             if not dates and profile.get("member_id") == "turkey" and profile.get("institution") == "foreign_affairs":
                 dates = _official_calendar_dates(document.visible(anchor))
             if dates:
-                # Any other substantive anchor makes attribution ambiguous.
+                # A card commonly links its image/title and also contains share
+                # or navigation anchors.  Only a *different publication URL*
+                # makes the date attribution ambiguous; treating every utility
+                # link as another article forced slow detail-page fetches on
+                # otherwise explicit official indexes.
                 pending = [parent]
                 other = False
+                publication_paths = [
+                    str(path).strip("/").lower()
+                    for path in profile.get("publication_paths", ())
+                    if str(path).strip("/")
+                ]
                 while pending:
                     node = pending.pop()
                     if isinstance(node, str):
@@ -1794,7 +2202,17 @@ def _official_index_date_hint(index_html, title, profile, article_url=None, docu
                         href = node["attrs"].get("href", "")
                         if href and not href.startswith("#"):
                             url = urljoin(base, href).split("#", 1)[0]
-                            if url != target:
+                            parsed = urlparse(url)
+                            domain = (parsed.hostname or "").removeprefix("www.")
+                            path = (parsed.path or "").strip("/").lower()
+                            is_publication = (
+                                parsed.scheme in {"http", "https"}
+                                and _domain_matches(domain, set(profile.get("domains", ())))
+                                and (not publication_paths or any(p in path for p in publication_paths))
+                                and path.rsplit("/", 1)[-1]
+                                not in {"", "default.aspx", "index", "index.html", "index.htm"}
+                            )
+                            if is_publication and url.rstrip("/") != target.rstrip("/"):
                                 other = True
                     pending.extend(node["children"])
                 if not other and len(dates) == 1 and not re.search(r"updated|modified|mis à jour|تحديث", text, re.I):
@@ -1857,9 +2275,15 @@ def _official_index_date_hint(index_html, title, profile, article_url=None, docu
 
 
 def _visible_official_date(text, profile):
-    """Read visible publication labels, excluding scripts and modification dates."""
+    """Read explicit public publication evidence, excluding modification dates."""
     if not text:
         return None
+    # Public JSON-LD/meta publication fields are part of the delivered article
+    # HTML and are the most reliable portable evidence on US/Canadian/EU sites.
+    # The extractor explicitly rejects dateModified-only metadata.
+    metadata_date = _extract_publication_date_from_html(text)
+    if metadata_date is not None:
+        return metadata_date
     document = _OfficialDocumentParser(text)
     visible = document.visible(document.root)
     # Label-specific captures stop before a separate modification timestamp.
@@ -1868,6 +2292,39 @@ def _visible_official_date(text, profile):
         if re.search(r"updated|modified|mis à jour|تحديث", visible[max(0, match.start() - 20):match.start()], re.I):
             continue
         value = re.split(r"updated|modified|mis à jour|تحديث", match.group(1), flags=re.I)[0]
+        dates = _official_calendar_dates(value, profile.get("date_order"))
+        if len(dates) == 1:
+            return next(iter(dates))
+    # Many public portals render the publication date as a standalone <time>
+    # or a compact element named date/publish, including Hijri-only pages.
+    # Restrict the evidence to the element itself so dates in article prose are
+    # never promoted to publication dates.
+    for node in document.nodes:
+        if node["tag"] not in {"time", "p", "div", "span"}:
+            continue
+        value = document.visible(node).strip()
+        if not value or len(value) > 80:
+            continue
+        attrs = " ".join(str(node["attrs"].get(k, "")) for k in
+                         ("class", "id", "itemprop", "property", "name")).lower()
+        is_date_element = node["tag"] == "time" or bool(re.search(
+            r"date|publish|posted|تاريخ|نشر|hijri", attrs, re.I))
+        normalized_value = value.translate(str.maketrans(
+            "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+        explicit_hijri = bool(
+            re.fullmatch(
+                r"\s*\d{1,2}\s*(?:[/.-]\s*)?(?:\d{1,2}|[^\d\n]{2,30})\s*"
+                r"(?:[/.-]\s*)?1[3-6]\d{2}\s*(?:هـ|هجرية|هجري|ه)?\s*",
+                normalized_value, re.I,
+            )
+            or re.fullmatch(
+                r"\s*1[3-6]\d{2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{1,2}"
+                r"\s*(?:هـ|هجرية|هجري|ه)?\s*",
+                normalized_value, re.I,
+            )
+        )
+        if not (is_date_element or explicit_hijri):
+            continue
         dates = _official_calendar_dates(value, profile.get("date_order"))
         if len(dates) == 1:
             return next(iter(dates))
@@ -1916,7 +2373,7 @@ async def _read_official_page(session, url, profile, semaphore):
                         url = urljoin(url, location)
                         continue
                     if response.status != 200:
-                        log.info("Official page rejected source=%s status=%s", profile.get("source_id", ""), response.status)
+                        log.debug("Official page rejected source=%s status=%s", profile.get("source_id", ""), response.status)
                         return None
                     mime = response.headers.get("Content-Type", "").lower()
                     if mime and not any(t in mime for t in ("html", "xml", "text/plain", "rss", "atom")):
@@ -1925,7 +2382,7 @@ async def _read_official_page(session, url, profile, semaphore):
                     async for chunk in response.content.iter_chunked(65536):
                         size += len(chunk)
                         if size > OFFICIAL_MAX_PAGE_BYTES:
-                            log.info("Official page rejected source=%s reason=oversized", profile.get("source_id", ""))
+                            log.debug("Official page rejected source=%s reason=oversized", profile.get("source_id", ""))
                             return None
                         chunks.append(chunk)
                     body = b"".join(chunks).decode(response.charset or "utf-8", errors="replace")
@@ -1981,10 +2438,21 @@ def _official_feed_items(body, profile):
     return result
 
 
-async def _fetch_official_article(session, profile, url, title, semaphore, published_hint=None):
+def _record_official_failure(failure_sink, profile, phase, error=None):
+    """Collect bounded diagnostics without emitting one traceback per URL."""
+    if failure_sink is None:
+        return
+    source_id = profile.get("source_id", "unknown")
+    error_name = type(error).__name__ if error is not None else "Unavailable"
+    failure_sink.append((source_id, phase, error_name))
+
+
+async def _fetch_official_article(session, profile, url, title, semaphore,
+                                  published_hint=None, failure_sink=None):
     try:
         page = await _read_official_page(session, url, profile, semaphore)
         if page is None:
+            _record_official_failure(failure_sink, profile, "article")
             return None
         final_url, final_domain, body = page
         published = _visible_official_date(body, profile)
@@ -1993,7 +2461,7 @@ async def _fetch_official_article(session, profile, url, title, semaphore, publi
             published = published_hint
             evidence = "visible_index_card_date"
         if published is None:
-            log.info("Official article skipped domain=%s reason=no_publication_date", final_domain)
+            log.debug("Official article skipped domain=%s reason=no_publication_date", final_domain)
             return None
         item = NewsItem(
             title=title, original_title=title, url=final_url,
@@ -2002,34 +2470,37 @@ async def _fetch_official_article(session, profile, url, title, semaphore, publi
             official_source_id=profile.get("source_id", ""), publication_evidence=evidence,
         )
         if not _is_current_news(item):
-            log.info("Official article skipped domain=%s reason=outside_current_window date=%s",
-                     final_domain, published.date().isoformat())
+            log.debug("Official article skipped domain=%s reason=outside_current_window date=%s",
+                      final_domain, published.date().isoformat())
             return None
         return classify_item(item)
-    except (asyncio.TimeoutError, aiohttp.ClientError):
-        log.info("Official article unavailable source=%s", profile.get("source_id", ""))
+    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+        _record_official_failure(failure_sink, profile, "article", exc)
         return None
-    except Exception:
-        log.exception("Official article parse failed source=%s", profile.get("source_id", ""))
+    except Exception as exc:
+        _record_official_failure(failure_sink, profile, "article_parse", exc)
         return None
 
 
-async def _fetch_official_index(session, profile, index_url, semaphore, max_links=None, result_sink=None, article_semaphore=None):
+async def _fetch_official_index(session, profile, index_url, semaphore,
+                                max_links=None, result_sink=None,
+                                article_semaphore=None, failure_sink=None):
     try:
         page = await _read_official_page(session, index_url, profile, semaphore)
         if page is None:
+            _record_official_failure(failure_sink, profile, "index")
             return []
         final_url, _, body = page
         profile = {**profile, "resolved_index_url": final_url}
         links = _official_article_links(body, final_url, profile, max_links=max_links)
         document = _OfficialDocumentParser(body)
-        log.info("Official public index source=%s links=%d", profile.get("source_id", ""), len(links))
+        log.debug("Official public index source=%s links=%d", profile.get("source_id", ""), len(links))
         dated_links = [(url, title, _official_index_date_hint(
             body, title, profile, article_url=url, document=document)) for url, title in links]
     except asyncio.CancelledError:
         raise
-    except Exception:
-        log.exception("Official index failed source=%s", profile.get("source_id", ""))
+    except Exception as exc:
+        _record_official_failure(failure_sink, profile, "index", exc)
         return []
 
     items = []
@@ -2039,10 +2510,12 @@ async def _fetch_official_index(session, profile, index_url, semaphore, max_link
             try:
                 page = await _read_official_page(session, url, profile, article_semaphore or semaphore)
                 if page is None:
+                    _record_official_failure(failure_sink, profile, "alternative")
                     continue
                 alternative_url, _, alternative_body = page
                 if url in feeds:
-                    found = _official_feed_items(alternative_body, profile)
+                    available = max(0, OFFICIAL_MAX_ITEMS_PER_INDEX - len(items))
+                    found = _official_feed_items(alternative_body, profile)[:available]
                     items.extend(found)
                     if result_sink is not None:
                         result_sink.extend(found)
@@ -2055,10 +2528,12 @@ async def _fetch_official_index(session, profile, index_url, semaphore, max_link
                             await collect_one(article_url, title, hint)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                log.info("Official advertised alternative unavailable source=%s", profile["source_id"])
+            except Exception as exc:
+                _record_official_failure(failure_sink, profile, "alternative", exc)
 
     async def collect_one(url, title, hint):
+        if len(items) >= OFFICIAL_MAX_ITEMS_PER_INDEX:
+            return
         if hint is not None:
             # The exact dated public card is sufficient original-publisher evidence.
             item = NewsItem(title=title, original_title=title, url=url,
@@ -2070,8 +2545,13 @@ async def _fetch_official_index(session, profile, index_url, semaphore, max_link
         else:
             if urlparse(url).path.lower().endswith((".pdf", ".xls", ".xlsx", ".zip")):
                 return
-            item = await _fetch_official_article(session, profile, url, title, article_semaphore or semaphore, hint)
+            item = await _fetch_official_article(
+                session, profile, url, title, article_semaphore or semaphore,
+                hint, failure_sink=failure_sink,
+            )
         if item is not None:
+            if len(items) >= OFFICIAL_MAX_ITEMS_PER_INDEX:
+                return
             items.append(item)
             # Publish each completed article immediately, before sibling tasks finish.
             if result_sink is not None:
@@ -2094,7 +2574,7 @@ async def _fetch_official_index(session, profile, index_url, semaphore, max_link
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        log.info("Official source completed source=%s accepted=%d", profile.get("source_id", ""), len(items))
+        log.debug("Official source completed source=%s accepted=%d", profile.get("source_id", ""), len(items))
     return items
 
 
@@ -2103,16 +2583,55 @@ def official_source_coverage():
             for member in sorted(G20_MEMBERS)}
 
 
-def _official_collection_profiles(country_id=None):
+_OFFICIAL_INSTITUTION_PRIORITY = {
+    "government": 0,
+    "foreign_affairs": 1,
+    "defence": 2,
+    "finance": 3,
+    "economy": 3,
+    "central_bank": 4,
+    "council": 5,
+    "commission": 5,
+    "peace_security": 5,
+    "official_agency": 6,
+}
+
+
+def _official_collection_profiles(country_id=None, per_member=None, round_index=0,
+                                  include_extensions=False):
+    """Return a fair institution rotation without giving any G20 member priority."""
     by_member = {}
     for profile in OFFICIAL_SOURCE_REGISTRY.values():
         member = profile["member_id"]
+        if country_id is None and not include_extensions and member not in G20_MEMBERS:
+            continue
         if country_id is None or member == country_id:
             by_member.setdefault(member, []).append(profile)
+    for profiles in by_member.values():
+        profiles.sort(key=lambda profile: (
+            _OFFICIAL_INSTITUTION_PRIORITY.get(profile["institution"], 99),
+            profile["source_id"],
+        ))
+
     members = sorted(by_member)
     if members:
         offset = int(time.time() // ROTATION_WINDOW_SECONDS) % len(members)
         members = members[offset:] + members[:offset]
+
+    if per_member is not None:
+        selected = {}
+        cap = max(1, int(per_member))
+        for member, profiles in by_member.items():
+            if len(profiles) <= cap:
+                selected[member] = profiles
+                continue
+            start = (max(0, int(round_index)) * cap) % len(profiles)
+            selected[member] = [
+                profiles[(start + index) % len(profiles)]
+                for index in range(cap)
+            ]
+        by_member = selected
+
     # One source per member per round, rather than exhausting one member first.
     return [by_member[m][i] for i in range(max((len(v) for v in by_member.values()), default=0))
             for m in members if i < len(by_member[m])]
@@ -2125,6 +2644,7 @@ async def _collect_official_profiles(profiles, budget, max_links):
     semaphore = asyncio.Semaphore(OFFICIAL_INDEX_CONCURRENCY)
     article_semaphore = asyncio.Semaphore(8)
     tasks = []
+    failures = []
     pending_count = 0
     async with aiohttp.ClientSession(connector=connector) as session:
         try:
@@ -2132,7 +2652,9 @@ async def _collect_official_profiles(profiles, budget, max_links):
                 for template in profile["index_urls"]:
                     tasks.append(asyncio.create_task(_fetch_official_index(
                         session, profile, _official_index_url(template), semaphore,
-                        max_links=max_links, result_sink=results, article_semaphore=article_semaphore)))
+                        max_links=max_links, result_sink=results,
+                        article_semaphore=article_semaphore,
+                        failure_sink=failures)))
             if tasks:
                 _, pending = await asyncio.wait(tasks, timeout=budget)
                 pending_count = len(pending)
@@ -2147,17 +2669,237 @@ async def _collect_official_profiles(profiles, budget, max_links):
         if _is_current_news(item):
             unique.setdefault(item.url.split("#", 1)[0], item)
     result = sorted(unique.values(), key=lambda item: item.published, reverse=True)
-    log.info("Official collection sources=%d completed=%d timed_out=%d accepted=%d elapsed=%.2fs",
-             len(tasks), len(tasks) - pending_count, pending_count, len(result), time.monotonic() - started)
+    active_source_ids = {
+        item.official_source_id for item in result
+        if getattr(item, "official_source_id", "")
+    }
+    active_members = {
+        OFFICIAL_SOURCE_REGISTRY[source_id]["member_id"]
+        for source_id in active_source_ids
+        if source_id in OFFICIAL_SOURCE_REGISTRY
+    }
+    if failures:
+        failure_types = Counter(
+            f"{phase}:{error_name}"
+            for _, phase, error_name in failures
+        )
+        failed_sources = sorted({source_id for source_id, _, _ in failures})
+        type_summary = ",".join(
+            f"{name}={count}"
+            for name, count in sorted(failure_types.items())
+        )
+        log.warning(
+            "Official collection partial failures=%d sources=%d types=%s sample=%s",
+            len(failures), len(failed_sources), type_summary,
+            ",".join(failed_sources[:8]),
+        )
+    log.info(
+        "Official collection sources=%d completed=%d timed_out=%d accepted=%d "
+        "active_sources=%d active_members=%d elapsed=%.2fs",
+        len(tasks), len(tasks) - pending_count, pending_count, len(result),
+        len(active_source_ids), len(active_members), time.monotonic() - started,
+    )
+    return result
+
+
+_OFFICIAL_DISCOVERY_PHASES = (
+    {"government", "council", "commission"},
+    {"defence", "peace_security"},
+    {"finance", "economy"},
+    {"central_bank"},
+    {"official_agency"},
+)
+
+
+def _official_discovery_profiles_for_round(round_index):
+    """Alternate foreign ministries with the other institution layers."""
+    if int(round_index) % 2 == 0:
+        institutions = {"foreign_affairs"}
+    else:
+        phase = (int(round_index) // 2) % len(_OFFICIAL_DISCOVERY_PHASES)
+        institutions = _OFFICIAL_DISCOVERY_PHASES[phase]
+    # A host shared by multiple registry institutions cannot prove which one
+    # published a Google News result (gov.uk and gov.br are common examples).
+    # Those profiles remain covered by their direct public index collectors,
+    # while discovery is limited to unambiguous publisher hosts.
+    domain_counts = {
+        domain: sum(
+            domain in candidate.get("domains", ())
+            for candidate in OFFICIAL_SOURCE_REGISTRY.values()
+        )
+        for profile in OFFICIAL_SOURCE_REGISTRY.values()
+        for domain in profile.get("domains", ())
+    }
+    return sorted(
+        (profile for profile in OFFICIAL_SOURCE_REGISTRY.values()
+         if profile["institution"] in institutions
+         and profile.get("domains")
+         and all(domain_counts.get(domain, 0) == 1 for domain in profile["domains"])),
+        key=lambda profile: (profile["member_id"], profile["source_id"]),
+    )
+
+
+async def _collect_official_public_discovery(profiles):
+    """Use the public news index only as fallback discovery for official domains."""
+    if not profiles:
+        return []
+
+    started = time.monotonic()
+    results = []
+    connector = aiohttp.TCPConnector(
+        limit=OFFICIAL_DISCOVERY_CONCURRENCY,
+        limit_per_host=OFFICIAL_DISCOVERY_CONCURRENCY,
+        ttl_dns_cache=60,
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = {}
+        for profile in profiles:
+            domain = profile["domains"][0]
+            query = f"site:{domain} when:{CURRENT_NEWS_LOOKBACK_DAYS + 1}d"
+            task = asyncio.create_task(
+                fetch_feed(session, f"رصد رسمي: {profile['source_id']}", google_news_url(query))
+            )
+            tasks[task] = profile
+
+        done, pending = await asyncio.wait(tasks, timeout=OFFICIAL_DISCOVERY_BUDGET)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        for task in done:
+            profile = tasks[task]
+            try:
+                group = task.result()
+            except Exception:
+                continue
+            accepted = 0
+            for item in group:
+                if accepted >= OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE:
+                    break
+                if (_looks_mojibake(item.title) or _looks_mojibake(item.source)
+                        or not _is_current_news(item)
+                        or not _domain_matches(item.domain, profile["domains"])
+                        or _is_digest(item.title)
+                        or _is_non_article_result(item)
+                        or _hard_low_value(item)):
+                    continue
+                item.official = True
+                item.trust_score = max(float(item.trust_score or 0), 99.0)
+                item.source = profile["publisher_name"]
+                item.official_source_id = profile["source_id"]
+                item.publication_evidence = "public_news_index_date"
+                item = classify_item(item)
+                if _direct_official_statement(item):
+                    results.append(item)
+                    accepted += 1
+
+    unique = {}
+    for item in results:
+        unique.setdefault(item.url.split("#", 1)[0], item)
+    result = sorted(unique.values(), key=lambda item: item.published, reverse=True)
+    log.info(
+        "Official public discovery profiles=%d completed=%d timed_out=%d accepted=%d elapsed=%.2fs",
+        len(tasks), len(done), len(pending), len(result), time.monotonic() - started,
+    )
     return result
 
 
 async def collect_official_publisher_news():
-    profiles = _official_collection_profiles()
+    global _OFFICIAL_PROFILE_ROUND
+
+    round_index = _OFFICIAL_PROFILE_ROUND
+    _OFFICIAL_PROFILE_ROUND += 1
+    profiles = _official_collection_profiles(
+        per_member=OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE,
+        round_index=round_index,
+        include_extensions=True,
+    )
     coverage = official_source_coverage()
-    log.info("Official registry g20_covered=%d g20_total=%d sources=%d",
-             sum(bool(n) for n in coverage.values()), len(coverage), len(profiles))
-    return await _collect_official_profiles(profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS)
+    log.info(
+        "Official registry g20_covered=%d g20_total=%d sources=%d polled=%d round=%d",
+        sum(bool(n) for n in coverage.values()), len(coverage),
+        len(OFFICIAL_SOURCE_REGISTRY), len(profiles), round_index,
+    )
+    direct_task = asyncio.create_task(_collect_official_profiles(
+        profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS
+    ))
+    discovery_profiles = _official_discovery_profiles_for_round(round_index)
+    discovery_task = asyncio.create_task(
+        _collect_official_public_discovery(discovery_profiles)
+    )
+    # Direct publisher pages are authoritative and must survive a slow public
+    # search fallback. Previously gather() let the discovery task hold the
+    # completed direct collection until collect_news cancelled both at 20s.
+    direct = await direct_task
+    discovered = []
+    done, _ = await asyncio.wait({discovery_task}, timeout=0.5)
+    if discovery_task in done:
+        try:
+            discovered = discovery_task.result()
+        except Exception:
+            log.exception("Official public discovery failed")
+    else:
+        discovery_task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(discovery_task, return_exceptions=True), timeout=0.5
+            )
+        except asyncio.TimeoutError:
+            log.warning("Official public discovery cancellation exceeded grace period")
+    fresh = direct + discovered
+
+    # Preserve verified results from earlier institution rotations. This gives
+    # the UI broad ministry coverage without launching the full registry at once.
+    fresh_by_source = {}
+    for item in fresh:
+        source_id = getattr(item, "official_source_id", "")
+        if source_id:
+            fresh_by_source.setdefault(source_id, []).append(item)
+    for source_id, new_items in fresh_by_source.items():
+        combined = list(new_items) + list(_OFFICIAL_RESULT_CACHE.get(source_id, ()))
+        by_url = {}
+        for item in combined:
+            if (not _is_current_news(item)
+                    or _is_digest(item.title)
+                    or _is_non_article_result(item)
+                    or _hard_low_value(item)):
+                continue
+            key = item.url.split("#", 1)[0]
+            if key and key not in by_url:
+                by_url[key] = item
+        _OFFICIAL_RESULT_CACHE[source_id] = sorted(
+            by_url.values(), key=lambda item: item.published, reverse=True
+        )[:OFFICIAL_CACHE_ITEMS_PER_SOURCE]
+
+    merged = {}
+    for source_id, cached_items in list(_OFFICIAL_RESULT_CACHE.items()):
+        current = [
+            item for item in cached_items
+            if (_is_current_news(item)
+                and not _is_digest(item.title)
+                and not _is_non_article_result(item)
+                and not _hard_low_value(item))
+        ]
+        if current:
+            _OFFICIAL_RESULT_CACHE[source_id] = current
+            for item in current:
+                merged.setdefault(item.url.split("#", 1)[0], item)
+        else:
+            _OFFICIAL_RESULT_CACHE.pop(source_id, None)
+    for item in fresh:
+        if (_is_current_news(item)
+                and not _is_digest(item.title)
+                and not _is_non_article_result(item)
+                and not _hard_low_value(item)):
+            merged.setdefault(item.url.split("#", 1)[0], item)
+
+    result = sorted(merged.values(), key=lambda item: item.published, reverse=True)
+    log.info(
+        "Official rolling cache sources=%d accepted=%d",
+        len(_OFFICIAL_RESULT_CACHE), len(result),
+    )
+    return result
 
 
 async def collect_official_institution_news(country_id):
@@ -2558,6 +3300,9 @@ def _jsonld_date_published(value):
                 dt = parse_date(child)
                 if dt is not None:
                     return dt
+                dates = _official_calendar_dates(child)
+                if len(dates) == 1:
+                    return next(iter(dates))
         for child in value.values():
             dt = _jsonld_date_published(child)
             if dt is not None:
@@ -2595,9 +3340,13 @@ def _extract_publication_date_from_html(text):
     )
     for pattern in meta_patterns:
         for value in re.findall(pattern, text, flags=re.I):
-            dt = parse_date(html.unescape(value).strip())
+            value = html.unescape(value).strip()
+            dt = parse_date(value)
             if dt is not None:
                 return dt
+            dates = _official_calendar_dates(value)
+            if len(dates) == 1:
+                return next(iter(dates))
 
     # HTML5 time element, but only when it is explicitly publication-oriented
     # or when there is no modified marker in the element itself.
@@ -2606,9 +3355,13 @@ def _extract_publication_date_from_html(text):
             continue
         match = re.search(r'datetime=["\']([^"\']+)', tag, flags=re.I)
         if match:
-            dt = parse_date(html.unescape(match.group(1)).strip())
+            value = html.unescape(match.group(1)).strip()
+            dt = parse_date(value)
             if dt is not None:
                 return dt
+            dates = _official_calendar_dates(value)
+            if len(dates) == 1:
+                return next(iter(dates))
     return None
 
 
@@ -2699,7 +3452,7 @@ def parse_entry(entry, source, category="general"):
     title = html.unescape(str(entry.get("title", "") or "").strip())
     url = str(entry.get("link", "") or "").strip()
 
-    if not title or not url:
+    if not title or not url or _looks_mojibake(title):
         return None
 
     summary = html.unescape(
@@ -2708,6 +3461,8 @@ def parse_entry(entry, source, category="general"):
     published = _entry_date(entry)
 
     publisher = _entry_publisher(entry, source)
+    if _looks_mojibake(publisher):
+        return None
     publisher_domain = _entry_source_domain(entry)
 
     item = NewsItem(
@@ -2791,11 +3546,10 @@ async def fetch_feed(session, source, url):
         # even the Home button appear frozen for ~20 seconds.  A tiny dedicated
         # pool isolates parser CPU from Telegram's event loop.
         async with asyncio.timeout(FEED_PARSE_TIMEOUT):
-            async with _FEED_PARSE_SEMAPHORE:
-                loop = asyncio.get_running_loop()
-                parsed = await loop.run_in_executor(
-                    _FEED_PARSE_EXECUTOR, feedparser.parse, data
-                )
+            loop = asyncio.get_running_loop()
+            parsed = await loop.run_in_executor(
+                _FEED_PARSE_EXECUTOR, feedparser.parse, data
+            )
         items = []
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)
@@ -3451,13 +4205,62 @@ async def _collect_general_news(max_items=150):
 
     return items
 
+
+def _balanced_official_order(items):
+    """Prefer exact publication time and spread each country across the pages.
+
+    This is a reorder only: no verified publication is deleted. Every member
+    competes under the same rule. A country is not repeated within the previous
+    five positions while another country is available.
+    """
+    remaining = list(items)
+    ordered = []
+    institution_counts = Counter()
+    source_counts = Counter()
+
+    def identity(item):
+        source_id = getattr(item, "official_source_id", "")
+        profile = OFFICIAL_SOURCE_REGISTRY.get(source_id, {})
+        member = profile.get("member_id") or (item.domain or item.source or "unknown")
+        institution = profile.get("institution") or "official"
+        return member, institution, source_id or item.domain or item.source or "unknown"
+
+    while remaining:
+        recent_members = {
+            identity(item)[0] for item in ordered[-4:]
+        }
+        eligible = [
+            item for item in remaining
+            if identity(item)[0] not in recent_members
+        ] or remaining
+
+        def score(item):
+            member, institution, source = identity(item)
+            return (
+                item.published.timestamp(),
+                _official_importance(item),
+                -source_counts[source],
+                -institution_counts[institution],
+            )
+
+        selected = max(eligible, key=score)
+        remaining.remove(selected)
+        member, institution, source = identity(selected)
+        institution_counts[institution] += 1
+        source_counts[source] += 1
+        ordered.append(selected)
+    return ordered
+
 async def collect_news(max_items=150):
     """Independent collectors share a deadline below the worker's 25s timeout."""
     tasks = [asyncio.create_task(_collect_general_news(max_items), name="general-news"),
              asyncio.create_task(collect_official_publisher_news(), name="official-news")]
     items = []
     try:
-        done, _ = await asyncio.wait(tasks, timeout=20.0)
+        # The caller runs this collector in the Hot Cache worker with a 40s
+        # ceiling. Allow slow official/general lanes to finish while leaving
+        # headroom for translation, topic preparation and atomic cache swap.
+        done, _ = await asyncio.wait(tasks, timeout=32.0)
         for task in tasks:
             if task in done:
                 try:
@@ -3469,17 +4272,31 @@ async def collect_news(max_items=150):
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-    official = [item for item in items if _direct_official_statement(item)]
+    # Event-level deduplication prevents the same publication/event returning
+    # through both its direct official index and public discovery URL.
+    official = deduplicate_news(
+        [item for item in items if _direct_official_statement(item)]
+    )
     if official:
         try:
             await translate_news_titles(official, budget=2.0)
         except asyncio.TimeoutError:
             log.info("Official translation budget reached; original titles retained")
+    ordered = _balanced_official_order(official)
+    # Balance independently *after* exclusive routing. Balancing the combined
+    # official stream first allowed Economy/Security items between two UK
+    # diplomatic releases to disappear from the Official view, leaving those
+    # UK releases adjacent again.
+    official_by_topic = {}
     for item in official:
-        # Neutral date priority for the existing bot's score-based topic filter.
-        age = (datetime.now(timezone.utc).date() - item.published.date()).days
-        item.relevance_score = (4 - age) * 1000 + _official_importance(item)
-    ordered = sorted(official, key=lambda x: (x.published.date(), _official_importance(x), x.published), reverse=True)
+        topic = _exclusive_topic_key(item)
+        if topic:
+            official_by_topic.setdefault(topic, []).append(item)
+    for topic_items in official_by_topic.values():
+        for position, item in enumerate(_balanced_official_order(topic_items)):
+            # topic_filter adds its own keyword score. A wide positional
+            # interval preserves each section's balanced order.
+            item.relevance_score = 100_000 - position * 100
     remaining = [item for item in items if not getattr(item, "official_source_id", "")]
     # Keep registry provenance when a general feed also carries the same URL.
     seen, result = set(), []

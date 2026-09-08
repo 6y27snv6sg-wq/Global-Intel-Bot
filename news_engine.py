@@ -49,11 +49,6 @@ OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 6
 OFFICIAL_INTERACTIVE_BUDGET = 5.5
 OFFICIAL_COLLECTION_BUDGET = 12.0
 OFFICIAL_MAX_PAGE_BYTES = 900_000
-OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE = 3
-OFFICIAL_CACHE_ITEMS_PER_SOURCE = 20
-OFFICIAL_DISCOVERY_BUDGET = 4.0
-OFFICIAL_DISCOVERY_CONCURRENCY = 10
-OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE = 8
 
 # Fast breaking-news lane: direct publisher feeds only.  This path is designed
 # for frequent lightweight polling and deliberately excludes Google discovery,
@@ -61,8 +56,6 @@ OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE = 8
 BREAKING_FEED_CONCURRENCY = 12
 
 _FEED_FAILURE_STATE = {}
-_OFFICIAL_PROFILE_ROUND = 0
-_OFFICIAL_RESULT_CACHE = {}
 # feedparser is pure-Python and can monopolize the GIL when many feeds parse at once.
 # Keep RSS parsing on a small dedicated pool so background collectors cannot starve
 # Telegram callbacks or the main asyncio loop.
@@ -70,6 +63,7 @@ _FEED_PARSE_EXECUTOR = ThreadPoolExecutor(
     max_workers=FEED_PARSE_WORKERS,
     thread_name_prefix="feed-parser",
 )
+_FEED_PARSE_SEMAPHORE = asyncio.Semaphore(FEED_PARSE_WORKERS)
 BREAKING_TRANSLATION_BUDGET = 1.2
 BREAKING_MAX_PER_FEED = 12
 
@@ -151,11 +145,7 @@ ECON_TERMS = [
     "economic","markets","market","stocks","equities","stock exchange",
     "inflation","interest rates","gold","dollar","usd","bitcoin","crypto",
     "investment","bonds","budget","gdp","central bank","exports","imports",
-    "earnings","acquisition", "reserve bank", "monetary policy",
-    "liquidity adjustment facility", "liquidity facility", "reverse repo",
-    "repo rate", "open market operation",
-    "بنك احتياطي", "سياسة نقدية", "تسهيلات السيولة", "إعادة الشراء",
-    "عمليات السوق المفتوحة",
+    "earnings","acquisition",
 ]
 
 ECON_EXCLUDE = [
@@ -163,11 +153,6 @@ ECON_EXCLUDE = [
     "انتشال","إنقاذ عمال","منجم","نفق","فيضانات","طقس",
     "rescue","earthquake","death","funeral","accident","drowning","flood",
     "weather",
-    # A passing economic reference in the summary must not move a primarily
-    # humanitarian, rights or conflict story onto the Economy desk.
-    "حقوق الانسان", "حقوق الإنسان", "انساني", "إنساني", "لاجئين",
-    "الحرب", "نزاع", "ضحايا", "human rights", "humanitarian",
-    "refugees", "war in", "war on", "war against", "conflict", "victims",
 ]
 
 SECURITY_TERMS = [
@@ -178,8 +163,7 @@ SECURITY_TERMS = [
     "military","army","forces","defense","defence","security","weapons","weapon",
     "missile","missiles","airstrike","airstrike","strike","attack","fighting",
     "battle","battles","combat","drone","drones","ammunition","air defense",
-    "military operation","troops","navy","warship", "حرب",
-    "war in", "war on", "war against", "conflict",
+    "military operation","troops","navy","warship",
 ]
 
 SECURITY_SOCIAL_EXCLUDE = [
@@ -222,22 +206,6 @@ LOW_VALUE_HARD_TERMS = [
     "مشاهدة مباشرة", "مشاهدة البث المباشر", "مشاهدة مباراة",
     "شاهد المباراة", "رابط المباراة", "روابط المباراة", "live stream",
     "watch live", "streaming link", "live score", "نتيجة مباشرة",
-    # Compromised government subdomains and SEO spam must never inherit the
-    # trust of their parent public-sector suffix.
-    "sexy", "xxx", "porn", "فيديو مسرب", "مسرب فيديو",
-    "تسريب مقاطع", "الفيديو الكامل", "رابط الفيديو الأصلي",
-    "دراما قصيرة", "علاقة عاطفية", "شاهد على الهاتف المحمول",
-    "free short drama", "watch on mobile",
-    # Embassy services, commercial listings and ceremonial award publicity are
-    # official-site content but not intelligence-grade official statements.
-    "مزاد السفارة", "مزاد الكتروني", "مزاد إلكتروني",
-    "embassy auction", "online auction",
-    "جوائز تجربة العملاء", "جائزة تجربة العملاء",
-    "customer experience award", "customer experience awards",
-    # Legacy archive pages can be newly indexed today even though the release
-    # itself is historical.  These retired institution names are conclusive
-    # evidence that the page is not a current Saudi Central Bank statement.
-    "مؤسسة النقد العربي السعودي", "saudi arabian monetary agency",
 ]
 
 SPORT_TERMS = [
@@ -313,20 +281,6 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s\u0600-\u06FF-]", " ", text)).strip()
 
 
-def _looks_mojibake(value):
-    """Detect broken UTF-8/Windows-codepage text before it reaches Telegram."""
-    text = str(value or "")
-    if not text:
-        return False
-    if re.search(r"[\x80-\x9f]", text):
-        return True
-    severe = ("ï¿½", "â€", "Ãƒ", "Ø§Ù", "Ù„Ø", "Ů„", "Ř§", "Ř±")
-    if any(marker in text for marker in severe):
-        return True
-    markers = ("Ã", "Â", "Ø", "Ù", "Ů", "Ř")
-    return sum(text.count(marker) for marker in markers) >= 3
-
-
 # Arabic display/normalization layer.
 # This uses the public Google Translate endpoint only for title translation.
 # Gemini is deliberately NOT used here.
@@ -346,18 +300,6 @@ def _needs_arabic_translation(title: str) -> bool:
     return latin >= 3 and latin > arabic
 
 
-def _translation_input(title: str) -> str:
-    """Remove redundant parenthesized acronyms before machine translation.
-
-    Publisher headlines commonly spell out a term and then append an acronym,
-    e.g. ``Liquidity Adjustment Facility (LAF)``. Translators may reinterpret
-    that acronym as an unrelated organization. The full phrase is retained, so
-    stripping only the parenthesized acronym loses no headline meaning.
-    """
-    text = str(title or "").strip()
-    return re.sub(r"(?<=\w)\s*\([A-Z][A-Z0-9&.-]{1,9}\)", "", text).strip()
-
-
 async def translate_title_to_arabic(session, title: str) -> str:
     title = (title or "").strip()
     if not _needs_arabic_translation(title):
@@ -373,7 +315,7 @@ async def translate_title_to_arabic(session, title: str) -> str:
         "sl": "auto",
         "tl": "ar",
         "dt": "t",
-        "q": _translation_input(title),
+        "q": title,
     }
 
     for attempt in range(1):
@@ -781,13 +723,8 @@ def detect_region(text):
     return ""
 
 def _domain_matches(domain, candidates):
-    # Registry domains are exact publisher hosts.  Treating every subdomain of
-    # a broad government host (for example *.gov.br) as the same publisher lets
-    # unrelated or compromised municipal sites impersonate a ministry.
     d = (domain or "").lower().split(":")[0].split("/")[0].strip(".")
-    d = d.removeprefix("www.")
-    return any(d == str(candidate or "").lower().strip(".").removeprefix("www.")
-               for candidate in candidates)
+    return any(d == candidate or d.endswith("." + candidate) for candidate in candidates)
 
 def is_official_source(source, domain):
     # Official status is determined from the publisher domain, not from words
@@ -824,22 +761,12 @@ def _is_digest(title):
     n = normalize_text(title)
     return any(normalize_text(term) in n for term in DIGEST_TERMS)
 
-def _security_term_score(value):
-    """Count security meaning without matching أمن inside words like الثامن."""
-    n = normalize_text(value)
-    ambiguous = normalize_text("أمن")
-    score = score_terms(n, [term for term in SECURITY_TERMS
-                            if normalize_text(term) != ambiguous])
-    score += len(re.findall(r"(?<!\w)(?:امن|الامن)(?!\w)", n))
-    return score
-
-
 def _security_signal(title, summary=""):
     t = normalize_text(title)
     s = normalize_text(summary)
     if any(normalize_text(x) in t for x in SECURITY_SOCIAL_EXCLUDE):
         return False
-    return _security_term_score(t) >= 1 or _security_term_score(s) >= 2
+    return score_terms(t, SECURITY_TERMS) >= 1 or score_terms(s, SECURITY_TERMS) >= 2
 
 def _economy_signal(title, summary=""):
     t = normalize_text(title)
@@ -967,175 +894,91 @@ def _direct_official_statement(item):
                 and _official_signal(item.original_title or item.title, item.summary, item))
 
 
-URGENT_SECTION_TERMS = [
-    "عاجل", "خبر عاجل", "تحذير عاجل", "حالة طوارئ", "إخلاء فوري",
-    "breaking", "breaking news", "urgent", "state of emergency",
-    "emergency declared", "immediate evacuation",
-    "زلزال", "earthquake", "تسونامي", "tsunami",
-]
-
-URGENT_RETROSPECTIVE_TERMS = [
-    "ذكرى", "الذكري", "anniversary", "years since", "year since",
-    "اعاده الاعمار", "إعادة الإعمار", "reconstruction progress",
-]
-
-URGENT_METAPHOR_PATTERNS = [
-    r"زلزال\s+(?:الاقتراع|انتخابي|سياسي|الانتخابات)",
-    r"(?:electoral|political)\s+earthquake",
-]
-
-URGENT_LIVE_EVENT_TERMS = [
-    "قتل", "قتيل", "قتلى", "مصاب", "اصابه", "إصابة", "ضحايا",
-    "غاره", "غارة", "غارات", "قصف", "هجوم", "انفجار", "اخلاء", "إخلاء",
-    "يضرب", "ضرب", "وقع", "هزه", "هزة", "بقوه", "بقوة", "تحذير",
-    "killed", "dead", "injured", "casualties", "airstrike", "attack",
-    "explosion", "evacuation", "hits", "strikes", "magnitude", "warning",
-]
-
-
-def _urgent_section_signal(title, summary=""):
-    """Admit live emergencies, not anniversaries, analysis or metaphors."""
-    t = normalize_text(title)
-    s = normalize_text(summary)
-    combined = f"{t} {s}"
-
-    if score_terms(combined, URGENT_RETROSPECTIVE_TERMS):
-        return False
-    if any(re.search(pattern, t, re.I) for pattern in URGENT_METAPHOR_PATTERNS):
-        return False
-
-    emergency = score_terms(t, (
-        "حاله طوارئ", "حالة طوارئ", "اخلاء فوري", "إخلاء فوري",
-        "state of emergency", "emergency declared", "immediate evacuation",
-        "تسونامي", "tsunami",
-    )) >= 1
-    if emergency:
-        return True
-
-    explicit = score_terms(t, ("عاجل", "خبر عاجل", "breaking", "breaking news", "urgent")) >= 1
-    live_title = score_terms(t, URGENT_LIVE_EVENT_TERMS)
-    if explicit and live_title >= 1:
-        return True
-
-    disaster = score_terms(t, ("زلزال", "earthquake")) >= 1
-    if disaster and live_title >= 1:
-        return True
-
-    # A summary can never manufacture urgency by repeating generic disaster
-    # words beneath an analytical headline.
-    return False
-
-ROUTINE_INSTITUTIONAL_PATTERNS = [
-    # Internal staffing, fellowships and ceremonial publicity. Central-bank
-    # market operations are not noise: they belong exclusively to Economy.
-    r"\bappoints? (?:a )?new (?:chief financial officer|finance director)\b",
-    r"\bnational armaments director appoints\b",
-    r"\bfellowship (?:programme|program)\b",
-    r"\byouth fellowship\b",
-    r"\b(?:to celebrate|commemorates?|marks?) (?:the )?.{0,35}\banniversary\b",
-    r"\bيعين مديرا ماليا جديدا\b",
-    r"\bبرنامج زماله الشباب\b",
-    r"\b(?:للاحتفال|يحتفل|سيحتفل|يحيي) .{0,35}\بالذكري\b",
-]
-
-SUBSTANTIVE_POLICY_TERMS = [
-    "strategy", "policy", "decision", "interest rate", "rate decision",
-    "sanctions", "agreement", "treaty", "ceasefire", "legislation",
-    "budget", "security", "defence", "defense", "military", "emergency",
-    "استراتيجية", "سياسة", "قرار", "سعر الفائدة", "عقوبات", "اتفاق",
-    "معاهدة", "وقف إطلاق النار", "تشريع", "ميزانية", "أمن", "دفاع",
-    "عسكري", "طوارئ",
-]
-
-
-def _classification_text(item):
-    """Use trustworthy pre-translation text for every section decision."""
-    original = str(getattr(item, "original_title", "") or "").strip()
-    title = original or str(getattr(item, "title", "") or "").strip()
-    summary = str(getattr(item, "summary", "") or "").strip()
-    return title, summary
-
-
-def _routine_institutional_noise(item, title, summary):
-    """Reject routine publisher notices while retaining substantive policy."""
-    text = normalize_text(f"{title} {summary}")
-    if not any(re.search(pattern, text, re.I) for pattern in ROUTINE_INSTITUTIONAL_PATTERNS):
-        return False
-    return score_terms(text, SUBSTANTIVE_POLICY_TERMS) == 0
-
-
-def _exclusive_topic_key(item):
-    """Assign exactly one specialist section, or None for general noise."""
-    title, summary = _classification_text(item)
-    if not title or _is_digest(title) or _hard_low_value(item):
-        return None
-    if _routine_institutional_noise(item, title, summary):
-        return None
-
-    normalized_title = normalize_text(title)
-    normalized_summary = normalize_text(summary)
-
-    # Keep urgent deliberately narrow. Ordinary attack/missile coverage stays
-    # on the security desk unless it explicitly signals a live emergency.
-    if _urgent_section_signal(title, summary):
-        return "urg"
-
-    security = _security_signal(title, summary)
-    economy = _economy_signal(title, summary)
-    if security and economy:
-        security_score = (
-            _security_term_score(normalized_title) * 3
-            + _security_term_score(normalized_summary)
-        )
-        economy_score = (
-            score_terms(normalized_title, ECON_TERMS) * 3
-            + score_terms(normalized_summary, ECON_TERMS)
-        )
-        if score_terms(normalized_title, SECURITY_SOCIAL_EXCLUDE):
-            security_score -= 12
-        if score_terms(f"{normalized_title} {normalized_summary}", ECON_EXCLUDE):
-            economy_score -= 5
-        return "secu" if security_score >= economy_score else "econ"
-    if security:
-        return "secu"
-    if economy:
-        return "econ"
-
-    # Official is a provenance desk for releases that do not belong to a more
-    # specific specialist desk. Thus defence releases go only to Security and
-    # central-bank releases go only to Economy, while diplomatic/government
-    # statements remain here.
-    if _direct_official_statement(item):
-        return "forg"
-
-    # Regional/world desks are fallbacks after the specialist desks.
-    # Recompute geography from the same original evidence. ``item.region`` may
-    # have been inferred from a later display translation and is not evidence.
-    region = detect_region(f"{title} {summary}")
-    if region == "الشرق الأوسط":
-        return "gulf"
-    if region:
-        return "wrld"
-
-    world_markers = [
-        "الأمم المتحدة", "الاتحاد الأوروبي", "الاتحاد الأفريقي", "الناتو",
-        "united nations", "european union", "african union", "nato",
-        "دولي", "عالمي", "international", "global",
-    ]
-    if score_terms(f"{normalized_title} {normalized_summary}", world_markers):
-        return "wrld"
-    return None
-
-
 def classify_item(item):
-    item.category = _exclusive_topic_key(item) or "general"
+    title = normalize_text(item.title)
+    summary = normalize_text(item.summary)
+    text = f"{title} {summary}"
+
+    if _is_digest(item.title):
+        item.category = "general"
+        return item
+
+    econ = (score_terms(title, ECON_TERMS) * 3
+            + score_terms(summary, ECON_TERMS))
+    if score_terms(text, ECON_EXCLUDE):
+        econ -= 5
+
+    sec = (score_terms(title, SECURITY_TERMS) * 3
+           + score_terms(summary, SECURITY_TERMS))
+    if score_terms(title, SECURITY_SOCIAL_EXCLUDE):
+        sec -= 12
+
+    official = (score_terms(title, OFFICIAL_TERMS) * 3
+                + score_terms(summary, OFFICIAL_TERMS))
+    if item.official:
+        official += 2
+
+    urgent = (score_terms(title, URGENT_TERMS) * 2
+              + score_terms(summary, URGENT_TERMS))
+
+    # Explicit category assignment. Security/social and official stories
+    # must not be promoted to economy merely because they mention oil/energy.
+    if _security_signal(title, summary) and sec >= max(econ, official, 4):
+        item.category = "secu"
+    elif _official_signal(title, summary, item) and official >= max(econ, sec, 4):
+        item.category = "forg"
+    elif _economy_signal(title, summary) and econ >= max(sec, official, 4):
+        item.category = "econ"
+    elif urgent >= 4:
+        item.category = "urg"
+    else:
+        item.category = "general"
+
     return item
 
-
 def is_topic_match(item, topic_key):
-    if topic_key not in {"econ", "forg", "urg", "gulf", "wrld", "secu"}:
+    title = item.title or ""
+    summary = item.summary or ""
+
+    # This is intentionally the first gate for every section.
+    # Generic digest articles can never enter any section.
+    if _is_digest(title):
         return False
-    return _exclusive_topic_key(item) == topic_key
+
+    if topic_key == "econ":
+        # Section classification uses title/summary only.
+        # It NEVER uses source/search_text.
+        return _economy_signal(title, summary) and not (
+            _security_signal(title, summary)
+            and score_terms(normalize_text(title), SECURITY_TERMS) >= 1
+            and score_terms(normalize_text(title), ECON_TERMS) <= 1
+        )
+
+    if topic_key == "secu":
+        return _security_signal(title, summary)
+
+    if topic_key == "forg":
+        return _direct_official_statement(item)
+
+    if topic_key == "urg":
+        return (
+            score_terms(title, URGENT_TERMS) >= 1
+            or score_terms(summary, URGENT_TERMS) >= 2
+        )
+
+    if topic_key == "gulf":
+        text = normalize_text(f"{title} {summary}")
+        gulf = REGIONS["الشرق الأوسط"]
+        return any(normalize_text(x) in text for x in gulf)
+
+    if topic_key == "wrld":
+        text = normalize_text(f"{title} {summary}")
+        return bool(item.region) or any(
+            normalize_text(x) in text
+            for x in ["امريكا","الولايات المتحده","اوروبا","الصين","روسيا","اوكرانيا","الهند","اليابان"]
+        )
+
+    return False
 
 def deduplicate_news(items):
     """Global event-level deduplication with source preservation.
@@ -1286,17 +1129,8 @@ def _query_intent(query):
 
 
 def _hard_low_value(item):
-    if _looks_mojibake(item.title) or _looks_mojibake(item.original_title) or _looks_mojibake(item.source):
-        return True
-    raw = f"{item.title} {item.original_title} {item.summary}"
-    if "🔞" in raw:
-        return True
     text = normalize_text(f"{item.title} {item.original_title}")
-    return any(
-        normalized and normalized in text
-        for term in LOW_VALUE_HARD_TERMS
-        for normalized in (normalize_text(term),)
-    )
+    return any(normalize_text(term) in text for term in LOW_VALUE_HARD_TERMS)
 
 
 def _content_value_adjustment(item, query):
@@ -1372,7 +1206,6 @@ def _semantic_event_match(a, b):
 
 def _is_non_article_result(item):
     """Reject homepages, section pages and generic portal entries."""
-    raw_title = html.unescape(str(item.title or "")).strip()
     title = normalize_text(item.title)
     original = normalize_text(item.original_title)
     combined = f"{title} {original}"
@@ -1385,22 +1218,7 @@ def _is_non_article_result(item):
         "الرئيسيه",
         "الرئيسية",
         "ministry of foreign affairs",
-        "official portal",
-        "البوابة الرسمية",
     )
-
-    # Public news indexes occasionally surface a bare domain (or the same
-    # domain repeated around separators) as if it were a current article.
-    # This rule is institution-agnostic and therefore protects every registry
-    # source, not only a ministry that happened to expose the problem.
-    without_domains = re.sub(
-        r"(?i)(?:https?://)?(?:www\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[a-z0-9_./%-]*)?",
-        " ",
-        raw_title,
-    )
-    without_domains = re.sub(r"[\s\-|:–—_/.,()\[\]]+", "", without_domains)
-    if not without_domains:
-        return True
 
     parsed = urlparse(item.url or "")
     path = (parsed.path or "").strip("/")
@@ -1410,10 +1228,7 @@ def _is_non_article_result(item):
         article_signals = (
             "يدين", "تدين", "يعرب", "تعلن", "اعلنت", "أعلنت", "بيان",
             "تصريح", "اجتماع", "استقبل", "بحث", "ناقش", "اتصال",
-            "يؤكد", "تؤكد", "أكد", "اكد", "وقعت", "يوقع", "توقيع",
-            "زيارة", "يزور",
             "condemns", "statement", "meeting", "announces", "minister",
-            "confirms", "confirmed", "signs", "signed", "visits", "visited",
         )
         if not any(normalize_text(x) in combined for x in article_signals):
             return True
@@ -1635,64 +1450,7 @@ united_states|finance|الخزانة الأمريكية|https://home.treasury.go
 european_union|council|مجلس الاتحاد الأوروبي|https://www.consilium.europa.eu/en/press/press-releases/|/press/press-releases/|1
 european_union|central_bank|البنك المركزي الأوروبي|https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release|/press/pr/|1
 african_union|commission|مفوضية الاتحاد الأفريقي|https://au.int/en/press-releases|/pressreleases/|1
-african_union|peace_security|مجلس السلم والأمن الأفريقي|https://www.peaceau.org/en/|/article/|1
-argentina|government|الحكومة الأرجنتينية|https://www.argentina.gob.ar/noticias|/noticias/|0
-argentina|defence|الدفاع الأرجنتينية|https://www.argentina.gob.ar/defensa/noticias|/defensa/noticias/|1
-argentina|economy|الاقتصاد الأرجنتينية|https://www.argentina.gob.ar/economia/noticias|/economia/noticias/|1
-australia|government|رئاسة الوزراء الأسترالية|https://www.pm.gov.au/media|/media/|1
-australia|defence|الدفاع الأسترالية|https://www.defence.gov.au/news-events/releases|/news-events/releases/|1
-australia|finance|الخزانة الأسترالية|https://treasury.gov.au/media-release|/media-release/|1
-brazil|central_bank|البنك المركزي البرازيلي|https://www.bcb.gov.br/en/about/pressreleases|/pressreleases/|1
-brazil|defence|الدفاع البرازيلية|https://www.gov.br/defesa/pt-br/centrais-de-conteudo/noticias|/noticias/|1
-brazil|finance|المالية البرازيلية|https://www.gov.br/fazenda/pt-br/assuntos/noticias|/assuntos/noticias/|1
-canada|defence|الدفاع الكندية|https://www.canada.ca/en/department-national-defence/news.html|/department-national-defence/news/|1
-canada|finance|المالية الكندية|https://www.canada.ca/en/department-finance/news.html|/department-finance/news/|1
-china|central_bank|بنك الشعب الصيني|https://www.pbc.gov.cn/en/3688110/index.html|/en/|0
-china|defence|الدفاع الصينية|https://eng.mod.gov.cn/xb/News_213114/|/news_213114/|0
-china|finance|المالية الصينية|https://www.mof.gov.cn/en/News/|/en/news/|0
-france|defence|الدفاع الفرنسية|https://www.defense.gouv.fr/actualites|/actualites/|0
-france|finance|الاقتصاد والمالية الفرنسية|https://www.economie.gouv.fr/actualites|/actualites/|0
-germany|government|الحكومة الألمانية|https://www.bundesregierung.de/breg-en/news|/breg-en/news/|0
-germany|defence|الدفاع الألمانية|https://www.bmvg.de/en/news|/en/|0
-germany|finance|المالية الألمانية|https://www.bundesfinanzministerium.de/Content/EN/Standardartikel/Press_Room/Press-Releases/press-releases.html|/press-releases/|1
-india|government|رئاسة الوزراء الهندية|https://www.pmindia.gov.in/en/news_updates/|/news_updates/|1
-india|defence|الدفاع الهندية|https://www.pib.gov.in/AllRel.aspx?reg=3&lang=2|pressrelease|1
-india|finance|المالية الهندية|https://www.finmin.gov.in/news|/news/|0
-indonesia|government|الرئاسة الإندونيسية|https://www.presidenri.go.id/siaran-pers/|/siaran-pers/|1
-indonesia|defence|الدفاع الإندونيسية|https://www.kemhan.go.id/category/berita|/category/berita/|0
-indonesia|finance|المالية الإندونيسية|https://www.kemenkeu.go.id/informasi-publik/publikasi/berita-utama|/berita-utama/|0
-italy|government|الحكومة الإيطالية|https://www.governo.it/en/media|/en/|0
-italy|defence|الدفاع الإيطالية|https://www.difesa.it/eng/primo-piano/Pagine/default.aspx|/eng/primo-piano/|0
-italy|finance|الاقتصاد والمالية الإيطالية|https://www.mef.gov.it/en/ufficio-stampa/comunicati/|/ufficio-stampa/comunicati/|1
-japan|government|رئاسة الوزراء اليابانية|https://japan.kantei.go.jp/ongoingtopics/index.html|/ongoingtopics/|0
-japan|defence|الدفاع اليابانية|https://www.mod.go.jp/en/article/|/en/article/|0
-japan|finance|المالية اليابانية|https://www.mof.go.jp/english/policy/index.htm|/english/|0
-mexico|government|الرئاسة المكسيكية|https://www.gob.mx/presidencia/archivo/prensa|/presidencia/prensa/|1
-mexico|defence|الدفاع المكسيكية|https://www.gob.mx/defensa/archivo/prensa|/defensa/prensa/|1
-mexico|central_bank|بنك المكسيك|https://www.banxico.org.mx/publications-and-press/|/publications-and-press/|0
-russia|government|الحكومة الروسية|https://government.ru/en/news/|/en/news/|0
-russia|defence|الدفاع الروسية|https://eng.mil.ru/en/news_page/country.htm|/news_page/|0
-russia|finance|المالية الروسية|https://minfin.gov.ru/en/press-center/|/press-center/|0
-saudi_arabia|government|وكالة الأنباء السعودية|https://www.spa.gov.sa/en|/en/|0
-saudi_arabia|defence|الدفاع السعودية|https://www.mod.gov.sa/MediaCenter/Pages/default.aspx|/mediacenter/|0
-saudi_arabia|finance|المالية السعودية|https://www.mof.gov.sa/en/mediacenter/news/Pages/default.aspx|/mediacenter/news/|1
-south_africa|government|رئاسة جنوب أفريقيا|https://www.thepresidency.gov.za/press-statements|/press-statements/|1
-south_africa|defence|الدفاع الجنوب أفريقية|https://www.dod.mil.za/news|/news/|0
-south_africa|finance|الخزانة الجنوب أفريقية|https://www.treasury.gov.za/comm_media/press/|/comm_media/press/|1
-south_korea|government|رئاسة كوريا الجنوبية|https://www.president.go.kr/newsroom/|/newsroom/|0
-south_korea|defence|الدفاع الكورية الجنوبية|https://www.mnd.go.kr/mbshome/mbs/mndEN/subview.jsp?id=mndEN_020100000000|/mnden/|0
-south_korea|finance|الاقتصاد والمالية الكورية|https://english.mofe.go.kr/pc/selectTbPressCenterList.do?boardCd=N0001|/pc/|1
-turkey|government|الرئاسة التركية|https://www.tccb.gov.tr/en/news/542/|/en/news/|0
-turkey|defence|الدفاع التركية|https://www.msb.gov.tr/SlaytHaber/|/slaythaber/|0
-turkey|finance|الخزانة والمالية التركية|https://www.hmb.gov.tr/haberler|/haberler/|0
-united_kingdom|government|رئاسة الوزراء البريطانية|https://www.gov.uk/government/organisations/prime-ministers-office-10-downing-street|/government/news/;/government/speeches/|1
-united_kingdom|finance|الخزانة البريطانية|https://www.gov.uk/government/organisations/hm-treasury|/government/news/;/government/publications/|1
-united_states|government|البيت الأبيض|https://www.whitehouse.gov/briefing-room/|/briefing-room/|1
-united_states|defence|الدفاع الأمريكية|https://www.defense.gov/News/Releases/|/news/releases/|1
-european_union|commission|المفوضية الأوروبية|https://ec.europa.eu/commission/presscorner/home/en|/commission/presscorner/|1
-european_union|foreign_affairs|جهاز العمل الخارجي الأوروبي|https://www.eeas.europa.eu/eeas/press-material_en|/eeas/|1
-european_union|defence|وكالة الدفاع الأوروبية|https://eda.europa.eu/news-and-events/news|/news-and-events/news/|0
-african_union|official_agency|وكالة نيباد للتنمية|https://www.nepad.org/news|/news/|0"""
+african_union|peace_security|مجلس السلم والأمن الأفريقي|https://www.peaceau.org/en/|/article/|1"""
 OFFICIAL_SOURCE_REGISTRY = {}
 for _row in _OFFICIAL_PUBLIC_SOURCES.splitlines():
     _member, _institution, _name, _url, _paths, _dedicated = _row.split("|")
@@ -1714,48 +1472,9 @@ for _row in _OFFICIAL_PUBLIC_SOURCES.splitlines():
         }
 
 
-# High-value regional layer outside G20. These are public publisher pages and
-# follow the same strict date/provenance gates as the core registry.
-_OFFICIAL_STRATEGIC_EXTENSIONS = {
-    "uae": ("الخارجية الإماراتية", "https://www.mofa.gov.ae/en/mediahub/news", ("/mediahub/news/",)),
-    "qatar": ("الخارجية القطرية", "https://mofa.gov.qa/", ()),
-    "kuwait": ("الخارجية الكويتية", "https://www.mofa.gov.kw/", ()),
-    "bahrain": ("الخارجية البحرينية", "https://www.mofa.gov.bh/", ()),
-    "oman": ("الخارجية العمانية", "https://www.fm.gov.om/", ()),
-    "egypt": ("الخارجية المصرية", "https://www.mfa.gov.eg/", ()),
-}
-for _member, (_name, _url, _paths) in _OFFICIAL_STRATEGIC_EXTENSIONS.items():
-    _source_id = f"{_member}:foreign_affairs:0"
-    _base = FOREIGN_MINISTRY_REGISTRY.get(_member, {})
-    _domain = (urlparse(_url).hostname or "").removeprefix("www.")
-    OFFICIAL_SOURCE_REGISTRY[_source_id] = {
-        **_base,
-        "source_id": _source_id,
-        "member_id": _member,
-        "institution": "foreign_affairs",
-        "scope": "strategic_extension",
-        "publisher_name": _name,
-        "domains": (_domain,),
-        "index_urls": (_url,),
-        "publication_paths": _paths,
-        "statement_index": True,
-    }
-    FOREIGN_MINISTRY_REGISTRY[_member] = {
-        **_base,
-        "country_aliases": _base.get("country_aliases", (_member.replace("_", " "),)),
-        "adjectives": _base.get("adjectives", ()),
-        "domains": (_domain,),
-        "index_urls": (_url,),
-        "publication_paths": _paths,
-        "publisher_name": _name,
-    }
-
-
 for _source in OFFICIAL_SOURCE_REGISTRY.values():
     if _source["member_id"] == "saudi_arabia" and _source["institution"] == "foreign_affairs":
         _source["date_order"] = "mdy"
-    elif _source["member_id"] in _OFFICIAL_STRATEGIC_EXTENSIONS:
-        _source["date_order"] = "dmy"
     elif _source["member_id"] in {"germany", "france", "italy", "brazil", "argentina"}:
         _source["date_order"] = "dmy"
     _source["date_group_headings"] = _source["source_id"] in {
@@ -2384,55 +2103,16 @@ def official_source_coverage():
             for member in sorted(G20_MEMBERS)}
 
 
-_OFFICIAL_INSTITUTION_PRIORITY = {
-    "government": 0,
-    "foreign_affairs": 1,
-    "defence": 2,
-    "finance": 3,
-    "economy": 3,
-    "central_bank": 4,
-    "council": 5,
-    "commission": 5,
-    "peace_security": 5,
-    "official_agency": 6,
-}
-
-
-def _official_collection_profiles(country_id=None, per_member=None, round_index=0,
-                                  include_extensions=False):
-    """Return a fair institution rotation without giving any G20 member priority."""
+def _official_collection_profiles(country_id=None):
     by_member = {}
     for profile in OFFICIAL_SOURCE_REGISTRY.values():
         member = profile["member_id"]
-        if country_id is None and not include_extensions and member not in G20_MEMBERS:
-            continue
         if country_id is None or member == country_id:
             by_member.setdefault(member, []).append(profile)
-    for profiles in by_member.values():
-        profiles.sort(key=lambda profile: (
-            _OFFICIAL_INSTITUTION_PRIORITY.get(profile["institution"], 99),
-            profile["source_id"],
-        ))
-
     members = sorted(by_member)
     if members:
         offset = int(time.time() // ROTATION_WINDOW_SECONDS) % len(members)
         members = members[offset:] + members[:offset]
-
-    if per_member is not None:
-        selected = {}
-        cap = max(1, int(per_member))
-        for member, profiles in by_member.items():
-            if len(profiles) <= cap:
-                selected[member] = profiles
-                continue
-            start = (max(0, int(round_index)) * cap) % len(profiles)
-            selected[member] = [
-                profiles[(start + index) % len(profiles)]
-                for index in range(cap)
-            ]
-        by_member = selected
-
     # One source per member per round, rather than exhausting one member first.
     return [by_member[m][i] for i in range(max((len(v) for v in by_member.values()), default=0))
             for m in members if i < len(by_member[m])]
@@ -2472,186 +2152,12 @@ async def _collect_official_profiles(profiles, budget, max_links):
     return result
 
 
-_OFFICIAL_DISCOVERY_PHASES = (
-    {"government", "council", "commission"},
-    {"defence", "peace_security"},
-    {"finance", "economy"},
-    {"central_bank"},
-    {"official_agency"},
-)
-
-
-def _official_discovery_profiles_for_round(round_index):
-    """Alternate foreign ministries with the other institution layers."""
-    if int(round_index) % 2 == 0:
-        institutions = {"foreign_affairs"}
-    else:
-        phase = (int(round_index) // 2) % len(_OFFICIAL_DISCOVERY_PHASES)
-        institutions = _OFFICIAL_DISCOVERY_PHASES[phase]
-    # A host shared by multiple registry institutions cannot prove which one
-    # published a Google News result (gov.uk and gov.br are common examples).
-    # Those profiles remain covered by their direct public index collectors,
-    # while discovery is limited to unambiguous publisher hosts.
-    domain_counts = {
-        domain: sum(
-            domain in candidate.get("domains", ())
-            for candidate in OFFICIAL_SOURCE_REGISTRY.values()
-        )
-        for profile in OFFICIAL_SOURCE_REGISTRY.values()
-        for domain in profile.get("domains", ())
-    }
-    return sorted(
-        (profile for profile in OFFICIAL_SOURCE_REGISTRY.values()
-         if profile["institution"] in institutions
-         and profile.get("domains")
-         and all(domain_counts.get(domain, 0) == 1 for domain in profile["domains"])),
-        key=lambda profile: (profile["member_id"], profile["source_id"]),
-    )
-
-
-async def _collect_official_public_discovery(profiles):
-    """Use the public news index only as fallback discovery for official domains."""
-    if not profiles:
-        return []
-
-    started = time.monotonic()
-    results = []
-    connector = aiohttp.TCPConnector(
-        limit=OFFICIAL_DISCOVERY_CONCURRENCY,
-        limit_per_host=OFFICIAL_DISCOVERY_CONCURRENCY,
-        ttl_dns_cache=60,
-    )
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = {}
-        for profile in profiles:
-            domain = profile["domains"][0]
-            query = f"site:{domain} when:{CURRENT_NEWS_LOOKBACK_DAYS + 1}d"
-            task = asyncio.create_task(
-                fetch_feed(session, f"رصد رسمي: {profile['source_id']}", google_news_url(query))
-            )
-            tasks[task] = profile
-
-        done, pending = await asyncio.wait(tasks, timeout=OFFICIAL_DISCOVERY_BUDGET)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-        for task in done:
-            profile = tasks[task]
-            try:
-                group = task.result()
-            except Exception:
-                continue
-            accepted = 0
-            for item in group:
-                if accepted >= OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE:
-                    break
-                if (_looks_mojibake(item.title) or _looks_mojibake(item.source)
-                        or not _is_current_news(item)
-                        or not _domain_matches(item.domain, profile["domains"])
-                        or _is_digest(item.title)
-                        or _is_non_article_result(item)
-                        or _hard_low_value(item)):
-                    continue
-                item.official = True
-                item.trust_score = max(float(item.trust_score or 0), 99.0)
-                item.source = profile["publisher_name"]
-                item.official_source_id = profile["source_id"]
-                item.publication_evidence = "public_news_index_date"
-                item = classify_item(item)
-                if _direct_official_statement(item):
-                    results.append(item)
-                    accepted += 1
-
-    unique = {}
-    for item in results:
-        unique.setdefault(item.url.split("#", 1)[0], item)
-    result = sorted(unique.values(), key=lambda item: item.published, reverse=True)
-    log.info(
-        "Official public discovery profiles=%d completed=%d timed_out=%d accepted=%d elapsed=%.2fs",
-        len(tasks), len(done), len(pending), len(result), time.monotonic() - started,
-    )
-    return result
-
-
 async def collect_official_publisher_news():
-    global _OFFICIAL_PROFILE_ROUND
-
-    round_index = _OFFICIAL_PROFILE_ROUND
-    _OFFICIAL_PROFILE_ROUND += 1
-    profiles = _official_collection_profiles(
-        per_member=OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE,
-        round_index=round_index,
-        include_extensions=True,
-    )
+    profiles = _official_collection_profiles()
     coverage = official_source_coverage()
-    log.info(
-        "Official registry g20_covered=%d g20_total=%d sources=%d polled=%d round=%d",
-        sum(bool(n) for n in coverage.values()), len(coverage),
-        len(OFFICIAL_SOURCE_REGISTRY), len(profiles), round_index,
-    )
-    direct_task = asyncio.create_task(_collect_official_profiles(
-        profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS
-    ))
-    discovery_profiles = _official_discovery_profiles_for_round(round_index)
-    discovery_task = asyncio.create_task(
-        _collect_official_public_discovery(discovery_profiles)
-    )
-    direct, discovered = await asyncio.gather(direct_task, discovery_task)
-    fresh = direct + discovered
-
-    # Preserve verified results from earlier institution rotations. This gives
-    # the UI broad ministry coverage without launching the full registry at once.
-    fresh_by_source = {}
-    for item in fresh:
-        source_id = getattr(item, "official_source_id", "")
-        if source_id:
-            fresh_by_source.setdefault(source_id, []).append(item)
-    for source_id, new_items in fresh_by_source.items():
-        combined = list(new_items) + list(_OFFICIAL_RESULT_CACHE.get(source_id, ()))
-        by_url = {}
-        for item in combined:
-            if (not _is_current_news(item)
-                    or _is_digest(item.title)
-                    or _is_non_article_result(item)
-                    or _hard_low_value(item)):
-                continue
-            key = item.url.split("#", 1)[0]
-            if key and key not in by_url:
-                by_url[key] = item
-        _OFFICIAL_RESULT_CACHE[source_id] = sorted(
-            by_url.values(), key=lambda item: item.published, reverse=True
-        )[:OFFICIAL_CACHE_ITEMS_PER_SOURCE]
-
-    merged = {}
-    for source_id, cached_items in list(_OFFICIAL_RESULT_CACHE.items()):
-        current = [
-            item for item in cached_items
-            if (_is_current_news(item)
-                and not _is_digest(item.title)
-                and not _is_non_article_result(item)
-                and not _hard_low_value(item))
-        ]
-        if current:
-            _OFFICIAL_RESULT_CACHE[source_id] = current
-            for item in current:
-                merged.setdefault(item.url.split("#", 1)[0], item)
-        else:
-            _OFFICIAL_RESULT_CACHE.pop(source_id, None)
-    for item in fresh:
-        if (_is_current_news(item)
-                and not _is_digest(item.title)
-                and not _is_non_article_result(item)
-                and not _hard_low_value(item)):
-            merged.setdefault(item.url.split("#", 1)[0], item)
-
-    result = sorted(merged.values(), key=lambda item: item.published, reverse=True)
-    log.info(
-        "Official rolling cache sources=%d accepted=%d",
-        len(_OFFICIAL_RESULT_CACHE), len(result),
-    )
-    return result
+    log.info("Official registry g20_covered=%d g20_total=%d sources=%d",
+             sum(bool(n) for n in coverage.values()), len(coverage), len(profiles))
+    return await _collect_official_profiles(profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS)
 
 
 async def collect_official_institution_news(country_id):
@@ -3193,7 +2699,7 @@ def parse_entry(entry, source, category="general"):
     title = html.unescape(str(entry.get("title", "") or "").strip())
     url = str(entry.get("link", "") or "").strip()
 
-    if not title or not url or _looks_mojibake(title):
+    if not title or not url:
         return None
 
     summary = html.unescape(
@@ -3202,8 +2708,6 @@ def parse_entry(entry, source, category="general"):
     published = _entry_date(entry)
 
     publisher = _entry_publisher(entry, source)
-    if _looks_mojibake(publisher):
-        return None
     publisher_domain = _entry_source_domain(entry)
 
     item = NewsItem(
@@ -3287,10 +2791,11 @@ async def fetch_feed(session, source, url):
         # even the Home button appear frozen for ~20 seconds.  A tiny dedicated
         # pool isolates parser CPU from Telegram's event loop.
         async with asyncio.timeout(FEED_PARSE_TIMEOUT):
-            loop = asyncio.get_running_loop()
-            parsed = await loop.run_in_executor(
-                _FEED_PARSE_EXECUTOR, feedparser.parse, data
-            )
+            async with _FEED_PARSE_SEMAPHORE:
+                loop = asyncio.get_running_loop()
+                parsed = await loop.run_in_executor(
+                    _FEED_PARSE_EXECUTOR, feedparser.parse, data
+                )
         items = []
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)

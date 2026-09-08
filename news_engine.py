@@ -163,6 +163,11 @@ ECON_EXCLUDE = [
     "انتشال","إنقاذ عمال","منجم","نفق","فيضانات","طقس",
     "rescue","earthquake","death","funeral","accident","drowning","flood",
     "weather",
+    # A passing economic reference in the summary must not move a primarily
+    # humanitarian, rights or conflict story onto the Economy desk.
+    "حقوق الانسان", "حقوق الإنسان", "انساني", "إنساني", "لاجئين",
+    "الحرب", "نزاع", "ضحايا", "human rights", "humanitarian",
+    "refugees", "war in", "war on", "war against", "conflict", "victims",
 ]
 
 SECURITY_TERMS = [
@@ -173,7 +178,8 @@ SECURITY_TERMS = [
     "military","army","forces","defense","defence","security","weapons","weapon",
     "missile","missiles","airstrike","airstrike","strike","attack","fighting",
     "battle","battles","combat","drone","drones","ammunition","air defense",
-    "military operation","troops","navy","warship",
+    "military operation","troops","navy","warship", "حرب",
+    "war in", "war on", "war against", "conflict",
 ]
 
 SECURITY_SOCIAL_EXCLUDE = [
@@ -216,6 +222,22 @@ LOW_VALUE_HARD_TERMS = [
     "مشاهدة مباشرة", "مشاهدة البث المباشر", "مشاهدة مباراة",
     "شاهد المباراة", "رابط المباراة", "روابط المباراة", "live stream",
     "watch live", "streaming link", "live score", "نتيجة مباشرة",
+    # Compromised government subdomains and SEO spam must never inherit the
+    # trust of their parent public-sector suffix.
+    "sexy", "xxx", "porn", "فيديو مسرب", "مسرب فيديو",
+    "تسريب مقاطع", "الفيديو الكامل", "رابط الفيديو الأصلي",
+    "دراما قصيرة", "علاقة عاطفية", "شاهد على الهاتف المحمول",
+    "free short drama", "watch on mobile",
+    # Embassy services, commercial listings and ceremonial award publicity are
+    # official-site content but not intelligence-grade official statements.
+    "مزاد السفارة", "مزاد الكتروني", "مزاد إلكتروني",
+    "embassy auction", "online auction",
+    "جوائز تجربة العملاء", "جائزة تجربة العملاء",
+    "customer experience award", "customer experience awards",
+    # Legacy archive pages can be newly indexed today even though the release
+    # itself is historical.  These retired institution names are conclusive
+    # evidence that the page is not a current Saudi Central Bank statement.
+    "مؤسسة النقد العربي السعودي", "saudi arabian monetary agency",
 ]
 
 SPORT_TERMS = [
@@ -759,8 +781,13 @@ def detect_region(text):
     return ""
 
 def _domain_matches(domain, candidates):
+    # Registry domains are exact publisher hosts.  Treating every subdomain of
+    # a broad government host (for example *.gov.br) as the same publisher lets
+    # unrelated or compromised municipal sites impersonate a ministry.
     d = (domain or "").lower().split(":")[0].split("/")[0].strip(".")
-    return any(d == candidate or d.endswith("." + candidate) for candidate in candidates)
+    d = d.removeprefix("www.")
+    return any(d == str(candidate or "").lower().strip(".").removeprefix("www.")
+               for candidate in candidates)
 
 def is_official_source(source, domain):
     # Official status is determined from the publisher domain, not from words
@@ -797,12 +824,22 @@ def _is_digest(title):
     n = normalize_text(title)
     return any(normalize_text(term) in n for term in DIGEST_TERMS)
 
+def _security_term_score(value):
+    """Count security meaning without matching أمن inside words like الثامن."""
+    n = normalize_text(value)
+    ambiguous = normalize_text("أمن")
+    score = score_terms(n, [term for term in SECURITY_TERMS
+                            if normalize_text(term) != ambiguous])
+    score += len(re.findall(r"(?<!\w)(?:امن|الامن)(?!\w)", n))
+    return score
+
+
 def _security_signal(title, summary=""):
     t = normalize_text(title)
     s = normalize_text(summary)
     if any(normalize_text(x) in t for x in SECURITY_SOCIAL_EXCLUDE):
         return False
-    return score_terms(t, SECURITY_TERMS) >= 1 or score_terms(s, SECURITY_TERMS) >= 2
+    return _security_term_score(t) >= 1 or _security_term_score(s) >= 2
 
 def _economy_signal(title, summary=""):
     t = normalize_text(title)
@@ -937,6 +974,57 @@ URGENT_SECTION_TERMS = [
     "زلزال", "earthquake", "تسونامي", "tsunami",
 ]
 
+URGENT_RETROSPECTIVE_TERMS = [
+    "ذكرى", "الذكري", "anniversary", "years since", "year since",
+    "اعاده الاعمار", "إعادة الإعمار", "reconstruction progress",
+]
+
+URGENT_METAPHOR_PATTERNS = [
+    r"زلزال\s+(?:الاقتراع|انتخابي|سياسي|الانتخابات)",
+    r"(?:electoral|political)\s+earthquake",
+]
+
+URGENT_LIVE_EVENT_TERMS = [
+    "قتل", "قتيل", "قتلى", "مصاب", "اصابه", "إصابة", "ضحايا",
+    "غاره", "غارة", "غارات", "قصف", "هجوم", "انفجار", "اخلاء", "إخلاء",
+    "يضرب", "ضرب", "وقع", "هزه", "هزة", "بقوه", "بقوة", "تحذير",
+    "killed", "dead", "injured", "casualties", "airstrike", "attack",
+    "explosion", "evacuation", "hits", "strikes", "magnitude", "warning",
+]
+
+
+def _urgent_section_signal(title, summary=""):
+    """Admit live emergencies, not anniversaries, analysis or metaphors."""
+    t = normalize_text(title)
+    s = normalize_text(summary)
+    combined = f"{t} {s}"
+
+    if score_terms(combined, URGENT_RETROSPECTIVE_TERMS):
+        return False
+    if any(re.search(pattern, t, re.I) for pattern in URGENT_METAPHOR_PATTERNS):
+        return False
+
+    emergency = score_terms(t, (
+        "حاله طوارئ", "حالة طوارئ", "اخلاء فوري", "إخلاء فوري",
+        "state of emergency", "emergency declared", "immediate evacuation",
+        "تسونامي", "tsunami",
+    )) >= 1
+    if emergency:
+        return True
+
+    explicit = score_terms(t, ("عاجل", "خبر عاجل", "breaking", "breaking news", "urgent")) >= 1
+    live_title = score_terms(t, URGENT_LIVE_EVENT_TERMS)
+    if explicit and live_title >= 1:
+        return True
+
+    disaster = score_terms(t, ("زلزال", "earthquake")) >= 1
+    if disaster and live_title >= 1:
+        return True
+
+    # A summary can never manufacture urgency by repeating generic disaster
+    # words beneath an analytical headline.
+    return False
+
 ROUTINE_INSTITUTIONAL_PATTERNS = [
     # Internal staffing, fellowships and ceremonial publicity. Central-bank
     # market operations are not noise: they belong exclusively to Economy.
@@ -989,16 +1077,15 @@ def _exclusive_topic_key(item):
 
     # Keep urgent deliberately narrow. Ordinary attack/missile coverage stays
     # on the security desk unless it explicitly signals a live emergency.
-    if (score_terms(normalized_title, URGENT_SECTION_TERMS) >= 1
-            or score_terms(normalized_summary, URGENT_SECTION_TERMS) >= 2):
+    if _urgent_section_signal(title, summary):
         return "urg"
 
     security = _security_signal(title, summary)
     economy = _economy_signal(title, summary)
     if security and economy:
         security_score = (
-            score_terms(normalized_title, SECURITY_TERMS) * 3
-            + score_terms(normalized_summary, SECURITY_TERMS)
+            _security_term_score(normalized_title) * 3
+            + _security_term_score(normalized_summary)
         )
         economy_score = (
             score_terms(normalized_title, ECON_TERMS) * 3
@@ -1201,8 +1288,15 @@ def _query_intent(query):
 def _hard_low_value(item):
     if _looks_mojibake(item.title) or _looks_mojibake(item.original_title) or _looks_mojibake(item.source):
         return True
+    raw = f"{item.title} {item.original_title} {item.summary}"
+    if "🔞" in raw:
+        return True
     text = normalize_text(f"{item.title} {item.original_title}")
-    return any(normalize_text(term) in text for term in LOW_VALUE_HARD_TERMS)
+    return any(
+        normalized and normalized in text
+        for term in LOW_VALUE_HARD_TERMS
+        for normalized in (normalize_text(term),)
+    )
 
 
 def _content_value_adjustment(item, query):
@@ -2394,9 +2488,23 @@ def _official_discovery_profiles_for_round(round_index):
     else:
         phase = (int(round_index) // 2) % len(_OFFICIAL_DISCOVERY_PHASES)
         institutions = _OFFICIAL_DISCOVERY_PHASES[phase]
+    # A host shared by multiple registry institutions cannot prove which one
+    # published a Google News result (gov.uk and gov.br are common examples).
+    # Those profiles remain covered by their direct public index collectors,
+    # while discovery is limited to unambiguous publisher hosts.
+    domain_counts = {
+        domain: sum(
+            domain in candidate.get("domains", ())
+            for candidate in OFFICIAL_SOURCE_REGISTRY.values()
+        )
+        for profile in OFFICIAL_SOURCE_REGISTRY.values()
+        for domain in profile.get("domains", ())
+    }
     return sorted(
         (profile for profile in OFFICIAL_SOURCE_REGISTRY.values()
-         if profile["institution"] in institutions and profile.get("domains")),
+         if profile["institution"] in institutions
+         and profile.get("domains")
+         and all(domain_counts.get(domain, 0) == 1 for domain in profile["domains"])),
         key=lambda profile: (profile["member_id"], profile["source_id"]),
     )
 

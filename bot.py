@@ -384,10 +384,20 @@ async def initialize_custom_emoji_pack(application):
         log.exception("Custom emoji pack failed; fallback enabled.")
 
 
+def _collect_news_in_isolated_loop(max_items=150):
+    """Run the collector away from Telegram's callback event loop.
+
+    The collector is asynchronous for network concurrency, but it also performs
+    CPU-heavy HTML parsing and event deduplication between awaits.  Giving it a
+    private loop in a worker thread prevents those phases from freezing buttons.
+    """
+    return asyncio.run(collect_news(max_items=max_items))
+
+
 async def _run_news_collection():
     try:
         items = await asyncio.wait_for(
-            collect_news(max_items=150),
+            asyncio.to_thread(_collect_news_in_isolated_loop, 150),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
         if items:
@@ -1569,6 +1579,10 @@ async def button_handler(update, context):
     log.info("Callback received: %s", data)
 
     if not claim_callback(query, user_id, data):
+        # Every Telegram callback must be acknowledged, including a repeated
+        # tap that we intentionally do not execute twice. Otherwise the client
+        # keeps showing a spinner and the user experiences it as a stuck button.
+        await safe_query_answer(query)
         return
 
     if data == "toggle_alerts":

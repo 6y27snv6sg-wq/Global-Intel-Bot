@@ -51,6 +51,9 @@ OFFICIAL_COLLECTION_BUDGET = 12.0
 OFFICIAL_MAX_PAGE_BYTES = 900_000
 OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE = 3
 OFFICIAL_CACHE_ITEMS_PER_SOURCE = 20
+OFFICIAL_DISCOVERY_BUDGET = 4.0
+OFFICIAL_DISCOVERY_CONCURRENCY = 10
+OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE = 8
 
 # Fast breaking-news lane: direct publisher feeds only.  This path is designed
 # for frequent lightweight polling and deliberately excludes Google discovery,
@@ -286,6 +289,20 @@ def normalize_text(value):
     for old, new in {"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ة":"ه","ؤ":"و","ئ":"ي"}.items():
         text = text.replace(old, new)
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s\u0600-\u06FF-]", " ", text)).strip()
+
+
+def _looks_mojibake(value):
+    """Detect broken UTF-8/Windows-codepage text before it reaches Telegram."""
+    text = str(value or "")
+    if not text:
+        return False
+    if re.search(r"[\x80-\x9f]", text):
+        return True
+    severe = ("ï¿½", "â€", "Ãƒ", "Ø§Ù", "Ù„Ø", "Ů„", "Ř§", "Ř±")
+    if any(marker in text for marker in severe):
+        return True
+    markers = ("Ã", "Â", "Ø", "Ù", "Ů", "Ř")
+    return sum(text.count(marker) for marker in markers) >= 3
 
 
 # Arabic display/normalization layer.
@@ -1182,6 +1199,8 @@ def _query_intent(query):
 
 
 def _hard_low_value(item):
+    if _looks_mojibake(item.title) or _looks_mojibake(item.original_title) or _looks_mojibake(item.source):
+        return True
     text = normalize_text(f"{item.title} {item.original_title}")
     return any(normalize_text(term) in text for term in LOW_VALUE_HARD_TERMS)
 
@@ -1582,9 +1601,48 @@ for _row in _OFFICIAL_PUBLIC_SOURCES.splitlines():
         }
 
 
+# High-value regional layer outside G20. These are public publisher pages and
+# follow the same strict date/provenance gates as the core registry.
+_OFFICIAL_STRATEGIC_EXTENSIONS = {
+    "uae": ("الخارجية الإماراتية", "https://www.mofa.gov.ae/en/mediahub/news", ("/mediahub/news/",)),
+    "qatar": ("الخارجية القطرية", "https://mofa.gov.qa/", ()),
+    "kuwait": ("الخارجية الكويتية", "https://www.mofa.gov.kw/", ()),
+    "bahrain": ("الخارجية البحرينية", "https://www.mofa.gov.bh/", ()),
+    "oman": ("الخارجية العمانية", "https://www.fm.gov.om/", ()),
+    "egypt": ("الخارجية المصرية", "https://www.mfa.gov.eg/", ()),
+}
+for _member, (_name, _url, _paths) in _OFFICIAL_STRATEGIC_EXTENSIONS.items():
+    _source_id = f"{_member}:foreign_affairs:0"
+    _base = FOREIGN_MINISTRY_REGISTRY.get(_member, {})
+    _domain = (urlparse(_url).hostname or "").removeprefix("www.")
+    OFFICIAL_SOURCE_REGISTRY[_source_id] = {
+        **_base,
+        "source_id": _source_id,
+        "member_id": _member,
+        "institution": "foreign_affairs",
+        "scope": "strategic_extension",
+        "publisher_name": _name,
+        "domains": (_domain,),
+        "index_urls": (_url,),
+        "publication_paths": _paths,
+        "statement_index": True,
+    }
+    FOREIGN_MINISTRY_REGISTRY[_member] = {
+        **_base,
+        "country_aliases": _base.get("country_aliases", (_member.replace("_", " "),)),
+        "adjectives": _base.get("adjectives", ()),
+        "domains": (_domain,),
+        "index_urls": (_url,),
+        "publication_paths": _paths,
+        "publisher_name": _name,
+    }
+
+
 for _source in OFFICIAL_SOURCE_REGISTRY.values():
     if _source["member_id"] == "saudi_arabia" and _source["institution"] == "foreign_affairs":
         _source["date_order"] = "mdy"
+    elif _source["member_id"] in _OFFICIAL_STRATEGIC_EXTENSIONS:
+        _source["date_order"] = "dmy"
     elif _source["member_id"] in {"germany", "france", "italy", "brazil", "argentina"}:
         _source["date_order"] = "dmy"
     _source["date_group_headings"] = _source["source_id"] in {
@@ -2227,11 +2285,14 @@ _OFFICIAL_INSTITUTION_PRIORITY = {
 }
 
 
-def _official_collection_profiles(country_id=None, per_member=None, round_index=0):
+def _official_collection_profiles(country_id=None, per_member=None, round_index=0,
+                                  include_extensions=False):
     """Return a fair institution rotation without giving any G20 member priority."""
     by_member = {}
     for profile in OFFICIAL_SOURCE_REGISTRY.values():
         member = profile["member_id"]
+        if country_id is None and not include_extensions and member not in G20_MEMBERS:
+            continue
         if country_id is None or member == country_id:
             by_member.setdefault(member, []).append(profile)
     for profiles in by_member.values():
@@ -2298,6 +2359,92 @@ async def _collect_official_profiles(profiles, budget, max_links):
     return result
 
 
+_OFFICIAL_DISCOVERY_PHASES = (
+    {"government", "council", "commission"},
+    {"defence", "peace_security"},
+    {"finance", "economy"},
+    {"central_bank"},
+    {"official_agency"},
+)
+
+
+def _official_discovery_profiles_for_round(round_index):
+    """Alternate foreign ministries with the other institution layers."""
+    if int(round_index) % 2 == 0:
+        institutions = {"foreign_affairs"}
+    else:
+        phase = (int(round_index) // 2) % len(_OFFICIAL_DISCOVERY_PHASES)
+        institutions = _OFFICIAL_DISCOVERY_PHASES[phase]
+    return sorted(
+        (profile for profile in OFFICIAL_SOURCE_REGISTRY.values()
+         if profile["institution"] in institutions and profile.get("domains")),
+        key=lambda profile: (profile["member_id"], profile["source_id"]),
+    )
+
+
+async def _collect_official_public_discovery(profiles):
+    """Use the public news index only as fallback discovery for official domains."""
+    if not profiles:
+        return []
+
+    started = time.monotonic()
+    results = []
+    connector = aiohttp.TCPConnector(
+        limit=OFFICIAL_DISCOVERY_CONCURRENCY,
+        limit_per_host=OFFICIAL_DISCOVERY_CONCURRENCY,
+        ttl_dns_cache=60,
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = {}
+        for profile in profiles:
+            domain = profile["domains"][0]
+            query = f"site:{domain} when:{CURRENT_NEWS_LOOKBACK_DAYS + 1}d"
+            task = asyncio.create_task(
+                fetch_feed(session, f"رصد رسمي: {profile['source_id']}", google_news_url(query))
+            )
+            tasks[task] = profile
+
+        done, pending = await asyncio.wait(tasks, timeout=OFFICIAL_DISCOVERY_BUDGET)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        for task in done:
+            profile = tasks[task]
+            try:
+                group = task.result()
+            except Exception:
+                continue
+            accepted = 0
+            for item in group:
+                if accepted >= OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE:
+                    break
+                if (_looks_mojibake(item.title) or _looks_mojibake(item.source)
+                        or not _is_current_news(item)
+                        or not _domain_matches(item.domain, profile["domains"])):
+                    continue
+                item.official = True
+                item.trust_score = max(float(item.trust_score or 0), 99.0)
+                item.source = profile["publisher_name"]
+                item.official_source_id = profile["source_id"]
+                item.publication_evidence = "public_news_index_date"
+                item = classify_item(item)
+                if _direct_official_statement(item):
+                    results.append(item)
+                    accepted += 1
+
+    unique = {}
+    for item in results:
+        unique.setdefault(item.url.split("#", 1)[0], item)
+    result = sorted(unique.values(), key=lambda item: item.published, reverse=True)
+    log.info(
+        "Official public discovery profiles=%d completed=%d timed_out=%d accepted=%d elapsed=%.2fs",
+        len(tasks), len(done), len(pending), len(result), time.monotonic() - started,
+    )
+    return result
+
+
 async def collect_official_publisher_news():
     global _OFFICIAL_PROFILE_ROUND
 
@@ -2306,6 +2453,7 @@ async def collect_official_publisher_news():
     profiles = _official_collection_profiles(
         per_member=OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE,
         round_index=round_index,
+        include_extensions=True,
     )
     coverage = official_source_coverage()
     log.info(
@@ -2313,9 +2461,15 @@ async def collect_official_publisher_news():
         sum(bool(n) for n in coverage.values()), len(coverage),
         len(OFFICIAL_SOURCE_REGISTRY), len(profiles), round_index,
     )
-    fresh = await _collect_official_profiles(
+    direct_task = asyncio.create_task(_collect_official_profiles(
         profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS
+    ))
+    discovery_profiles = _official_discovery_profiles_for_round(round_index)
+    discovery_task = asyncio.create_task(
+        _collect_official_public_discovery(discovery_profiles)
     )
+    direct, discovered = await asyncio.gather(direct_task, discovery_task)
+    fresh = direct + discovered
 
     # Preserve verified results from earlier institution rotations. This gives
     # the UI broad ministry coverage without launching the full registry at once.
@@ -2896,7 +3050,7 @@ def parse_entry(entry, source, category="general"):
     title = html.unescape(str(entry.get("title", "") or "").strip())
     url = str(entry.get("link", "") or "").strip()
 
-    if not title or not url:
+    if not title or not url or _looks_mojibake(title):
         return None
 
     summary = html.unescape(
@@ -2905,6 +3059,8 @@ def parse_entry(entry, source, category="general"):
     published = _entry_date(entry)
 
     publisher = _entry_publisher(entry, source)
+    if _looks_mojibake(publisher):
+        return None
     publisher_domain = _entry_source_domain(entry)
 
     item = NewsItem(

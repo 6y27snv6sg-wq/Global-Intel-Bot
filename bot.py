@@ -11,6 +11,7 @@ from collections import deque
 from typing import Any, Dict, List, Set
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -69,7 +70,10 @@ BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
-NEWS_COLLECTION_TIMEOUT = 25
+# Full collection runs in an isolated worker thread. A wider background budget
+# improves slow official-source coverage without delaying Telegram callbacks,
+# which always read the last prepared snapshot immediately.
+NEWS_COLLECTION_TIMEOUT = 40
 ONLINE_SEARCH_TIMEOUT = 6
 CALLBACK_ACK_TIMEOUT = 1.5
 CALLBACK_DEDUP_TTL = 60
@@ -78,7 +82,9 @@ GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
 PER_PAGE = 5
-CACHE_TTL = 300
+CACHE_TTL = 600
+HOT_CACHE_REFRESH_SECONDS = 120
+HOT_CACHE_INITIAL_DELAY = 2
 
 URGENT_MONITOR_INTERVAL = 30
 URGENT_INITIAL_DELAY = 8
@@ -86,6 +92,29 @@ BREAKING_LANE_TIMEOUT = 8
 MAX_SENT_URGENT_KEYS = 500
 MAX_RECENT_URGENT_EVENTS = 300
 RECENT_URGENT_EVENT_TTL = 12 * 3600
+
+# Bounded multi-user capacity. Different users may run concurrently, while a
+# per-user lock below preserves the stable single-user interaction semantics.
+MAX_CONCURRENT_UPDATES = 16
+TELEGRAM_CONNECTION_POOL_SIZE = 32
+TELEGRAM_POOL_TIMEOUT = 10
+ONLINE_SEARCH_CONCURRENCY = 8
+ONLINE_SEARCH_QUEUE_TIMEOUT = 2
+ANALYSIS_CONCURRENCY = 4
+ANALYSIS_QUEUE_TIMEOUT = 2
+
+# Telegram's free broadcast ceiling is about 30 messages/second. Keep explicit
+# headroom for ordinary replies and callback acknowledgements.
+URGENT_BROADCAST_BATCH_SIZE = 20
+URGENT_BROADCAST_WINDOW = 1.05
+URGENT_PER_CHAT_INTERVAL = 1.05
+
+# Search pages, topic snapshots and locks are ephemeral UI state. Alert opt-in
+# sets are intentionally not pruned here; losing a subscription silently would
+# be worse than retaining one integer per subscriber.
+USER_STATE_TTL = 6 * 3600
+USER_STATE_PRUNE_INTERVAL = 600
+MAX_EPHEMERAL_USERS = 2000
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -132,12 +161,15 @@ class SimpleCache:
 NEWS_CACHE = SimpleCache(CACHE_TTL)
 BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
 NEWS_VIEW_CACHE = SimpleCache(CACHE_TTL)
+TOPIC_VIEW_CACHE = SimpleCache(max(CACHE_TTL, HOT_CACHE_REFRESH_SECONDS * 2))
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
 USER_SEEN_TOPIC_EVENTS: Dict[str, List[Any]] = {}
 MAX_SEEN_TOPIC_EVENTS = 120
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
+USER_LAST_ACTIVE: Dict[int, float] = {}
+USER_LAST_ALERT_SEND: Dict[int, float] = {}
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
 SENT_URGENT_KEYS = deque(maxlen=MAX_SENT_URGENT_KEYS)
@@ -147,8 +179,12 @@ CUSTOM_EMOJI_IDS = {}
 URGENT_MONITOR_STARTED = False
 URGENT_BASELINE_READY = False
 URGENT_MONITOR_TASK = None
+HOT_CACHE_TASK = None
+USER_STATE_TASK = None
 BACKGROUND_TASKS: Set[asyncio.Task] = set()
 NEWS_COLLECTION_TASK = None
+ONLINE_SEARCH_SEMAPHORE = None
+ANALYSIS_SEMAPHORE = None
 SEEN_CALLBACK_IDS: Dict[str, float] = {}
 RECENT_CALLBACK_ACTIONS: Dict[str, float] = {}
 
@@ -228,6 +264,74 @@ SEARCH_ALIASES = {
 
 def register_user(user_id):
     ALERT_USERS.add(user_id)
+    USER_LAST_ACTIVE[user_id] = time.monotonic()
+
+
+def get_user_lock(user_id):
+    """Return the one event-loop lock that serializes this user's actions."""
+    return USER_LOCKS.setdefault(user_id, asyncio.Lock())
+
+
+def _user_id_from_snapshot_key(value):
+    try:
+        return int(str(value).split(":", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def prune_ephemeral_user_state(now=None):
+    """Bound inactive per-user UI state without changing alert subscriptions."""
+    now = time.monotonic() if now is None else now
+    protected = {
+        user_id for user_id, lock in USER_LOCKS.items()
+        if lock.locked()
+    }
+    victims = {
+        user_id for user_id, seen_at in USER_LAST_ACTIVE.items()
+        if user_id not in protected and now - seen_at > USER_STATE_TTL
+    }
+
+    remaining = [
+        (seen_at, user_id)
+        for user_id, seen_at in USER_LAST_ACTIVE.items()
+        if user_id not in victims and user_id not in protected
+    ]
+    overflow = max(0, len(USER_LAST_ACTIVE) - len(victims) - MAX_EPHEMERAL_USERS)
+    if overflow:
+        remaining.sort()
+        victims.update(user_id for _, user_id in remaining[:overflow])
+
+    # Alert pacing timestamps have no value after a long inactive period and
+    # must be pruned even when no other UI state happened to expire this cycle.
+    for user_id, sent_at in list(USER_LAST_ALERT_SEND.items()):
+        if now - sent_at > USER_STATE_TTL:
+            USER_LAST_ALERT_SEND.pop(user_id, None)
+
+    if not victims:
+        return 0
+
+    for user_id in victims:
+        USER_SEARCH_RESULTS.pop(user_id, None)
+        USER_SEARCH_QUERY.pop(user_id, None)
+        lock = USER_LOCKS.get(user_id)
+        if lock is None or not lock.locked():
+            USER_LOCKS.pop(user_id, None)
+        USER_LAST_ACTIVE.pop(user_id, None)
+
+    for mapping in (USER_TOPIC_RESULTS, USER_SEEN_TOPIC_EVENTS):
+        for key in list(mapping):
+            if _user_id_from_snapshot_key(key) in victims:
+                mapping.pop(key, None)
+
+    return len(victims)
+
+
+async def user_state_maintenance():
+    while True:
+        await asyncio.sleep(USER_STATE_PRUNE_INTERVAL)
+        removed = prune_ephemeral_user_state()
+        if removed:
+            log.info("Pruned ephemeral state for %d inactive user(s).", removed)
 
 
 def safe_html(value):
@@ -384,10 +488,20 @@ async def initialize_custom_emoji_pack(application):
         log.exception("Custom emoji pack failed; fallback enabled.")
 
 
+def _collect_news_in_isolated_loop(max_items=150):
+    """Run the collector away from Telegram's callback event loop.
+
+    The collector is asynchronous for network concurrency, but it also performs
+    CPU-heavy HTML parsing and event deduplication between awaits.  Giving it a
+    private loop in a worker thread prevents those phases from freezing buttons.
+    """
+    return asyncio.run(collect_news(max_items=max_items))
+
+
 async def _run_news_collection():
     try:
         items = await asyncio.wait_for(
-            collect_news(max_items=150),
+            asyncio.to_thread(_collect_news_in_isolated_loop, 150),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
         if items:
@@ -395,7 +509,8 @@ async def _run_news_collection():
             # second all-pairs dedup here previously consumed another 10-17s.
             items = list(items[:150])
             NEWS_CACHE.set("all_news", items)
-            _refresh_news_view_cache()
+            view = _refresh_news_view_cache()
+            await _refresh_topic_view_cache(view)
             return items
     except asyncio.TimeoutError:
         log.warning("News collection timed out; keeping last available cache.")
@@ -514,6 +629,38 @@ def topic_filter(items, topic_key, max_results=25):
     if topic_key == "urg":
         return deduplicate_urgent_events(ranked, limit=max_results)
     return deduplicate_events(ranked, limit=max_results)
+
+
+def _build_topic_views(items):
+    """Build every section once so button callbacks only read prepared lists."""
+    return {
+        key: topic_filter(items, key, MAX_SEARCH_RESULTS)
+        for key in TOPICS
+    }
+
+
+async def _refresh_topic_view_cache(items=None):
+    view = list(items if items is not None else get_cached_news_view())
+    prepared = await asyncio.to_thread(_build_topic_views, view)
+    TOPIC_VIEW_CACHE.set("topics", prepared)
+    return prepared
+
+
+async def _refresh_urgent_topic_view(items=None):
+    """Refresh only the rapidly changing urgent page between full warm cycles."""
+    view = list(items if items is not None else get_cached_news_view())
+    urgent = await asyncio.to_thread(
+        topic_filter, view, "urg", MAX_SEARCH_RESULTS
+    )
+    prepared = dict(TOPIC_VIEW_CACHE.peek("topics") or {})
+    prepared["urg"] = urgent
+    TOPIC_VIEW_CACHE.set("topics", prepared)
+    return urgent
+
+
+def get_cached_topic_view(topic_key):
+    prepared = TOPIC_VIEW_CACHE.peek("topics") or {}
+    return list(prepared.get(topic_key, []))
 
 
 def generate_base_report(
@@ -654,7 +801,14 @@ async def analyze_with_gemini(items):
     if not ai_client:
         return "ℹ️ طبقة التحليل غير متاحة حالياً، لكن جمع الأخبار والبحث يعملان."
 
+    semaphore = ANALYSIS_SEMAPHORE
+    acquired = False
     try:
+        if semaphore is not None:
+            await asyncio.wait_for(
+                semaphore.acquire(), timeout=ANALYSIS_QUEUE_TIMEOUT
+            )
+            acquired = True
         context = build_ai_context(items[:8])
         response = await asyncio.wait_for(
             asyncio.to_thread(
@@ -672,9 +826,60 @@ async def analyze_with_gemini(items):
         return (
             getattr(response, "text", None) or ""
         ).strip() or "⚠️ لم يُرجع التحليل نتيجة."
+    except asyncio.TimeoutError:
+        if not acquired:
+            return "⏳ التحليل مشغول الآن بعدة طلبات. حاول مرة أخرى بعد قليل."
+        log.info("Gemini analysis timed out.")
+        return "⚠️ تعذر التحليل بالذكاء الاصطناعي حالياً."
     except Exception:
         log.exception("Gemini analysis failed.")
         return "⚠️ تعذر التحليل بالذكاء الاصطناعي حالياً."
+    finally:
+        if acquired:
+            semaphore.release()
+
+
+def analysis_home_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏠 مركز الأخبار", callback_data="home")
+    ]])
+
+
+async def complete_topic_analysis(status, key):
+    """Finish analysis in background so navigation callbacks stay available."""
+    try:
+        results = get_cached_topic_view(key)[:8]
+        if not results:
+            cached = NEWS_CACHE.peek("all_news") or []
+            if not cached:
+                await collect_and_cache_news()
+                cached = NEWS_CACHE.peek("all_news") or []
+            results = await asyncio.to_thread(topic_filter, cached, key, 8)
+
+        if not results:
+            await status.edit_text(
+                "⚠️ لا توجد بيانات كافية للتحليل.",
+                reply_markup=analysis_home_keyboard(),
+            )
+            return
+
+        analysis = await analyze_with_gemini(results)
+        await status.edit_text(
+            "🧠 <b>التحليل التنفيذي</b>\n\n" + safe_html(analysis),
+            parse_mode="HTML",
+            reply_markup=analysis_home_keyboard(),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Analysis failed.")
+        try:
+            await status.edit_text(
+                "⚠️ حدث خطأ أثناء التحليل.",
+                reply_markup=analysis_home_keyboard(),
+            )
+        except Exception:
+            pass
 
 
 URGENT_STRONG_TERMS = {
@@ -1149,7 +1354,8 @@ async def _merge_breaking_into_cache(items):
         deduplicate_urgent_events, list(items) + list(cached), 80
     )
     BREAKING_CACHE.set("breaking_news", merged)
-    _refresh_news_view_cache()
+    view = _refresh_news_view_cache()
+    await _refresh_urgent_topic_view(view)
 
 
 async def initialize_urgent_baseline():
@@ -1171,6 +1377,73 @@ async def initialize_urgent_baseline():
                 remember_urgent_event(item)
 
     URGENT_BASELINE_READY = True
+
+
+def _retry_after_seconds(error):
+    value = getattr(error, "retry_after", 1)
+    if hasattr(value, "total_seconds"):
+        value = value.total_seconds()
+    try:
+        return max(0.1, float(value))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+async def _send_urgent_alert_to_user(application, user_id, message):
+    """Send one alert with per-chat pacing and one Telegram-directed retry."""
+    for attempt in range(2):
+        since_last = time.monotonic() - USER_LAST_ALERT_SEND.get(user_id, 0)
+        if since_last < URGENT_PER_CHAT_INTERVAL:
+            await asyncio.sleep(URGENT_PER_CHAT_INTERVAL - since_last)
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode="HTML",
+                disable_web_page_preview=False,
+            )
+            USER_LAST_ALERT_SEND[user_id] = time.monotonic()
+            return True
+        except RetryAfter as exc:
+            if attempt == 0:
+                await asyncio.sleep(_retry_after_seconds(exc) + 0.1)
+                continue
+            log.warning("Urgent alert rate-limited after retry for %s", user_id)
+        except Forbidden:
+            # The user blocked the bot; stop retrying this unreachable chat.
+            ALERT_USERS.discard(user_id)
+            MUTED_USERS.discard(user_id)
+            log.info("Removed unreachable alert subscriber %s", user_id)
+        except TelegramError as exc:
+            log.warning(
+                "Urgent alert Telegram failure for %s: %s",
+                user_id, type(exc).__name__,
+            )
+        except Exception:
+            log.exception("Urgent alert send failed for %s", user_id)
+        return False
+    return False
+
+
+async def broadcast_urgent_alert(application, message):
+    """Broadcast below Telegram's free global ceiling with reply headroom."""
+    recipients = [
+        user_id for user_id in list(ALERT_USERS)
+        if user_id not in MUTED_USERS
+    ]
+    delivered = 0
+    for offset in range(0, len(recipients), URGENT_BROADCAST_BATCH_SIZE):
+        started = time.monotonic()
+        batch = recipients[offset:offset + URGENT_BROADCAST_BATCH_SIZE]
+        outcomes = await asyncio.gather(*(
+            _send_urgent_alert_to_user(application, user_id, message)
+            for user_id in batch
+        ))
+        delivered += sum(bool(outcome) for outcome in outcomes)
+        if offset + len(batch) < len(recipients):
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0, URGENT_BROADCAST_WINDOW - elapsed))
+    return delivered
 
 
 async def urgent_monitor(application):
@@ -1198,26 +1471,9 @@ async def urgent_monitor(application):
                 for item in alerts:
                     key = urgent_key(item)
                     message = await format_urgent_alert(item)
-                    delivered = False
+                    delivered = await broadcast_urgent_alert(application, message)
 
-                    for user_id in list(ALERT_USERS):
-                        if user_id in MUTED_USERS:
-                            continue
-                        try:
-                            await application.bot.send_message(
-                                chat_id=user_id,
-                                text=message,
-                                parse_mode="HTML",
-                                disable_web_page_preview=False,
-                            )
-                            delivered = True
-                        except Exception:
-                            log.exception(
-                                "Urgent alert send failed for %s",
-                                user_id,
-                            )
-
-                    if delivered:
+                    if delivered > 0:
                         SENT_URGENT_KEYS.append(key)
                         remember_urgent_event(item)
 
@@ -1232,24 +1488,84 @@ async def urgent_monitor(application):
         await asyncio.sleep(max(5, URGENT_MONITOR_INTERVAL - elapsed))
 
 
+async def hot_cache_monitor():
+    """Continuously warm collection and all topic pages without user traffic."""
+    log.info(
+        "Hot cache monitor started interval=%ds collection_timeout=%ds",
+        HOT_CACHE_REFRESH_SECONDS, NEWS_COLLECTION_TIMEOUT,
+    )
+    await asyncio.sleep(HOT_CACHE_INITIAL_DELAY)
+    while True:
+        started = time.monotonic()
+        try:
+            items = await collect_and_cache_news()
+            prepared = TOPIC_VIEW_CACHE.peek("topics") or {}
+            log.info(
+                "Hot cache ready news=%d topics=%s elapsed=%.2fs",
+                len(items),
+                ",".join(f"{key}:{len(prepared.get(key, []))}" for key in TOPICS),
+                time.monotonic() - started,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Hot cache refresh failed; keeping previous snapshots.")
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(15, HOT_CACHE_REFRESH_SECONDS - elapsed))
+
+
 async def post_init(application):
-    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK, HOT_CACHE_TASK
+    global USER_STATE_TASK, ONLINE_SEARCH_SEMAPHORE, ANALYSIS_SEMAPHORE
     if URGENT_MONITOR_STARTED:
         return
 
     URGENT_MONITOR_STARTED = True
+    ONLINE_SEARCH_SEMAPHORE = asyncio.Semaphore(ONLINE_SEARCH_CONCURRENCY)
+    ANALYSIS_SEMAPHORE = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
     await initialize_custom_emoji_pack(application)
     URGENT_MONITOR_TASK = asyncio.create_task(
         urgent_monitor(application),
         name="urgent-news-monitor",
     )
+    HOT_CACHE_TASK = asyncio.create_task(
+        hot_cache_monitor(),
+        name="hot-cache-monitor",
+    )
+
+    def report_hot_cache_exit(task):
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            log.error(
+                "Hot cache monitor stopped unexpectedly: %s",
+                type(error).__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    HOT_CACHE_TASK.add_done_callback(report_hot_cache_exit)
+    USER_STATE_TASK = asyncio.create_task(
+        user_state_maintenance(),
+        name="user-state-maintenance",
+    )
 
 
 async def post_stop(application):
-    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK, HOT_CACHE_TASK
+    global USER_STATE_TASK, ONLINE_SEARCH_SEMAPHORE, ANALYSIS_SEMAPHORE
 
     task = URGENT_MONITOR_TASK
     URGENT_MONITOR_TASK = None
+    hot_task = HOT_CACHE_TASK
+    HOT_CACHE_TASK = None
+    user_state_task = USER_STATE_TASK
+    USER_STATE_TASK = None
+    ONLINE_SEARCH_SEMAPHORE = None
+    ANALYSIS_SEMAPHORE = None
     URGENT_MONITOR_STARTED = False
 
     for bg_task in list(BACKGROUND_TASKS):
@@ -1260,6 +1576,18 @@ async def post_stop(application):
         task.cancel()
         try:
             await task
+        except asyncio.CancelledError:
+            pass
+    if hot_task and not hot_task.done():
+        hot_task.cancel()
+        try:
+            await hot_task
+        except asyncio.CancelledError:
+            pass
+    if user_state_task and not user_state_task.done():
+        user_state_task.cancel()
+        try:
+            await user_state_task
         except asyncio.CancelledError:
             pass
 
@@ -1345,20 +1673,24 @@ async def show_topic(query, user_id, key, page):
         # Later pages must use that same snapshot for stable, instant pagination.
         raw_results = []
         if page == 1:
-            cached = get_cached_news_view()
-            raw_results = await asyncio.to_thread(
-                topic_filter, cached, key, MAX_SEARCH_RESULTS
-            )
+            raw_results = get_cached_topic_view(key)
+            if not raw_results:
+                cached = get_cached_news_view()
+                raw_results = await asyncio.to_thread(
+                    topic_filter, cached, key, MAX_SEARCH_RESULTS
+                )
             results = _filter_unseen_topic_events(user_id, key, raw_results)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
         else:
             results = USER_TOPIC_RESULTS.get(snapshot_key, [])
             if not results:
-                cached = NEWS_CACHE.peek("all_news") or []
-                results = await asyncio.to_thread(
-                    topic_filter, cached, key, MAX_SEARCH_RESULTS
-                )
+                results = get_cached_topic_view(key)
+                if not results:
+                    cached = NEWS_CACHE.peek("all_news") or []
+                    results = await asyncio.to_thread(
+                        topic_filter, cached, key, MAX_SEARCH_RESULTS
+                    )
                 if results:
                     USER_TOPIC_RESULTS[snapshot_key] = list(results)
 
@@ -1465,13 +1797,23 @@ async def progressive_online_search(
     local_results,
 ):
     """Online discovery is additive and never blocks the first visible state."""
+    semaphore = ONLINE_SEARCH_SEMAPHORE
+    acquired = False
     try:
+        if semaphore is not None:
+            await asyncio.wait_for(
+                semaphore.acquire(), timeout=ONLINE_SEARCH_QUEUE_TIMEOUT
+            )
+            acquired = True
         online = await asyncio.wait_for(
             search_news_online(query_text, MAX_SEARCH_RESULTS),
             timeout=ONLINE_SEARCH_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        log.info("Online search timed out; keeping available results.")
+        log.info(
+            "%s; keeping available results.",
+            "Online search timed out" if acquired else "Online search capacity busy",
+        )
         if not local_results:
             try:
                 await status.edit_text(
@@ -1496,6 +1838,9 @@ async def progressive_online_search(
             except Exception:
                 pass
         return
+    finally:
+        if acquired:
+            semaphore.release()
 
     online = deduplicate_events(online or [], limit=MAX_SEARCH_RESULTS)
     local_keys = {urgent_key(item) for item in local_results}
@@ -1569,6 +1914,10 @@ async def button_handler(update, context):
     log.info("Callback received: %s", data)
 
     if not claim_callback(query, user_id, data):
+        # Every Telegram callback must be acknowledged, including a repeated
+        # tap that we intentionally do not execute twice. Otherwise the client
+        # keeps showing a spinner and the user experiences it as a stuck button.
+        await safe_query_answer(query)
         return
 
     if data == "toggle_alerts":
@@ -1680,40 +2029,13 @@ async def button_handler(update, context):
 
         await safe_query_answer(query, "🧠 جاري تجهيز التحليل...")
         status = await query.message.reply_text(
-            "🧠 جاري تحليل البيانات..."
+            "🧠 جاري تحليل البيانات...",
+            reply_markup=analysis_home_keyboard(),
         )
-
-        try:
-            items = NEWS_CACHE.peek("all_news") or []
-            if not items:
-                track_task(
-                    collect_and_cache_news(),
-                    f"analysis-cache-warm-{user_id}",
-                )
-                await status.edit_text(
-                    "🧠 لا توجد بيانات جاهزة للتحليل الآن.\n"
-                    "📡 جاري تحديث التغطية في الخلفية، ثم أعد المحاولة بعد قليل."
-                )
-                return
-
-            results = topic_filter(items, key, 8)
-            if not results:
-                await status.edit_text(
-                    "⚠️ لا توجد بيانات كافية للتحليل."
-                )
-                return
-
-            analysis = await analyze_with_gemini(results)
-            await status.edit_text(
-                "🧠 <b>التحليل التنفيذي</b>\n\n"
-                + safe_html(analysis),
-                parse_mode="HTML",
-            )
-        except Exception:
-            log.exception("Analysis failed.")
-            await status.edit_text(
-                "⚠️ حدث خطأ أثناء التحليل."
-            )
+        track_task(
+            complete_topic_analysis(status, key),
+            f"analysis-{user_id}-{key}",
+        )
         return
 
     if data.startswith("t:"):
@@ -1734,6 +2056,26 @@ async def button_handler(update, context):
         return
 
 
+async def concurrent_button_handler(update, context):
+    """Serialize one user's buttons while allowing different users in parallel."""
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user:
+        return
+
+    register_user(user.id)
+    lock = get_user_lock(user.id)
+    if lock.locked():
+        await safe_query_answer(
+            query,
+            "⏳ طلبك السابق قيد التنفيذ.",
+        )
+        return
+
+    async with lock:
+        await button_handler(update, context)
+
+
 async def handle_user_message(update, context):
     if not update.message:
         return
@@ -1745,7 +2087,7 @@ async def handle_user_message(update, context):
 
     user_id = user.id
     register_user(user_id)
-    lock = USER_LOCKS.setdefault(user_id, asyncio.Lock())
+    lock = get_user_lock(user_id)
 
     if lock.locked():
         await update.message.reply_text(
@@ -1833,6 +2175,9 @@ def main():
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .concurrent_updates(MAX_CONCURRENT_UPDATES)
+        .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+        .pool_timeout(TELEGRAM_POOL_TIMEOUT)
         .post_init(post_init)
         .post_stop(post_stop)
         .build()
@@ -1841,7 +2186,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(
         CallbackQueryHandler(
-            button_handler,
+            concurrent_button_handler,
             pattern=(
                 r"^(t:.*|s:\d+|home|refresh|more|"
                 r"toggle_alerts|analyze:.*)$"

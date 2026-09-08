@@ -179,8 +179,8 @@ SECURITY_TERMS = [
     "military","army","forces","defense","defence","security","weapons","weapon",
     "missile","missiles","airstrike","airstrike","strike","attack","fighting",
     "battle","battles","combat","drone","drones","ammunition","air defense",
-    "military operation","troops","navy","warship", "target", "targets",
-    "targeted", "targeting", "houthi", "houthis", "حوثي", "الحوثي",
+    "military operation","troops","navy","warship", "targeted", "targeting",
+    "houthi", "houthis", "حوثي", "الحوثي",
     "الحوثيون", "الحوثيين", "حرب",
     "war in", "war on", "war against", "conflict",
 ]
@@ -1100,6 +1100,8 @@ def _exclusive_topic_key(item):
 
     security = _security_signal(title, summary)
     economy = _economy_signal(title, summary)
+    security_title_hits = _security_term_score(normalized_title)
+    economy_title_hits = score_terms(normalized_title, ECON_TERMS)
 
     # Verified institution provenance outranks incidental vocabulary.  A
     # foreign-ministry meeting does not become an Economy story merely because
@@ -1115,6 +1117,15 @@ def _exclusive_topic_key(item):
             return "econ"
         if institution == "foreign_affairs":
             return "secu" if security else "forg"
+
+    # A clear headline owns the routing decision. Feed summaries sometimes
+    # contain navigation text or adjacent-story fragments; those fragments may
+    # help classify an otherwise neutral headline, but they must never move an
+    # explicitly financial headline to Security (or the reverse).
+    if economy_title_hits and not security_title_hits:
+        return "econ"
+    if security_title_hits and not economy_title_hits:
+        return "secu"
 
     if security and economy:
         security_score = (

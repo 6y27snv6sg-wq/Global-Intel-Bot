@@ -179,7 +179,9 @@ SECURITY_TERMS = [
     "military","army","forces","defense","defence","security","weapons","weapon",
     "missile","missiles","airstrike","airstrike","strike","attack","fighting",
     "battle","battles","combat","drone","drones","ammunition","air defense",
-    "military operation","troops","navy","warship", "حرب",
+    "military operation","troops","navy","warship", "target", "targets",
+    "targeted", "targeting", "houthi", "houthis", "حوثي", "الحوثي",
+    "الحوثيون", "الحوثيين", "حرب",
     "war in", "war on", "war against", "conflict",
 ]
 
@@ -1034,9 +1036,13 @@ ROUTINE_INSTITUTIONAL_PATTERNS = [
     r"\bfellowship (?:programme|program)\b",
     r"\byouth fellowship\b",
     r"\b(?:to celebrate|commemorates?|marks?) (?:the )?.{0,35}\banniversary\b",
+    r"\b(?:takes? (?:his|her|its|the) seat|assumes? office)\b",
+    r"\battend(?:ed|s|ing)? (?:the )?(?:opening|inauguration) (?:ceremony|of)\b",
     r"\bيعين مديرا ماليا جديدا\b",
     r"\bبرنامج زماله الشباب\b",
     r"\b(?:للاحتفال|يحتفل|سيحتفل|يحيي) .{0,35}\بالذكري\b",
+    r"\bيشغل مقعده\b",
+    r"\b(?:حضر|تحضر|يحضر|شارك|تشارك|يشارك) .{0,55}\bحفل افتتاح\b",
 ]
 
 SUBSTANTIVE_POLICY_TERMS = [
@@ -1065,6 +1071,17 @@ def _routine_institutional_noise(item, title, summary):
     return score_terms(text, SUBSTANTIVE_POLICY_TERMS) == 0
 
 
+def _verified_official_profile(item):
+    """Return original-publisher provenance used to route specialist desks."""
+    source_id = str(getattr(item, "official_source_id", "") or "")
+    profile = OFFICIAL_SOURCE_REGISTRY.get(source_id)
+    if not profile or not getattr(item, "publication_evidence", ""):
+        return None
+    if not _is_current_news(item) or not _domain_matches(item.domain, profile["domains"]):
+        return None
+    return profile
+
+
 def _exclusive_topic_key(item):
     """Assign exactly one specialist section, or None for general noise."""
     title, summary = _classification_text(item)
@@ -1083,6 +1100,22 @@ def _exclusive_topic_key(item):
 
     security = _security_signal(title, summary)
     economy = _economy_signal(title, summary)
+
+    # Verified institution provenance outranks incidental vocabulary.  A
+    # foreign-ministry meeting does not become an Economy story merely because
+    # exports or investment were discussed; likewise central-bank and defence
+    # releases belong to their specialist desks.  This rule is registry-driven
+    # and therefore applies uniformly to every configured country.
+    official_profile = _verified_official_profile(item)
+    if official_profile:
+        institution = official_profile.get("institution", "")
+        if institution in {"defence", "peace_security"}:
+            return "secu"
+        if institution in {"central_bank", "finance", "economy"}:
+            return "econ"
+        if institution == "foreign_affairs":
+            return "secu" if security else "forg"
+
     if security and economy:
         security_score = (
             _security_term_score(normalized_title) * 3

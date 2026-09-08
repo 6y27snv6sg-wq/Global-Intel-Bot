@@ -49,6 +49,8 @@ OFFICIAL_INTERACTIVE_MAX_LINKS_PER_INDEX = 6
 OFFICIAL_INTERACTIVE_BUDGET = 5.5
 OFFICIAL_COLLECTION_BUDGET = 12.0
 OFFICIAL_MAX_PAGE_BYTES = 900_000
+OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE = 3
+OFFICIAL_CACHE_ITEMS_PER_SOURCE = 20
 
 # Fast breaking-news lane: direct publisher feeds only.  This path is designed
 # for frequent lightweight polling and deliberately excludes Google discovery,
@@ -56,6 +58,8 @@ OFFICIAL_MAX_PAGE_BYTES = 900_000
 BREAKING_FEED_CONCURRENCY = 12
 
 _FEED_FAILURE_STATE = {}
+_OFFICIAL_PROFILE_ROUND = 0
+_OFFICIAL_RESULT_CACHE = {}
 # feedparser is pure-Python and can monopolize the GIL when many feeds parse at once.
 # Keep RSS parsing on a small dedicated pool so background collectors cannot starve
 # Telegram callbacks or the main asyncio loop.
@@ -63,7 +67,6 @@ _FEED_PARSE_EXECUTOR = ThreadPoolExecutor(
     max_workers=FEED_PARSE_WORKERS,
     thread_name_prefix="feed-parser",
 )
-_FEED_PARSE_SEMAPHORE = asyncio.Semaphore(FEED_PARSE_WORKERS)
 BREAKING_TRANSLATION_BUDGET = 1.2
 BREAKING_MAX_PER_FEED = 12
 
@@ -1500,7 +1503,64 @@ united_states|finance|الخزانة الأمريكية|https://home.treasury.go
 european_union|council|مجلس الاتحاد الأوروبي|https://www.consilium.europa.eu/en/press/press-releases/|/press/press-releases/|1
 european_union|central_bank|البنك المركزي الأوروبي|https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release|/press/pr/|1
 african_union|commission|مفوضية الاتحاد الأفريقي|https://au.int/en/press-releases|/pressreleases/|1
-african_union|peace_security|مجلس السلم والأمن الأفريقي|https://www.peaceau.org/en/|/article/|1"""
+african_union|peace_security|مجلس السلم والأمن الأفريقي|https://www.peaceau.org/en/|/article/|1
+argentina|government|الحكومة الأرجنتينية|https://www.argentina.gob.ar/noticias|/noticias/|0
+argentina|defence|الدفاع الأرجنتينية|https://www.argentina.gob.ar/defensa/noticias|/defensa/noticias/|1
+argentina|economy|الاقتصاد الأرجنتينية|https://www.argentina.gob.ar/economia/noticias|/economia/noticias/|1
+australia|government|رئاسة الوزراء الأسترالية|https://www.pm.gov.au/media|/media/|1
+australia|defence|الدفاع الأسترالية|https://www.defence.gov.au/news-events/releases|/news-events/releases/|1
+australia|finance|الخزانة الأسترالية|https://treasury.gov.au/media-release|/media-release/|1
+brazil|central_bank|البنك المركزي البرازيلي|https://www.bcb.gov.br/en/about/pressreleases|/pressreleases/|1
+brazil|defence|الدفاع البرازيلية|https://www.gov.br/defesa/pt-br/centrais-de-conteudo/noticias|/noticias/|1
+brazil|finance|المالية البرازيلية|https://www.gov.br/fazenda/pt-br/assuntos/noticias|/assuntos/noticias/|1
+canada|defence|الدفاع الكندية|https://www.canada.ca/en/department-national-defence/news.html|/department-national-defence/news/|1
+canada|finance|المالية الكندية|https://www.canada.ca/en/department-finance/news.html|/department-finance/news/|1
+china|central_bank|بنك الشعب الصيني|https://www.pbc.gov.cn/en/3688110/index.html|/en/|0
+china|defence|الدفاع الصينية|https://eng.mod.gov.cn/xb/News_213114/|/news_213114/|0
+china|finance|المالية الصينية|https://www.mof.gov.cn/en/News/|/en/news/|0
+france|defence|الدفاع الفرنسية|https://www.defense.gouv.fr/actualites|/actualites/|0
+france|finance|الاقتصاد والمالية الفرنسية|https://www.economie.gouv.fr/actualites|/actualites/|0
+germany|government|الحكومة الألمانية|https://www.bundesregierung.de/breg-en/news|/breg-en/news/|0
+germany|defence|الدفاع الألمانية|https://www.bmvg.de/en/news|/en/|0
+germany|finance|المالية الألمانية|https://www.bundesfinanzministerium.de/Content/EN/Standardartikel/Press_Room/Press-Releases/press-releases.html|/press-releases/|1
+india|government|رئاسة الوزراء الهندية|https://www.pmindia.gov.in/en/news_updates/|/news_updates/|1
+india|defence|الدفاع الهندية|https://www.pib.gov.in/AllRel.aspx?reg=3&lang=2|pressrelease|1
+india|finance|المالية الهندية|https://www.finmin.gov.in/news|/news/|0
+indonesia|government|الرئاسة الإندونيسية|https://www.presidenri.go.id/siaran-pers/|/siaran-pers/|1
+indonesia|defence|الدفاع الإندونيسية|https://www.kemhan.go.id/category/berita|/category/berita/|0
+indonesia|finance|المالية الإندونيسية|https://www.kemenkeu.go.id/informasi-publik/publikasi/berita-utama|/berita-utama/|0
+italy|government|الحكومة الإيطالية|https://www.governo.it/en/media|/en/|0
+italy|defence|الدفاع الإيطالية|https://www.difesa.it/eng/primo-piano/Pagine/default.aspx|/eng/primo-piano/|0
+italy|finance|الاقتصاد والمالية الإيطالية|https://www.mef.gov.it/en/ufficio-stampa/comunicati/|/ufficio-stampa/comunicati/|1
+japan|government|رئاسة الوزراء اليابانية|https://japan.kantei.go.jp/ongoingtopics/index.html|/ongoingtopics/|0
+japan|defence|الدفاع اليابانية|https://www.mod.go.jp/en/article/|/en/article/|0
+japan|finance|المالية اليابانية|https://www.mof.go.jp/english/policy/index.htm|/english/|0
+mexico|government|الرئاسة المكسيكية|https://www.gob.mx/presidencia/archivo/prensa|/presidencia/prensa/|1
+mexico|defence|الدفاع المكسيكية|https://www.gob.mx/defensa/archivo/prensa|/defensa/prensa/|1
+mexico|central_bank|بنك المكسيك|https://www.banxico.org.mx/publications-and-press/|/publications-and-press/|0
+russia|government|الحكومة الروسية|https://government.ru/en/news/|/en/news/|0
+russia|defence|الدفاع الروسية|https://eng.mil.ru/en/news_page/country.htm|/news_page/|0
+russia|finance|المالية الروسية|https://minfin.gov.ru/en/press-center/|/press-center/|0
+saudi_arabia|government|وكالة الأنباء السعودية|https://www.spa.gov.sa/en|/en/|0
+saudi_arabia|defence|الدفاع السعودية|https://www.mod.gov.sa/MediaCenter/Pages/default.aspx|/mediacenter/|0
+saudi_arabia|finance|المالية السعودية|https://www.mof.gov.sa/en/mediacenter/news/Pages/default.aspx|/mediacenter/news/|1
+south_africa|government|رئاسة جنوب أفريقيا|https://www.thepresidency.gov.za/press-statements|/press-statements/|1
+south_africa|defence|الدفاع الجنوب أفريقية|https://www.dod.mil.za/news|/news/|0
+south_africa|finance|الخزانة الجنوب أفريقية|https://www.treasury.gov.za/comm_media/press/|/comm_media/press/|1
+south_korea|government|رئاسة كوريا الجنوبية|https://www.president.go.kr/newsroom/|/newsroom/|0
+south_korea|defence|الدفاع الكورية الجنوبية|https://www.mnd.go.kr/mbshome/mbs/mndEN/subview.jsp?id=mndEN_020100000000|/mnden/|0
+south_korea|finance|الاقتصاد والمالية الكورية|https://english.mofe.go.kr/pc/selectTbPressCenterList.do?boardCd=N0001|/pc/|1
+turkey|government|الرئاسة التركية|https://www.tccb.gov.tr/en/news/542/|/en/news/|0
+turkey|defence|الدفاع التركية|https://www.msb.gov.tr/SlaytHaber/|/slaythaber/|0
+turkey|finance|الخزانة والمالية التركية|https://www.hmb.gov.tr/haberler|/haberler/|0
+united_kingdom|government|رئاسة الوزراء البريطانية|https://www.gov.uk/government/organisations/prime-ministers-office-10-downing-street|/government/news/;/government/speeches/|1
+united_kingdom|finance|الخزانة البريطانية|https://www.gov.uk/government/organisations/hm-treasury|/government/news/;/government/publications/|1
+united_states|government|البيت الأبيض|https://www.whitehouse.gov/briefing-room/|/briefing-room/|1
+united_states|defence|الدفاع الأمريكية|https://www.defense.gov/News/Releases/|/news/releases/|1
+european_union|commission|المفوضية الأوروبية|https://ec.europa.eu/commission/presscorner/home/en|/commission/presscorner/|1
+european_union|foreign_affairs|جهاز العمل الخارجي الأوروبي|https://www.eeas.europa.eu/eeas/press-material_en|/eeas/|1
+european_union|defence|وكالة الدفاع الأوروبية|https://eda.europa.eu/news-and-events/news|/news-and-events/news/|0
+african_union|official_agency|وكالة نيباد للتنمية|https://www.nepad.org/news|/news/|0"""
 OFFICIAL_SOURCE_REGISTRY = {}
 for _row in _OFFICIAL_PUBLIC_SOURCES.splitlines():
     _member, _institution, _name, _url, _paths, _dedicated = _row.split("|")
@@ -2153,16 +2213,52 @@ def official_source_coverage():
             for member in sorted(G20_MEMBERS)}
 
 
-def _official_collection_profiles(country_id=None):
+_OFFICIAL_INSTITUTION_PRIORITY = {
+    "government": 0,
+    "foreign_affairs": 1,
+    "defence": 2,
+    "finance": 3,
+    "economy": 3,
+    "central_bank": 4,
+    "council": 5,
+    "commission": 5,
+    "peace_security": 5,
+    "official_agency": 6,
+}
+
+
+def _official_collection_profiles(country_id=None, per_member=None, round_index=0):
+    """Return a fair institution rotation without giving any G20 member priority."""
     by_member = {}
     for profile in OFFICIAL_SOURCE_REGISTRY.values():
         member = profile["member_id"]
         if country_id is None or member == country_id:
             by_member.setdefault(member, []).append(profile)
+    for profiles in by_member.values():
+        profiles.sort(key=lambda profile: (
+            _OFFICIAL_INSTITUTION_PRIORITY.get(profile["institution"], 99),
+            profile["source_id"],
+        ))
+
     members = sorted(by_member)
     if members:
         offset = int(time.time() // ROTATION_WINDOW_SECONDS) % len(members)
         members = members[offset:] + members[:offset]
+
+    if per_member is not None:
+        selected = {}
+        cap = max(1, int(per_member))
+        for member, profiles in by_member.items():
+            if len(profiles) <= cap:
+                selected[member] = profiles
+                continue
+            start = (max(0, int(round_index)) * cap) % len(profiles)
+            selected[member] = [
+                profiles[(start + index) % len(profiles)]
+                for index in range(cap)
+            ]
+        by_member = selected
+
     # One source per member per round, rather than exhausting one member first.
     return [by_member[m][i] for i in range(max((len(v) for v in by_member.values()), default=0))
             for m in members if i < len(by_member[m])]
@@ -2203,11 +2299,62 @@ async def _collect_official_profiles(profiles, budget, max_links):
 
 
 async def collect_official_publisher_news():
-    profiles = _official_collection_profiles()
+    global _OFFICIAL_PROFILE_ROUND
+
+    round_index = _OFFICIAL_PROFILE_ROUND
+    _OFFICIAL_PROFILE_ROUND += 1
+    profiles = _official_collection_profiles(
+        per_member=OFFICIAL_SOURCES_PER_MEMBER_PER_CYCLE,
+        round_index=round_index,
+    )
     coverage = official_source_coverage()
-    log.info("Official registry g20_covered=%d g20_total=%d sources=%d",
-             sum(bool(n) for n in coverage.values()), len(coverage), len(profiles))
-    return await _collect_official_profiles(profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS)
+    log.info(
+        "Official registry g20_covered=%d g20_total=%d sources=%d polled=%d round=%d",
+        sum(bool(n) for n in coverage.values()), len(coverage),
+        len(OFFICIAL_SOURCE_REGISTRY), len(profiles), round_index,
+    )
+    fresh = await _collect_official_profiles(
+        profiles, OFFICIAL_COLLECTION_BUDGET, OFFICIAL_INDEX_MAX_LINKS
+    )
+
+    # Preserve verified results from earlier institution rotations. This gives
+    # the UI broad ministry coverage without launching the full registry at once.
+    fresh_by_source = {}
+    for item in fresh:
+        source_id = getattr(item, "official_source_id", "")
+        if source_id:
+            fresh_by_source.setdefault(source_id, []).append(item)
+    for source_id, new_items in fresh_by_source.items():
+        combined = list(new_items) + list(_OFFICIAL_RESULT_CACHE.get(source_id, ()))
+        by_url = {}
+        for item in combined:
+            if not _is_current_news(item):
+                continue
+            key = item.url.split("#", 1)[0]
+            if key and key not in by_url:
+                by_url[key] = item
+        _OFFICIAL_RESULT_CACHE[source_id] = sorted(
+            by_url.values(), key=lambda item: item.published, reverse=True
+        )[:OFFICIAL_CACHE_ITEMS_PER_SOURCE]
+
+    merged = {}
+    for source_id, cached_items in list(_OFFICIAL_RESULT_CACHE.items()):
+        current = [item for item in cached_items if _is_current_news(item)]
+        if current:
+            _OFFICIAL_RESULT_CACHE[source_id] = current
+            for item in current:
+                merged.setdefault(item.url.split("#", 1)[0], item)
+        else:
+            _OFFICIAL_RESULT_CACHE.pop(source_id, None)
+    for item in fresh:
+        merged.setdefault(item.url.split("#", 1)[0], item)
+
+    result = sorted(merged.values(), key=lambda item: item.published, reverse=True)
+    log.info(
+        "Official rolling cache sources=%d accepted=%d",
+        len(_OFFICIAL_RESULT_CACHE), len(result),
+    )
+    return result
 
 
 async def collect_official_institution_news(country_id):
@@ -2841,11 +2988,10 @@ async def fetch_feed(session, source, url):
         # even the Home button appear frozen for ~20 seconds.  A tiny dedicated
         # pool isolates parser CPU from Telegram's event loop.
         async with asyncio.timeout(FEED_PARSE_TIMEOUT):
-            async with _FEED_PARSE_SEMAPHORE:
-                loop = asyncio.get_running_loop()
-                parsed = await loop.run_in_executor(
-                    _FEED_PARSE_EXECUTOR, feedparser.parse, data
-                )
+            loop = asyncio.get_running_loop()
+            parsed = await loop.run_in_executor(
+                _FEED_PARSE_EXECUTOR, feedparser.parse, data
+            )
         items = []
         for entry in parsed.entries[:MAX_FEED_ITEMS]:
             item = parse_entry(entry, source)

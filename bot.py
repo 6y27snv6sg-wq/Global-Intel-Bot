@@ -79,6 +79,8 @@ GEMINI_TIMEOUT = 35
 MAX_SEARCH_RESULTS = 25
 PER_PAGE = 5
 CACHE_TTL = 300
+HOT_CACHE_REFRESH_SECONDS = 150
+HOT_CACHE_INITIAL_DELAY = 2
 
 URGENT_MONITOR_INTERVAL = 30
 URGENT_INITIAL_DELAY = 8
@@ -132,6 +134,7 @@ class SimpleCache:
 NEWS_CACHE = SimpleCache(CACHE_TTL)
 BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
 NEWS_VIEW_CACHE = SimpleCache(CACHE_TTL)
+TOPIC_VIEW_CACHE = SimpleCache(max(CACHE_TTL, HOT_CACHE_REFRESH_SECONDS * 2))
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
@@ -147,6 +150,7 @@ CUSTOM_EMOJI_IDS = {}
 URGENT_MONITOR_STARTED = False
 URGENT_BASELINE_READY = False
 URGENT_MONITOR_TASK = None
+HOT_CACHE_TASK = None
 BACKGROUND_TASKS: Set[asyncio.Task] = set()
 NEWS_COLLECTION_TASK = None
 SEEN_CALLBACK_IDS: Dict[str, float] = {}
@@ -405,7 +409,8 @@ async def _run_news_collection():
             # second all-pairs dedup here previously consumed another 10-17s.
             items = list(items[:150])
             NEWS_CACHE.set("all_news", items)
-            _refresh_news_view_cache()
+            view = _refresh_news_view_cache()
+            await _refresh_topic_view_cache(view)
             return items
     except asyncio.TimeoutError:
         log.warning("News collection timed out; keeping last available cache.")
@@ -524,6 +529,38 @@ def topic_filter(items, topic_key, max_results=25):
     if topic_key == "urg":
         return deduplicate_urgent_events(ranked, limit=max_results)
     return deduplicate_events(ranked, limit=max_results)
+
+
+def _build_topic_views(items):
+    """Build every section once so button callbacks only read prepared lists."""
+    return {
+        key: topic_filter(items, key, MAX_SEARCH_RESULTS)
+        for key in TOPICS
+    }
+
+
+async def _refresh_topic_view_cache(items=None):
+    view = list(items if items is not None else get_cached_news_view())
+    prepared = await asyncio.to_thread(_build_topic_views, view)
+    TOPIC_VIEW_CACHE.set("topics", prepared)
+    return prepared
+
+
+async def _refresh_urgent_topic_view(items=None):
+    """Refresh only the rapidly changing urgent page between full warm cycles."""
+    view = list(items if items is not None else get_cached_news_view())
+    urgent = await asyncio.to_thread(
+        topic_filter, view, "urg", MAX_SEARCH_RESULTS
+    )
+    prepared = dict(TOPIC_VIEW_CACHE.peek("topics") or {})
+    prepared["urg"] = urgent
+    TOPIC_VIEW_CACHE.set("topics", prepared)
+    return urgent
+
+
+def get_cached_topic_view(topic_key):
+    prepared = TOPIC_VIEW_CACHE.peek("topics") or {}
+    return list(prepared.get(topic_key, []))
 
 
 def generate_base_report(
@@ -685,6 +722,49 @@ async def analyze_with_gemini(items):
     except Exception:
         log.exception("Gemini analysis failed.")
         return "⚠️ تعذر التحليل بالذكاء الاصطناعي حالياً."
+
+
+def analysis_home_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏠 مركز الأخبار", callback_data="home")
+    ]])
+
+
+async def complete_topic_analysis(status, key):
+    """Finish analysis in background so navigation callbacks stay available."""
+    try:
+        results = get_cached_topic_view(key)[:8]
+        if not results:
+            cached = NEWS_CACHE.peek("all_news") or []
+            if not cached:
+                await collect_and_cache_news()
+                cached = NEWS_CACHE.peek("all_news") or []
+            results = await asyncio.to_thread(topic_filter, cached, key, 8)
+
+        if not results:
+            await status.edit_text(
+                "⚠️ لا توجد بيانات كافية للتحليل.",
+                reply_markup=analysis_home_keyboard(),
+            )
+            return
+
+        analysis = await analyze_with_gemini(results)
+        await status.edit_text(
+            "🧠 <b>التحليل التنفيذي</b>\n\n" + safe_html(analysis),
+            parse_mode="HTML",
+            reply_markup=analysis_home_keyboard(),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Analysis failed.")
+        try:
+            await status.edit_text(
+                "⚠️ حدث خطأ أثناء التحليل.",
+                reply_markup=analysis_home_keyboard(),
+            )
+        except Exception:
+            pass
 
 
 URGENT_STRONG_TERMS = {
@@ -1159,7 +1239,8 @@ async def _merge_breaking_into_cache(items):
         deduplicate_urgent_events, list(items) + list(cached), 80
     )
     BREAKING_CACHE.set("breaking_news", merged)
-    _refresh_news_view_cache()
+    view = _refresh_news_view_cache()
+    await _refresh_urgent_topic_view(view)
 
 
 async def initialize_urgent_baseline():
@@ -1242,8 +1323,30 @@ async def urgent_monitor(application):
         await asyncio.sleep(max(5, URGENT_MONITOR_INTERVAL - elapsed))
 
 
+async def hot_cache_monitor():
+    """Continuously warm collection and all topic pages without user traffic."""
+    await asyncio.sleep(HOT_CACHE_INITIAL_DELAY)
+    while True:
+        started = time.monotonic()
+        try:
+            items = await collect_and_cache_news()
+            prepared = TOPIC_VIEW_CACHE.peek("topics") or {}
+            log.info(
+                "Hot cache ready news=%d topics=%s elapsed=%.2fs",
+                len(items),
+                ",".join(f"{key}:{len(prepared.get(key, []))}" for key in TOPICS),
+                time.monotonic() - started,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Hot cache refresh failed; keeping previous snapshots.")
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(15, HOT_CACHE_REFRESH_SECONDS - elapsed))
+
+
 async def post_init(application):
-    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK, HOT_CACHE_TASK
     if URGENT_MONITOR_STARTED:
         return
 
@@ -1253,13 +1356,19 @@ async def post_init(application):
         urgent_monitor(application),
         name="urgent-news-monitor",
     )
+    HOT_CACHE_TASK = asyncio.create_task(
+        hot_cache_monitor(),
+        name="hot-cache-monitor",
+    )
 
 
 async def post_stop(application):
-    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK, HOT_CACHE_TASK
 
     task = URGENT_MONITOR_TASK
     URGENT_MONITOR_TASK = None
+    hot_task = HOT_CACHE_TASK
+    HOT_CACHE_TASK = None
     URGENT_MONITOR_STARTED = False
 
     for bg_task in list(BACKGROUND_TASKS):
@@ -1270,6 +1379,12 @@ async def post_stop(application):
         task.cancel()
         try:
             await task
+        except asyncio.CancelledError:
+            pass
+    if hot_task and not hot_task.done():
+        hot_task.cancel()
+        try:
+            await hot_task
         except asyncio.CancelledError:
             pass
 
@@ -1355,20 +1470,24 @@ async def show_topic(query, user_id, key, page):
         # Later pages must use that same snapshot for stable, instant pagination.
         raw_results = []
         if page == 1:
-            cached = get_cached_news_view()
-            raw_results = await asyncio.to_thread(
-                topic_filter, cached, key, MAX_SEARCH_RESULTS
-            )
+            raw_results = get_cached_topic_view(key)
+            if not raw_results:
+                cached = get_cached_news_view()
+                raw_results = await asyncio.to_thread(
+                    topic_filter, cached, key, MAX_SEARCH_RESULTS
+                )
             results = _filter_unseen_topic_events(user_id, key, raw_results)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
         else:
             results = USER_TOPIC_RESULTS.get(snapshot_key, [])
             if not results:
-                cached = NEWS_CACHE.peek("all_news") or []
-                results = await asyncio.to_thread(
-                    topic_filter, cached, key, MAX_SEARCH_RESULTS
-                )
+                results = get_cached_topic_view(key)
+                if not results:
+                    cached = NEWS_CACHE.peek("all_news") or []
+                    results = await asyncio.to_thread(
+                        topic_filter, cached, key, MAX_SEARCH_RESULTS
+                    )
                 if results:
                     USER_TOPIC_RESULTS[snapshot_key] = list(results)
 
@@ -1694,40 +1813,13 @@ async def button_handler(update, context):
 
         await safe_query_answer(query, "🧠 جاري تجهيز التحليل...")
         status = await query.message.reply_text(
-            "🧠 جاري تحليل البيانات..."
+            "🧠 جاري تحليل البيانات...",
+            reply_markup=analysis_home_keyboard(),
         )
-
-        try:
-            items = NEWS_CACHE.peek("all_news") or []
-            if not items:
-                track_task(
-                    collect_and_cache_news(),
-                    f"analysis-cache-warm-{user_id}",
-                )
-                await status.edit_text(
-                    "🧠 لا توجد بيانات جاهزة للتحليل الآن.\n"
-                    "📡 جاري تحديث التغطية في الخلفية، ثم أعد المحاولة بعد قليل."
-                )
-                return
-
-            results = topic_filter(items, key, 8)
-            if not results:
-                await status.edit_text(
-                    "⚠️ لا توجد بيانات كافية للتحليل."
-                )
-                return
-
-            analysis = await analyze_with_gemini(results)
-            await status.edit_text(
-                "🧠 <b>التحليل التنفيذي</b>\n\n"
-                + safe_html(analysis),
-                parse_mode="HTML",
-            )
-        except Exception:
-            log.exception("Analysis failed.")
-            await status.edit_text(
-                "⚠️ حدث خطأ أثناء التحليل."
-            )
+        track_task(
+            complete_topic_analysis(status, key),
+            f"analysis-{user_id}-{key}",
+        )
         return
 
     if data.startswith("t:"):

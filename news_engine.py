@@ -145,7 +145,11 @@ ECON_TERMS = [
     "economic","markets","market","stocks","equities","stock exchange",
     "inflation","interest rates","gold","dollar","usd","bitcoin","crypto",
     "investment","bonds","budget","gdp","central bank","exports","imports",
-    "earnings","acquisition",
+    "earnings","acquisition", "reserve bank", "monetary policy",
+    "liquidity adjustment facility", "liquidity facility", "reverse repo",
+    "repo rate", "open market operation",
+    "بنك احتياطي", "سياسة نقدية", "تسهيلات السيولة", "إعادة الشراء",
+    "عمليات السوق المفتوحة",
 ]
 
 ECON_EXCLUDE = [
@@ -300,6 +304,18 @@ def _needs_arabic_translation(title: str) -> bool:
     return latin >= 3 and latin > arabic
 
 
+def _translation_input(title: str) -> str:
+    """Remove redundant parenthesized acronyms before machine translation.
+
+    Publisher headlines commonly spell out a term and then append an acronym,
+    e.g. ``Liquidity Adjustment Facility (LAF)``. Translators may reinterpret
+    that acronym as an unrelated organization. The full phrase is retained, so
+    stripping only the parenthesized acronym loses no headline meaning.
+    """
+    text = str(title or "").strip()
+    return re.sub(r"(?<=\w)\s*\([A-Z][A-Z0-9&.-]{1,9}\)", "", text).strip()
+
+
 async def translate_title_to_arabic(session, title: str) -> str:
     title = (title or "").strip()
     if not _needs_arabic_translation(title):
@@ -315,7 +331,7 @@ async def translate_title_to_arabic(session, title: str) -> str:
         "sl": "auto",
         "tl": "ar",
         "dt": "t",
-        "q": title,
+        "q": _translation_input(title),
     }
 
     for attempt in range(1):
@@ -894,91 +910,125 @@ def _direct_official_statement(item):
                 and _official_signal(item.original_title or item.title, item.summary, item))
 
 
+URGENT_SECTION_TERMS = [
+    "عاجل", "خبر عاجل", "تحذير عاجل", "حالة طوارئ", "إخلاء فوري",
+    "breaking", "breaking news", "urgent", "state of emergency",
+    "emergency declared", "immediate evacuation",
+    "زلزال", "earthquake", "تسونامي", "tsunami",
+]
+
+ROUTINE_INSTITUTIONAL_PATTERNS = [
+    # Internal staffing, fellowships and ceremonial publicity. Central-bank
+    # market operations are not noise: they belong exclusively to Economy.
+    r"\bappoints? (?:a )?new (?:chief financial officer|finance director)\b",
+    r"\bnational armaments director appoints\b",
+    r"\bfellowship (?:programme|program)\b",
+    r"\byouth fellowship\b",
+    r"\b(?:to celebrate|commemorates?|marks?) (?:the )?.{0,35}\banniversary\b",
+    r"\bيعين مديرا ماليا جديدا\b",
+    r"\bبرنامج زماله الشباب\b",
+    r"\b(?:للاحتفال|يحتفل|سيحتفل|يحيي) .{0,35}\بالذكري\b",
+]
+
+SUBSTANTIVE_POLICY_TERMS = [
+    "strategy", "policy", "decision", "interest rate", "rate decision",
+    "sanctions", "agreement", "treaty", "ceasefire", "legislation",
+    "budget", "security", "defence", "defense", "military", "emergency",
+    "استراتيجية", "سياسة", "قرار", "سعر الفائدة", "عقوبات", "اتفاق",
+    "معاهدة", "وقف إطلاق النار", "تشريع", "ميزانية", "أمن", "دفاع",
+    "عسكري", "طوارئ",
+]
+
+
+def _classification_text(item):
+    """Use trustworthy pre-translation text for every section decision."""
+    original = str(getattr(item, "original_title", "") or "").strip()
+    title = original or str(getattr(item, "title", "") or "").strip()
+    summary = str(getattr(item, "summary", "") or "").strip()
+    return title, summary
+
+
+def _routine_institutional_noise(item, title, summary):
+    """Reject routine publisher notices while retaining substantive policy."""
+    text = normalize_text(f"{title} {summary}")
+    if not any(re.search(pattern, text, re.I) for pattern in ROUTINE_INSTITUTIONAL_PATTERNS):
+        return False
+    return score_terms(text, SUBSTANTIVE_POLICY_TERMS) == 0
+
+
+def _exclusive_topic_key(item):
+    """Assign exactly one specialist section, or None for general noise."""
+    title, summary = _classification_text(item)
+    if not title or _is_digest(title) or _hard_low_value(item):
+        return None
+    if _routine_institutional_noise(item, title, summary):
+        return None
+
+    normalized_title = normalize_text(title)
+    normalized_summary = normalize_text(summary)
+
+    # Keep urgent deliberately narrow. Ordinary attack/missile coverage stays
+    # on the security desk unless it explicitly signals a live emergency.
+    if (score_terms(normalized_title, URGENT_SECTION_TERMS) >= 1
+            or score_terms(normalized_summary, URGENT_SECTION_TERMS) >= 2):
+        return "urg"
+
+    security = _security_signal(title, summary)
+    economy = _economy_signal(title, summary)
+    if security and economy:
+        security_score = (
+            score_terms(normalized_title, SECURITY_TERMS) * 3
+            + score_terms(normalized_summary, SECURITY_TERMS)
+        )
+        economy_score = (
+            score_terms(normalized_title, ECON_TERMS) * 3
+            + score_terms(normalized_summary, ECON_TERMS)
+        )
+        if score_terms(normalized_title, SECURITY_SOCIAL_EXCLUDE):
+            security_score -= 12
+        if score_terms(f"{normalized_title} {normalized_summary}", ECON_EXCLUDE):
+            economy_score -= 5
+        return "secu" if security_score >= economy_score else "econ"
+    if security:
+        return "secu"
+    if economy:
+        return "econ"
+
+    # Official is a provenance desk for releases that do not belong to a more
+    # specific specialist desk. Thus defence releases go only to Security and
+    # central-bank releases go only to Economy, while diplomatic/government
+    # statements remain here.
+    if _direct_official_statement(item):
+        return "forg"
+
+    # Regional/world desks are fallbacks after the specialist desks.
+    # Recompute geography from the same original evidence. ``item.region`` may
+    # have been inferred from a later display translation and is not evidence.
+    region = detect_region(f"{title} {summary}")
+    if region == "الشرق الأوسط":
+        return "gulf"
+    if region:
+        return "wrld"
+
+    world_markers = [
+        "الأمم المتحدة", "الاتحاد الأوروبي", "الاتحاد الأفريقي", "الناتو",
+        "united nations", "european union", "african union", "nato",
+        "دولي", "عالمي", "international", "global",
+    ]
+    if score_terms(f"{normalized_title} {normalized_summary}", world_markers):
+        return "wrld"
+    return None
+
+
 def classify_item(item):
-    title = normalize_text(item.title)
-    summary = normalize_text(item.summary)
-    text = f"{title} {summary}"
-
-    if _is_digest(item.title):
-        item.category = "general"
-        return item
-
-    econ = (score_terms(title, ECON_TERMS) * 3
-            + score_terms(summary, ECON_TERMS))
-    if score_terms(text, ECON_EXCLUDE):
-        econ -= 5
-
-    sec = (score_terms(title, SECURITY_TERMS) * 3
-           + score_terms(summary, SECURITY_TERMS))
-    if score_terms(title, SECURITY_SOCIAL_EXCLUDE):
-        sec -= 12
-
-    official = (score_terms(title, OFFICIAL_TERMS) * 3
-                + score_terms(summary, OFFICIAL_TERMS))
-    if item.official:
-        official += 2
-
-    urgent = (score_terms(title, URGENT_TERMS) * 2
-              + score_terms(summary, URGENT_TERMS))
-
-    # Explicit category assignment. Security/social and official stories
-    # must not be promoted to economy merely because they mention oil/energy.
-    if _security_signal(title, summary) and sec >= max(econ, official, 4):
-        item.category = "secu"
-    elif _official_signal(title, summary, item) and official >= max(econ, sec, 4):
-        item.category = "forg"
-    elif _economy_signal(title, summary) and econ >= max(sec, official, 4):
-        item.category = "econ"
-    elif urgent >= 4:
-        item.category = "urg"
-    else:
-        item.category = "general"
-
+    item.category = _exclusive_topic_key(item) or "general"
     return item
 
+
 def is_topic_match(item, topic_key):
-    title = item.title or ""
-    summary = item.summary or ""
-
-    # This is intentionally the first gate for every section.
-    # Generic digest articles can never enter any section.
-    if _is_digest(title):
+    if topic_key not in {"econ", "forg", "urg", "gulf", "wrld", "secu"}:
         return False
-
-    if topic_key == "econ":
-        # Section classification uses title/summary only.
-        # It NEVER uses source/search_text.
-        return _economy_signal(title, summary) and not (
-            _security_signal(title, summary)
-            and score_terms(normalize_text(title), SECURITY_TERMS) >= 1
-            and score_terms(normalize_text(title), ECON_TERMS) <= 1
-        )
-
-    if topic_key == "secu":
-        return _security_signal(title, summary)
-
-    if topic_key == "forg":
-        return _direct_official_statement(item)
-
-    if topic_key == "urg":
-        return (
-            score_terms(title, URGENT_TERMS) >= 1
-            or score_terms(summary, URGENT_TERMS) >= 2
-        )
-
-    if topic_key == "gulf":
-        text = normalize_text(f"{title} {summary}")
-        gulf = REGIONS["الشرق الأوسط"]
-        return any(normalize_text(x) in text for x in gulf)
-
-    if topic_key == "wrld":
-        text = normalize_text(f"{title} {summary}")
-        return bool(item.region) or any(
-            normalize_text(x) in text
-            for x in ["امريكا","الولايات المتحده","اوروبا","الصين","روسيا","اوكرانيا","الهند","اليابان"]
-        )
-
-    return False
+    return _exclusive_topic_key(item) == topic_key
 
 def deduplicate_news(items):
     """Global event-level deduplication with source preservation.

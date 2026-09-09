@@ -6,12 +6,13 @@ import logging
 import os
 import re
 import time
+import json
+from pathlib import Path
 import urllib.parse
 from collections import deque
 from typing import Any, Dict, List, Set
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -62,18 +63,124 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("pro_news_bot")
-# httpx includes the full Telegram bot URL at INFO level. Besides producing a
-# large amount of I/O during callbacks, that URL contains the bot credential.
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
-# Full collection runs in an isolated worker thread. A wider background budget
-# improves slow official-source coverage without delaying Telegram callbacks,
-# which always read the last prepared snapshot immediately.
-NEWS_COLLECTION_TIMEOUT = 40
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+# The owner ID is deliberately fixed to the bot founder's Telegram numeric ID.
+# It can still be overridden with OWNER_TELEGRAM_ID in Railway if ever needed.
+OWNER_ID = int(os.getenv("OWNER_TELEGRAM_ID", "375794122"))
+ACCESS_STATE_PATH = Path(
+    os.getenv("ACCESS_STATE_PATH", "/data/telegram_access.json")
+)
+
+# Dynamic roles. The owner is never stored as an admin and cannot be removed.
+ADMINS: Set[int] = set()
+APPROVED_USERS: Set[int] = {OWNER_ID}
+BLOCKED_USERS: Set[int] = set()
+PENDING_USERS: Dict[int, Dict[str, Any]] = {}
+
+
+def _safe_user_record(user):
+    return {
+        "id": int(user.id),
+        "username": (user.username or "").strip(),
+        "first_name": (user.first_name or "").strip(),
+        "last_name": (user.last_name or "").strip(),
+        "requested_at": int(time.time()),
+    }
+
+
+def load_access_state():
+    """Load access state. Missing/corrupt storage fails closed: owner only."""
+    global ADMINS, APPROVED_USERS, BLOCKED_USERS, PENDING_USERS
+    ADMINS = set()
+    APPROVED_USERS = {OWNER_ID}
+    BLOCKED_USERS = set()
+    PENDING_USERS = {}
+    try:
+        if not ACCESS_STATE_PATH.exists():
+            return
+        raw = json.loads(ACCESS_STATE_PATH.read_text(encoding="utf-8"))
+        ADMINS = {int(x) for x in raw.get("admins", []) if int(x) != OWNER_ID}
+        APPROVED_USERS = {int(x) for x in raw.get("approved_users", [])}
+        APPROVED_USERS.add(OWNER_ID)
+        BLOCKED_USERS = {int(x) for x in raw.get("blocked_users", []) if int(x) != OWNER_ID}
+        pending = raw.get("pending_users", {}) or {}
+        PENDING_USERS = {int(k): dict(v or {}) for k, v in pending.items()}
+
+        # Role precedence: owner > admin > approved > pending > blocked.
+        # Blocked accounts must never remain active in another role.
+        ADMINS.difference_update(BLOCKED_USERS)
+        APPROVED_USERS.difference_update(BLOCKED_USERS)
+        APPROVED_USERS.add(OWNER_ID)
+        for uid in list(PENDING_USERS):
+            if uid == OWNER_ID or uid in ADMINS or uid in APPROVED_USERS or uid in BLOCKED_USERS:
+                PENDING_USERS.pop(uid, None)
+    except Exception:
+        log.exception("Access state could not be loaded; failing closed to owner-only mode.")
+        ADMINS = set()
+        APPROVED_USERS = {OWNER_ID}
+        BLOCKED_USERS = set()
+        PENDING_USERS = {}
+
+
+def save_access_state():
+    """Persist access state atomically when the configured path is writable."""
+    payload = {
+        "admins": sorted(ADMINS),
+        "approved_users": sorted(APPROVED_USERS | {OWNER_ID}),
+        "blocked_users": sorted(BLOCKED_USERS),
+        "pending_users": {str(k): v for k, v in PENDING_USERS.items()},
+    }
+    try:
+        ACCESS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ACCESS_STATE_PATH.with_suffix(ACCESS_STATE_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(ACCESS_STATE_PATH)
+    except Exception:
+        log.exception(
+            "Access state could not be saved at %s. Configure a persistent Railway Volume or ACCESS_STATE_PATH.",
+            ACCESS_STATE_PATH,
+        )
+
+
+def is_owner(user_id):
+    return int(user_id) == OWNER_ID
+
+
+def is_admin(user_id):
+    uid = int(user_id)
+    return uid == OWNER_ID or uid in ADMINS
+
+
+def is_authorized(user_id):
+    uid = int(user_id)
+    return uid == OWNER_ID or uid in ADMINS or uid in APPROVED_USERS
+
+
+def access_role(user_id):
+    uid = int(user_id)
+    if uid == OWNER_ID:
+        return "owner"
+    if uid in BLOCKED_USERS:
+        return "blocked"
+    if uid in ADMINS:
+        return "admin"
+    if uid in APPROVED_USERS:
+        return "user"
+    if uid in PENDING_USERS:
+        return "pending"
+    return "guest"
+
+
+load_access_state()
+
+NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
 CALLBACK_ACK_TIMEOUT = 1.5
 CALLBACK_DEDUP_TTL = 60
@@ -82,9 +189,7 @@ GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
 PER_PAGE = 5
-CACHE_TTL = 600
-HOT_CACHE_REFRESH_SECONDS = 120
-HOT_CACHE_INITIAL_DELAY = 2
+CACHE_TTL = 300
 
 URGENT_MONITOR_INTERVAL = 30
 URGENT_INITIAL_DELAY = 8
@@ -92,29 +197,6 @@ BREAKING_LANE_TIMEOUT = 8
 MAX_SENT_URGENT_KEYS = 500
 MAX_RECENT_URGENT_EVENTS = 300
 RECENT_URGENT_EVENT_TTL = 12 * 3600
-
-# Bounded multi-user capacity. Different users may run concurrently, while a
-# per-user lock below preserves the stable single-user interaction semantics.
-MAX_CONCURRENT_UPDATES = 16
-TELEGRAM_CONNECTION_POOL_SIZE = 32
-TELEGRAM_POOL_TIMEOUT = 10
-ONLINE_SEARCH_CONCURRENCY = 8
-ONLINE_SEARCH_QUEUE_TIMEOUT = 2
-ANALYSIS_CONCURRENCY = 4
-ANALYSIS_QUEUE_TIMEOUT = 2
-
-# Telegram's free broadcast ceiling is about 30 messages/second. Keep explicit
-# headroom for ordinary replies and callback acknowledgements.
-URGENT_BROADCAST_BATCH_SIZE = 20
-URGENT_BROADCAST_WINDOW = 1.05
-URGENT_PER_CHAT_INTERVAL = 1.05
-
-# Search pages, topic snapshots and locks are ephemeral UI state. Alert opt-in
-# sets are intentionally not pruned here; losing a subscription silently would
-# be worse than retaining one integer per subscriber.
-USER_STATE_TTL = 6 * 3600
-USER_STATE_PRUNE_INTERVAL = 600
-MAX_EPHEMERAL_USERS = 2000
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -160,16 +242,12 @@ class SimpleCache:
 
 NEWS_CACHE = SimpleCache(CACHE_TTL)
 BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
-NEWS_VIEW_CACHE = SimpleCache(CACHE_TTL)
-TOPIC_VIEW_CACHE = SimpleCache(max(CACHE_TTL, HOT_CACHE_REFRESH_SECONDS * 2))
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
 USER_SEEN_TOPIC_EVENTS: Dict[str, List[Any]] = {}
 MAX_SEEN_TOPIC_EVENTS = 120
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
-USER_LAST_ACTIVE: Dict[int, float] = {}
-USER_LAST_ALERT_SEND: Dict[int, float] = {}
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
 SENT_URGENT_KEYS = deque(maxlen=MAX_SENT_URGENT_KEYS)
@@ -179,12 +257,8 @@ CUSTOM_EMOJI_IDS = {}
 URGENT_MONITOR_STARTED = False
 URGENT_BASELINE_READY = False
 URGENT_MONITOR_TASK = None
-HOT_CACHE_TASK = None
-USER_STATE_TASK = None
 BACKGROUND_TASKS: Set[asyncio.Task] = set()
 NEWS_COLLECTION_TASK = None
-ONLINE_SEARCH_SEMAPHORE = None
-ANALYSIS_SEMAPHORE = None
 SEEN_CALLBACK_IDS: Dict[str, float] = {}
 RECENT_CALLBACK_ACTIONS: Dict[str, float] = {}
 
@@ -263,75 +337,28 @@ SEARCH_ALIASES = {
 
 
 def register_user(user_id):
-    ALERT_USERS.add(user_id)
-    USER_LAST_ACTIVE[user_id] = time.monotonic()
+    """Register only authorized users for alerts. Revoked/blocked users stay out."""
+    uid = int(user_id)
+    if is_authorized(uid) and uid not in BLOCKED_USERS:
+        ALERT_USERS.add(uid)
+    else:
+        ALERT_USERS.discard(uid)
+        MUTED_USERS.discard(uid)
 
 
-def get_user_lock(user_id):
-    """Return the one event-loop lock that serializes this user's actions."""
-    return USER_LOCKS.setdefault(user_id, asyncio.Lock())
-
-
-def _user_id_from_snapshot_key(value):
-    try:
-        return int(str(value).split(":", 1)[0])
-    except (TypeError, ValueError):
-        return None
-
-
-def prune_ephemeral_user_state(now=None):
-    """Bound inactive per-user UI state without changing alert subscriptions."""
-    now = time.monotonic() if now is None else now
-    protected = {
-        user_id for user_id, lock in USER_LOCKS.items()
-        if lock.locked()
-    }
-    victims = {
-        user_id for user_id, seen_at in USER_LAST_ACTIVE.items()
-        if user_id not in protected and now - seen_at > USER_STATE_TTL
-    }
-
-    remaining = [
-        (seen_at, user_id)
-        for user_id, seen_at in USER_LAST_ACTIVE.items()
-        if user_id not in victims and user_id not in protected
-    ]
-    overflow = max(0, len(USER_LAST_ACTIVE) - len(victims) - MAX_EPHEMERAL_USERS)
-    if overflow:
-        remaining.sort()
-        victims.update(user_id for _, user_id in remaining[:overflow])
-
-    # Alert pacing timestamps have no value after a long inactive period and
-    # must be pruned even when no other UI state happened to expire this cycle.
-    for user_id, sent_at in list(USER_LAST_ALERT_SEND.items()):
-        if now - sent_at > USER_STATE_TTL:
-            USER_LAST_ALERT_SEND.pop(user_id, None)
-
-    if not victims:
-        return 0
-
-    for user_id in victims:
-        USER_SEARCH_RESULTS.pop(user_id, None)
-        USER_SEARCH_QUERY.pop(user_id, None)
-        lock = USER_LOCKS.get(user_id)
-        if lock is None or not lock.locked():
-            USER_LOCKS.pop(user_id, None)
-        USER_LAST_ACTIVE.pop(user_id, None)
-
+def remove_runtime_user(user_id):
+    uid = int(user_id)
+    ALERT_USERS.discard(uid)
+    MUTED_USERS.discard(uid)
+    USER_SEARCH_RESULTS.pop(uid, None)
+    USER_SEARCH_QUERY.pop(uid, None)
+    USER_LOCKS.pop(uid, None)
+    # Topic history keys use a user prefix in this bot. Remove defensively.
+    prefix = f"{uid}:"
     for mapping in (USER_TOPIC_RESULTS, USER_SEEN_TOPIC_EVENTS):
         for key in list(mapping):
-            if _user_id_from_snapshot_key(key) in victims:
+            if str(key).startswith(prefix):
                 mapping.pop(key, None)
-
-    return len(victims)
-
-
-async def user_state_maintenance():
-    while True:
-        await asyncio.sleep(USER_STATE_PRUNE_INTERVAL)
-        removed = prune_ephemeral_user_state()
-        if removed:
-            log.info("Pruned ephemeral state for %d inactive user(s).", removed)
 
 
 def safe_html(value):
@@ -488,29 +515,15 @@ async def initialize_custom_emoji_pack(application):
         log.exception("Custom emoji pack failed; fallback enabled.")
 
 
-def _collect_news_in_isolated_loop(max_items=150):
-    """Run the collector away from Telegram's callback event loop.
-
-    The collector is asynchronous for network concurrency, but it also performs
-    CPU-heavy HTML parsing and event deduplication between awaits.  Giving it a
-    private loop in a worker thread prevents those phases from freezing buttons.
-    """
-    return asyncio.run(collect_news(max_items=max_items))
-
-
 async def _run_news_collection():
     try:
         items = await asyncio.wait_for(
-            asyncio.to_thread(_collect_news_in_isolated_loop, 150),
+            collect_news(max_items=150),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
         if items:
-            # news_engine already returns a bounded canonical collection. A
-            # second all-pairs dedup here previously consumed another 10-17s.
-            items = list(items[:150])
+            items = deduplicate_events(items, limit=150)
             NEWS_CACHE.set("all_news", items)
-            view = _refresh_news_view_cache()
-            await _refresh_topic_view_cache(view)
             return items
     except asyncio.TimeoutError:
         log.warning("News collection timed out; keeping last available cache.")
@@ -538,58 +551,26 @@ async def collect_and_cache_news():
             NEWS_COLLECTION_TASK = None
 
 
-def _merge_cached_lanes(breaking, broad, limit=150):
-    """Merge two already-deduplicated lanes without an all-pairs cache scan."""
-    result = list(breaking or [])
-    fast_count = len(result)
-    urls = {
-        str(getattr(item, "url", "") or "").split("#", 1)[0].strip().lower(): item
-        for item in result
-        if str(getattr(item, "url", "") or "").strip()
-    }
-    for item in broad or []:
-        url = str(getattr(item, "url", "") or "").split("#", 1)[0].strip().lower()
-        if url and url in urls:
-            _merge_event_sources(urls[url], item)
-            continue
-        matched = next((kept for kept in result[:fast_count]
-                        if same_news_event(item, kept)), None)
-        if matched is not None:
-            _merge_event_sources(matched, item)
-            continue
-        result.append(item)
-        if url:
-            urls[url] = item
-        if len(result) >= limit:
-            break
-    return result[:limit]
-
-
-def _refresh_news_view_cache():
-    view = _merge_cached_lanes(
-        BREAKING_CACHE.peek("breaking_news") or [],
-        NEWS_CACHE.peek("all_news") or [],
-        150,
-    )
-    NEWS_VIEW_CACHE.set("all_news_view", view)
-    return view
-
-
 def get_cached_news_view(limit=150):
-    """Read the prepared UI view; callback paths do no global deduplication."""
-    view = NEWS_VIEW_CACHE.peek("all_news_view")
-    if view is None:
-        view = _refresh_news_view_cache()
-    return list(view[:limit])
+    """Read-only UI view: breaking overlay + broad cache, without TTL mutation."""
+    breaking = BREAKING_CACHE.get("breaking_news") or []
+    broad = NEWS_CACHE.peek("all_news") or []
+    return deduplicate_events(list(breaking) + list(broad), limit=limit)
 
 
 async def get_fresh_news(force_refresh=False):
     if not force_refresh:
         cached = NEWS_CACHE.get("all_news")
         if cached is not None:
-            return get_cached_news_view()
-    await collect_and_cache_news()
-    return get_cached_news_view()
+            return deduplicate_events(
+                list(BREAKING_CACHE.get("breaking_news") or []) + list(cached),
+                limit=150,
+            )
+    items = await collect_and_cache_news()
+    return deduplicate_events(
+        list(BREAKING_CACHE.get("breaking_news") or []) + list(items or []),
+        limit=150,
+    )
 
 
 def topic_filter(items, topic_key, max_results=25):
@@ -629,38 +610,6 @@ def topic_filter(items, topic_key, max_results=25):
     if topic_key == "urg":
         return deduplicate_urgent_events(ranked, limit=max_results)
     return deduplicate_events(ranked, limit=max_results)
-
-
-def _build_topic_views(items):
-    """Build every section once so button callbacks only read prepared lists."""
-    return {
-        key: topic_filter(items, key, MAX_SEARCH_RESULTS)
-        for key in TOPICS
-    }
-
-
-async def _refresh_topic_view_cache(items=None):
-    view = list(items if items is not None else get_cached_news_view())
-    prepared = await asyncio.to_thread(_build_topic_views, view)
-    TOPIC_VIEW_CACHE.set("topics", prepared)
-    return prepared
-
-
-async def _refresh_urgent_topic_view(items=None):
-    """Refresh only the rapidly changing urgent page between full warm cycles."""
-    view = list(items if items is not None else get_cached_news_view())
-    urgent = await asyncio.to_thread(
-        topic_filter, view, "urg", MAX_SEARCH_RESULTS
-    )
-    prepared = dict(TOPIC_VIEW_CACHE.peek("topics") or {})
-    prepared["urg"] = urgent
-    TOPIC_VIEW_CACHE.set("topics", prepared)
-    return urgent
-
-
-def get_cached_topic_view(topic_key):
-    prepared = TOPIC_VIEW_CACHE.peek("topics") or {}
-    return list(prepared.get(topic_key, []))
 
 
 def generate_base_report(
@@ -779,7 +728,281 @@ def main_keyboard(user_id):
         InlineKeyboardButton("🔄 تحديث", callback_data="refresh"),
         InlineKeyboardButton("➕ المزيد", callback_data="more"),
     ])
+    if is_owner(user_id):
+        rows.append([
+            InlineKeyboardButton("👑 إدارة الوصول", callback_data="owner:panel")
+        ])
     return InlineKeyboardMarkup(rows)
+
+
+
+def owner_panel_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🟢 طلبات الدخول", callback_data="owner:pending"),
+            InlineKeyboardButton("👥 المستخدمون", callback_data="owner:users"),
+        ],
+        [
+            InlineKeyboardButton("🛡 الأدمن", callback_data="owner:admins"),
+            InlineKeyboardButton("⛔ المحظورون", callback_data="owner:blocked"),
+        ],
+        [InlineKeyboardButton("🏠 مركز الأخبار", callback_data="home")],
+    ])
+
+
+def _display_user(meta, user_id):
+    meta = meta or {}
+    name = " ".join(
+        x for x in [meta.get("first_name", ""), meta.get("last_name", "")] if x
+    ).strip()
+    username = (meta.get("username") or "").strip()
+    pieces = []
+    if name:
+        pieces.append(name)
+    if username:
+        pieces.append(f"@{username}")
+    pieces.append(str(user_id))
+    return " | ".join(pieces)
+
+
+def _known_user_meta(user_id):
+    uid = int(user_id)
+    return PENDING_USERS.get(uid, {})
+
+
+async def notify_owner_access_request(context, user, first_request=True):
+    if not first_request:
+        return
+    meta = _safe_user_record(user)
+    label = _display_user(meta, user.id)
+    keyboard = InlineKeyboardMarkup([[ 
+        InlineKeyboardButton("✅ قبول", callback_data=f"owner:approve:{user.id}"),
+        InlineKeyboardButton("❌ رفض", callback_data=f"owner:reject:{user.id}"),
+        InlineKeyboardButton("⛔ حظر", callback_data=f"owner:block:{user.id}"),
+    ]])
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "🔐 <b>طلب دخول جديد</b>\n\n"
+                f"{safe_html(label)}\n"
+                "هذا الحساب لا يملك أي صلاحية حتى توافق عليه."
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception:
+        log.exception("Could not notify owner about access request from %s", user.id)
+
+
+async def deny_or_request_access(update, context):
+    """Return True when the caller must be stopped before any bot feature runs."""
+    user = update.effective_user
+    if not user:
+        return True
+    uid = int(user.id)
+    if is_authorized(uid) and uid not in BLOCKED_USERS:
+        return False
+
+    remove_runtime_user(uid)
+    role = access_role(uid)
+    query = update.callback_query
+    message = update.effective_message
+
+    if role == "blocked":
+        text = "⛔ هذا الحساب محظور من استخدام البوت."
+        if query:
+            try:
+                await query.answer(text, show_alert=True)
+            except Exception:
+                pass
+        elif message:
+            await message.reply_text(text)
+        return True
+
+    first_request = uid not in PENDING_USERS
+    if first_request:
+        PENDING_USERS[uid] = _safe_user_record(user)
+        save_access_state()
+    await notify_owner_access_request(context, user, first_request=first_request)
+
+    text = (
+        "🔒 <b>البوت خاص</b>\n\n"
+        "تم تسجيل طلب الدخول. لن تتاح الأخبار أو البحث أو التنبيهات "
+        "إلا بعد موافقة مالك البوت."
+    )
+    if query:
+        try:
+            await query.answer("🔒 لا تملك صلاحية الدخول.", show_alert=True)
+        except Exception:
+            pass
+    elif message:
+        await message.reply_text(text, parse_mode="HTML")
+    return True
+
+
+async def show_owner_panel(message):
+    await message.reply_text(
+        "👑 <b>لوحة المالك</b>\n\n"
+        f"طلبات معلقة: {len(PENDING_USERS)}\n"
+        f"المستخدمون المعتمدون: {len(APPROVED_USERS - {OWNER_ID})}\n"
+        f"الأدمن: {len(ADMINS)}\n"
+        f"المحظورون: {len(BLOCKED_USERS)}\n\n"
+        "إضافة وحذف الأدمن بيد الـOwner فقط.",
+        parse_mode="HTML",
+        reply_markup=owner_panel_keyboard(),
+    )
+
+
+async def owner_callback(query, context, data, actor_id):
+    if not is_owner(actor_id):
+        await safe_query_answer(query, "⛔ هذه الصلاحية للمالك فقط.", show_alert=True)
+        return
+
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else "panel"
+
+    if action == "panel":
+        await safe_query_answer(query, "👑 لوحة المالك")
+        await show_owner_panel(query.message)
+        return
+
+    if action in {"approve", "reject", "block", "unblock", "promote", "demote", "revoke"}:
+        if len(parts) < 3:
+            await safe_query_answer(query, "⚠️ طلب غير صالح.", show_alert=True)
+            return
+        try:
+            target = int(parts[2])
+        except ValueError:
+            await safe_query_answer(query, "⚠️ معرف غير صالح.", show_alert=True)
+            return
+        if target == OWNER_ID:
+            await safe_query_answer(query, "👑 لا يمكن تعديل صلاحية المالك.", show_alert=True)
+            return
+
+        if action == "approve":
+            BLOCKED_USERS.discard(target)
+            PENDING_USERS.pop(target, None)
+            APPROVED_USERS.add(target)
+            register_user(target)
+            result = "✅ تم قبول المستخدم."
+            try:
+                await context.bot.send_message(target, "✅ تمت الموافقة على دخولك للبوت. أرسل /start للبدء.")
+            except Exception:
+                pass
+        elif action == "reject":
+            PENDING_USERS.pop(target, None)
+            APPROVED_USERS.discard(target)
+            ADMINS.discard(target)
+            remove_runtime_user(target)
+            result = "❌ تم رفض الطلب."
+        elif action == "block":
+            PENDING_USERS.pop(target, None)
+            APPROVED_USERS.discard(target)
+            ADMINS.discard(target)
+            BLOCKED_USERS.add(target)
+            remove_runtime_user(target)
+            result = "⛔ تم طرد المستخدم وحظره فوراً."
+            try:
+                await context.bot.send_message(target, "⛔ تم إلغاء صلاحية وصولك إلى البوت.")
+            except Exception:
+                pass
+        elif action == "unblock":
+            BLOCKED_USERS.discard(target)
+            # Unblocking does not silently grant access; user must request again.
+            result = "✅ تم رفع الحظر. يحتاج المستخدم موافقة جديدة للدخول."
+        elif action == "promote":
+            if target not in APPROVED_USERS:
+                await safe_query_answer(query, "⚠️ اعتمد المستخدم أولاً.", show_alert=True)
+                return
+            APPROVED_USERS.discard(target)
+            ADMINS.add(target)
+            register_user(target)
+            result = "🛡 تم تعيين المستخدم Admin."
+        elif action == "demote":
+            ADMINS.discard(target)
+            APPROVED_USERS.add(target)
+            register_user(target)
+            result = "👤 تمت إزالة صلاحية Admin وبقي كمستخدم معتمد."
+        else:  # revoke
+            ADMINS.discard(target)
+            APPROVED_USERS.discard(target)
+            PENDING_USERS.pop(target, None)
+            remove_runtime_user(target)
+            result = "🚪 تم سحب صلاحية الدخول. يمكنه تقديم طلب جديد لاحقاً."
+
+        save_access_state()
+        await safe_query_answer(query, result, show_alert=True)
+        await show_owner_panel(query.message)
+        return
+
+    if action == "pending":
+        await safe_query_answer(query, "🟢 طلبات الدخول")
+        if not PENDING_USERS:
+            await query.message.reply_text("لا توجد طلبات دخول معلقة.", reply_markup=owner_panel_keyboard())
+            return
+        for uid, meta in list(PENDING_USERS.items())[:20]:
+            await query.message.reply_text(
+                f"🔐 {safe_html(_display_user(meta, uid))}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[ 
+                    InlineKeyboardButton("✅ قبول", callback_data=f"owner:approve:{uid}"),
+                    InlineKeyboardButton("❌ رفض", callback_data=f"owner:reject:{uid}"),
+                    InlineKeyboardButton("⛔ حظر", callback_data=f"owner:block:{uid}"),
+                ]]),
+            )
+        return
+
+    if action == "users":
+        await safe_query_answer(query, "👥 المستخدمون")
+        users = sorted((APPROVED_USERS - {OWNER_ID}) - ADMINS)
+        if not users:
+            await query.message.reply_text("لا يوجد مستخدمون معتمدون حالياً.", reply_markup=owner_panel_keyboard())
+            return
+        for uid in users[:30]:
+            await query.message.reply_text(
+                f"👤 <code>{uid}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[ 
+                    InlineKeyboardButton("🛡 جعله Admin", callback_data=f"owner:promote:{uid}"),
+                    InlineKeyboardButton("🚪 سحب الدخول", callback_data=f"owner:revoke:{uid}"),
+                    InlineKeyboardButton("⛔ حظر", callback_data=f"owner:block:{uid}"),
+                ]]),
+            )
+        return
+
+    if action == "admins":
+        await safe_query_answer(query, "🛡 الأدمن")
+        if not ADMINS:
+            await query.message.reply_text("لا يوجد Admins حالياً. رقّ مستخدماً معتمداً من قائمة المستخدمين.", reply_markup=owner_panel_keyboard())
+            return
+        for uid in sorted(ADMINS):
+            await query.message.reply_text(
+                f"🛡 Admin: <code>{uid}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[ 
+                    InlineKeyboardButton("👤 إزالة Admin", callback_data=f"owner:demote:{uid}"),
+                    InlineKeyboardButton("⛔ حظر", callback_data=f"owner:block:{uid}"),
+                ]]),
+            )
+        return
+
+    if action == "blocked":
+        await safe_query_answer(query, "⛔ المحظورون")
+        if not BLOCKED_USERS:
+            await query.message.reply_text("لا يوجد مستخدمون محظورون.", reply_markup=owner_panel_keyboard())
+            return
+        for uid in sorted(BLOCKED_USERS)[:30]:
+            await query.message.reply_text(
+                f"⛔ <code>{uid}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[ 
+                    InlineKeyboardButton("✅ رفع الحظر", callback_data=f"owner:unblock:{uid}"),
+                ]]),
+            )
+        return
+
+    await safe_query_answer(query, "⚠️ إجراء غير معروف.", show_alert=True)
 
 
 ANALYSIS_PROMPT = """
@@ -801,14 +1024,7 @@ async def analyze_with_gemini(items):
     if not ai_client:
         return "ℹ️ طبقة التحليل غير متاحة حالياً، لكن جمع الأخبار والبحث يعملان."
 
-    semaphore = ANALYSIS_SEMAPHORE
-    acquired = False
     try:
-        if semaphore is not None:
-            await asyncio.wait_for(
-                semaphore.acquire(), timeout=ANALYSIS_QUEUE_TIMEOUT
-            )
-            acquired = True
         context = build_ai_context(items[:8])
         response = await asyncio.wait_for(
             asyncio.to_thread(
@@ -826,60 +1042,9 @@ async def analyze_with_gemini(items):
         return (
             getattr(response, "text", None) or ""
         ).strip() or "⚠️ لم يُرجع التحليل نتيجة."
-    except asyncio.TimeoutError:
-        if not acquired:
-            return "⏳ التحليل مشغول الآن بعدة طلبات. حاول مرة أخرى بعد قليل."
-        log.info("Gemini analysis timed out.")
-        return "⚠️ تعذر التحليل بالذكاء الاصطناعي حالياً."
     except Exception:
         log.exception("Gemini analysis failed.")
         return "⚠️ تعذر التحليل بالذكاء الاصطناعي حالياً."
-    finally:
-        if acquired:
-            semaphore.release()
-
-
-def analysis_home_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🏠 مركز الأخبار", callback_data="home")
-    ]])
-
-
-async def complete_topic_analysis(status, key):
-    """Finish analysis in background so navigation callbacks stay available."""
-    try:
-        results = get_cached_topic_view(key)[:8]
-        if not results:
-            cached = NEWS_CACHE.peek("all_news") or []
-            if not cached:
-                await collect_and_cache_news()
-                cached = NEWS_CACHE.peek("all_news") or []
-            results = await asyncio.to_thread(topic_filter, cached, key, 8)
-
-        if not results:
-            await status.edit_text(
-                "⚠️ لا توجد بيانات كافية للتحليل.",
-                reply_markup=analysis_home_keyboard(),
-            )
-            return
-
-        analysis = await analyze_with_gemini(results)
-        await status.edit_text(
-            "🧠 <b>التحليل التنفيذي</b>\n\n" + safe_html(analysis),
-            parse_mode="HTML",
-            reply_markup=analysis_home_keyboard(),
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Analysis failed.")
-        try:
-            await status.edit_text(
-                "⚠️ حدث خطأ أثناء التحليل.",
-                reply_markup=analysis_home_keyboard(),
-            )
-        except Exception:
-            pass
 
 
 URGENT_STRONG_TERMS = {
@@ -1345,17 +1510,15 @@ async def _run_breaking_lane():
     return []
 
 
-async def _merge_breaking_into_cache(items):
+def _merge_breaking_into_cache(items):
     """Update the fast overlay as canonical events, not raw feed-cycle headlines."""
     if not items:
         return
     cached = BREAKING_CACHE.get("breaking_news") or []
-    merged = await asyncio.to_thread(
-        deduplicate_urgent_events, list(items) + list(cached), 80
+    BREAKING_CACHE.set(
+        "breaking_news",
+        deduplicate_urgent_events(list(items) + list(cached), limit=80),
     )
-    BREAKING_CACHE.set("breaking_news", merged)
-    view = _refresh_news_view_cache()
-    await _refresh_urgent_topic_view(view)
 
 
 async def initialize_urgent_baseline():
@@ -1366,7 +1529,7 @@ async def initialize_urgent_baseline():
     # Seed from the lightweight lane only. A restart must not launch the heavy
     # global collector just to establish which alerts already exist.
     items = await _run_breaking_lane()
-    await _merge_breaking_into_cache(items)
+    _merge_breaking_into_cache(items)
     for item in items:
         # Baseline only publishable events. A weak single-source signal is not
         # marked as sent, so a later corroborating source can still trigger it.
@@ -1377,73 +1540,6 @@ async def initialize_urgent_baseline():
                 remember_urgent_event(item)
 
     URGENT_BASELINE_READY = True
-
-
-def _retry_after_seconds(error):
-    value = getattr(error, "retry_after", 1)
-    if hasattr(value, "total_seconds"):
-        value = value.total_seconds()
-    try:
-        return max(0.1, float(value))
-    except (TypeError, ValueError):
-        return 1.0
-
-
-async def _send_urgent_alert_to_user(application, user_id, message):
-    """Send one alert with per-chat pacing and one Telegram-directed retry."""
-    for attempt in range(2):
-        since_last = time.monotonic() - USER_LAST_ALERT_SEND.get(user_id, 0)
-        if since_last < URGENT_PER_CHAT_INTERVAL:
-            await asyncio.sleep(URGENT_PER_CHAT_INTERVAL - since_last)
-        try:
-            await application.bot.send_message(
-                chat_id=user_id,
-                text=message,
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-            )
-            USER_LAST_ALERT_SEND[user_id] = time.monotonic()
-            return True
-        except RetryAfter as exc:
-            if attempt == 0:
-                await asyncio.sleep(_retry_after_seconds(exc) + 0.1)
-                continue
-            log.warning("Urgent alert rate-limited after retry for %s", user_id)
-        except Forbidden:
-            # The user blocked the bot; stop retrying this unreachable chat.
-            ALERT_USERS.discard(user_id)
-            MUTED_USERS.discard(user_id)
-            log.info("Removed unreachable alert subscriber %s", user_id)
-        except TelegramError as exc:
-            log.warning(
-                "Urgent alert Telegram failure for %s: %s",
-                user_id, type(exc).__name__,
-            )
-        except Exception:
-            log.exception("Urgent alert send failed for %s", user_id)
-        return False
-    return False
-
-
-async def broadcast_urgent_alert(application, message):
-    """Broadcast below Telegram's free global ceiling with reply headroom."""
-    recipients = [
-        user_id for user_id in list(ALERT_USERS)
-        if user_id not in MUTED_USERS
-    ]
-    delivered = 0
-    for offset in range(0, len(recipients), URGENT_BROADCAST_BATCH_SIZE):
-        started = time.monotonic()
-        batch = recipients[offset:offset + URGENT_BROADCAST_BATCH_SIZE]
-        outcomes = await asyncio.gather(*(
-            _send_urgent_alert_to_user(application, user_id, message)
-            for user_id in batch
-        ))
-        delivered += sum(bool(outcome) for outcome in outcomes)
-        if offset + len(batch) < len(recipients):
-            elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0, URGENT_BROADCAST_WINDOW - elapsed))
-    return delivered
 
 
 async def urgent_monitor(application):
@@ -1457,7 +1553,7 @@ async def urgent_monitor(application):
                 # Fast lane only: direct public RSS feeds. The heavy collector
                 # stays on its own cadence and can never delay an urgent alert.
                 items = await _run_breaking_lane()
-                await _merge_breaking_into_cache(items)
+                _merge_breaking_into_cache(items)
                 alerts = find_new_urgent_news(items)
                 publishable = sum(
                     1 for item in deduplicate_urgent_events(items)
@@ -1471,9 +1567,26 @@ async def urgent_monitor(application):
                 for item in alerts:
                     key = urgent_key(item)
                     message = await format_urgent_alert(item)
-                    delivered = await broadcast_urgent_alert(application, message)
+                    delivered = False
 
-                    if delivered > 0:
+                    for user_id in list(ALERT_USERS):
+                        if user_id in MUTED_USERS:
+                            continue
+                        try:
+                            await application.bot.send_message(
+                                chat_id=user_id,
+                                text=message,
+                                parse_mode="HTML",
+                                disable_web_page_preview=False,
+                            )
+                            delivered = True
+                        except Exception:
+                            log.exception(
+                                "Urgent alert send failed for %s",
+                                user_id,
+                            )
+
+                    if delivered:
                         SENT_URGENT_KEYS.append(key)
                         remember_urgent_event(item)
 
@@ -1488,84 +1601,28 @@ async def urgent_monitor(application):
         await asyncio.sleep(max(5, URGENT_MONITOR_INTERVAL - elapsed))
 
 
-async def hot_cache_monitor():
-    """Continuously warm collection and all topic pages without user traffic."""
-    log.info(
-        "Hot cache monitor started interval=%ds collection_timeout=%ds",
-        HOT_CACHE_REFRESH_SECONDS, NEWS_COLLECTION_TIMEOUT,
-    )
-    await asyncio.sleep(HOT_CACHE_INITIAL_DELAY)
-    while True:
-        started = time.monotonic()
-        try:
-            items = await collect_and_cache_news()
-            prepared = TOPIC_VIEW_CACHE.peek("topics") or {}
-            log.info(
-                "Hot cache ready news=%d topics=%s elapsed=%.2fs",
-                len(items),
-                ",".join(f"{key}:{len(prepared.get(key, []))}" for key in TOPICS),
-                time.monotonic() - started,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Hot cache refresh failed; keeping previous snapshots.")
-        elapsed = time.monotonic() - started
-        await asyncio.sleep(max(15, HOT_CACHE_REFRESH_SECONDS - elapsed))
-
-
 async def post_init(application):
-    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK, HOT_CACHE_TASK
-    global USER_STATE_TASK, ONLINE_SEARCH_SEMAPHORE, ANALYSIS_SEMAPHORE
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
     if URGENT_MONITOR_STARTED:
         return
 
+    # Restore only authorized recipients. Old/revoked users are never reconnected.
+    ALERT_USERS.clear()
+    ALERT_USERS.update((APPROVED_USERS | ADMINS | {OWNER_ID}) - BLOCKED_USERS)
+
     URGENT_MONITOR_STARTED = True
-    ONLINE_SEARCH_SEMAPHORE = asyncio.Semaphore(ONLINE_SEARCH_CONCURRENCY)
-    ANALYSIS_SEMAPHORE = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
     await initialize_custom_emoji_pack(application)
     URGENT_MONITOR_TASK = asyncio.create_task(
         urgent_monitor(application),
         name="urgent-news-monitor",
     )
-    HOT_CACHE_TASK = asyncio.create_task(
-        hot_cache_monitor(),
-        name="hot-cache-monitor",
-    )
-
-    def report_hot_cache_exit(task):
-        if task.cancelled():
-            return
-        try:
-            error = task.exception()
-        except asyncio.CancelledError:
-            return
-        if error is not None:
-            log.error(
-                "Hot cache monitor stopped unexpectedly: %s",
-                type(error).__name__,
-                exc_info=(type(error), error, error.__traceback__),
-            )
-
-    HOT_CACHE_TASK.add_done_callback(report_hot_cache_exit)
-    USER_STATE_TASK = asyncio.create_task(
-        user_state_maintenance(),
-        name="user-state-maintenance",
-    )
 
 
 async def post_stop(application):
-    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK, HOT_CACHE_TASK
-    global USER_STATE_TASK, ONLINE_SEARCH_SEMAPHORE, ANALYSIS_SEMAPHORE
+    global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
 
     task = URGENT_MONITOR_TASK
     URGENT_MONITOR_TASK = None
-    hot_task = HOT_CACHE_TASK
-    HOT_CACHE_TASK = None
-    user_state_task = USER_STATE_TASK
-    USER_STATE_TASK = None
-    ONLINE_SEARCH_SEMAPHORE = None
-    ANALYSIS_SEMAPHORE = None
     URGENT_MONITOR_STARTED = False
 
     for bg_task in list(BACKGROUND_TASKS):
@@ -1578,23 +1635,14 @@ async def post_stop(application):
             await task
         except asyncio.CancelledError:
             pass
-    if hot_task and not hot_task.done():
-        hot_task.cancel()
-        try:
-            await hot_task
-        except asyncio.CancelledError:
-            pass
-    if user_state_task and not user_state_task.done():
-        user_state_task.cancel()
-        try:
-            await user_state_task
-        except asyncio.CancelledError:
-            pass
 
 
 async def start(update, context):
     user = update.effective_user
     if not user or not update.message:
+        return
+
+    if await deny_or_request_access(update, context):
         return
 
     register_user(user.id)
@@ -1614,9 +1662,7 @@ async def send_topic_update(message, key, previous_results, user_id=None):
     """Refresh a topic in the background and send only meaningful additions."""
     try:
         fresh = await get_fresh_news(force_refresh=True)
-        current = await asyncio.to_thread(
-            topic_filter, fresh, key, MAX_SEARCH_RESULTS
-        )
+        current = topic_filter(fresh, key, MAX_SEARCH_RESULTS)
         if not current:
             return
 
@@ -1625,9 +1671,7 @@ async def send_topic_update(message, key, previous_results, user_id=None):
             item for item in current
             if urgent_key(item) not in previous_keys
         ]
-        additions = await asyncio.to_thread(
-            deduplicate_events, additions, PER_PAGE
-        )
+        additions = deduplicate_events(additions, limit=PER_PAGE)
         if user_id is not None:
             additions = _filter_unseen_topic_events(user_id, key, additions)
 
@@ -1673,24 +1717,16 @@ async def show_topic(query, user_id, key, page):
         # Later pages must use that same snapshot for stable, instant pagination.
         raw_results = []
         if page == 1:
-            raw_results = get_cached_topic_view(key)
-            if not raw_results:
-                cached = get_cached_news_view()
-                raw_results = await asyncio.to_thread(
-                    topic_filter, cached, key, MAX_SEARCH_RESULTS
-                )
+            cached = get_cached_news_view()
+            raw_results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
             results = _filter_unseen_topic_events(user_id, key, raw_results)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
         else:
             results = USER_TOPIC_RESULTS.get(snapshot_key, [])
             if not results:
-                results = get_cached_topic_view(key)
-                if not results:
-                    cached = NEWS_CACHE.peek("all_news") or []
-                    results = await asyncio.to_thread(
-                        topic_filter, cached, key, MAX_SEARCH_RESULTS
-                    )
+                cached = NEWS_CACHE.peek("all_news") or []
+                results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
                 if results:
                     USER_TOPIC_RESULTS[snapshot_key] = list(results)
 
@@ -1797,23 +1833,13 @@ async def progressive_online_search(
     local_results,
 ):
     """Online discovery is additive and never blocks the first visible state."""
-    semaphore = ONLINE_SEARCH_SEMAPHORE
-    acquired = False
     try:
-        if semaphore is not None:
-            await asyncio.wait_for(
-                semaphore.acquire(), timeout=ONLINE_SEARCH_QUEUE_TIMEOUT
-            )
-            acquired = True
         online = await asyncio.wait_for(
             search_news_online(query_text, MAX_SEARCH_RESULTS),
             timeout=ONLINE_SEARCH_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        log.info(
-            "%s; keeping available results.",
-            "Online search timed out" if acquired else "Online search capacity busy",
-        )
+        log.info("Online search timed out; keeping available results.")
         if not local_results:
             try:
                 await status.edit_text(
@@ -1838,9 +1864,6 @@ async def progressive_online_search(
             except Exception:
                 pass
         return
-    finally:
-        if acquired:
-            semaphore.release()
 
     online = deduplicate_events(online or [], limit=MAX_SEARCH_RESULTS)
     local_keys = {urgent_key(item) for item in local_results}
@@ -1909,15 +1932,19 @@ async def button_handler(update, context):
         return
 
     user_id = user.id
-    register_user(user_id)
     data = query.data or ""
+
+    if await deny_or_request_access(update, context):
+        return
+
+    register_user(user_id)
     log.info("Callback received: %s", data)
 
+    if data.startswith("owner:"):
+        await owner_callback(query, context, data, user_id)
+        return
+
     if not claim_callback(query, user_id, data):
-        # Every Telegram callback must be acknowledged, including a repeated
-        # tap that we intentionally do not execute twice. Otherwise the client
-        # keeps showing a spinner and the user experiences it as a stuck button.
-        await safe_query_answer(query)
         return
 
     if data == "toggle_alerts":
@@ -2029,13 +2056,40 @@ async def button_handler(update, context):
 
         await safe_query_answer(query, "🧠 جاري تجهيز التحليل...")
         status = await query.message.reply_text(
-            "🧠 جاري تحليل البيانات...",
-            reply_markup=analysis_home_keyboard(),
+            "🧠 جاري تحليل البيانات..."
         )
-        track_task(
-            complete_topic_analysis(status, key),
-            f"analysis-{user_id}-{key}",
-        )
+
+        try:
+            items = NEWS_CACHE.peek("all_news") or []
+            if not items:
+                track_task(
+                    collect_and_cache_news(),
+                    f"analysis-cache-warm-{user_id}",
+                )
+                await status.edit_text(
+                    "🧠 لا توجد بيانات جاهزة للتحليل الآن.\n"
+                    "📡 جاري تحديث التغطية في الخلفية، ثم أعد المحاولة بعد قليل."
+                )
+                return
+
+            results = topic_filter(items, key, 8)
+            if not results:
+                await status.edit_text(
+                    "⚠️ لا توجد بيانات كافية للتحليل."
+                )
+                return
+
+            analysis = await analyze_with_gemini(results)
+            await status.edit_text(
+                "🧠 <b>التحليل التنفيذي</b>\n\n"
+                + safe_html(analysis),
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception("Analysis failed.")
+            await status.edit_text(
+                "⚠️ حدث خطأ أثناء التحليل."
+            )
         return
 
     if data.startswith("t:"):
@@ -2056,26 +2110,6 @@ async def button_handler(update, context):
         return
 
 
-async def concurrent_button_handler(update, context):
-    """Serialize one user's buttons while allowing different users in parallel."""
-    query = update.callback_query
-    user = update.effective_user
-    if not query or not user:
-        return
-
-    register_user(user.id)
-    lock = get_user_lock(user.id)
-    if lock.locked():
-        await safe_query_answer(
-            query,
-            "⏳ طلبك السابق قيد التنفيذ.",
-        )
-        return
-
-    async with lock:
-        await button_handler(update, context)
-
-
 async def handle_user_message(update, context):
     if not update.message:
         return
@@ -2085,9 +2119,12 @@ async def handle_user_message(update, context):
     if not text or not user:
         return
 
+    if await deny_or_request_access(update, context):
+        return
+
     user_id = user.id
     register_user(user_id)
-    lock = get_user_lock(user_id)
+    lock = USER_LOCKS.setdefault(user_id, asyncio.Lock())
 
     if lock.locked():
         await update.message.reply_text(
@@ -2163,6 +2200,18 @@ async def handle_user_message(update, context):
             )
 
 
+async def admin_command(update, context):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if await deny_or_request_access(update, context):
+        return
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ لوحة إدارة الوصول للـOwner فقط.")
+        return
+    await show_owner_panel(update.message)
+
+
 async def error_handler(update, context):
     log.error(
         "Unhandled Telegram error: %r",
@@ -2175,21 +2224,19 @@ def main():
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .concurrent_updates(MAX_CONCURRENT_UPDATES)
-        .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
-        .pool_timeout(TELEGRAM_POOL_TIMEOUT)
         .post_init(post_init)
         .post_stop(post_stop)
         .build()
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(
         CallbackQueryHandler(
-            concurrent_button_handler,
+            button_handler,
             pattern=(
                 r"^(t:.*|s:\d+|home|refresh|more|"
-                r"toggle_alerts|analyze:.*)$"
+                r"toggle_alerts|analyze:.*|owner:.*)$"
             ),
         )
     )

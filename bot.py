@@ -408,12 +408,12 @@ CACHE_TTL = 300
 HOT_CACHE_LIMIT = 260
 SOCIAL_CACHE_TTL = 180
 DIRECT_CACHE_TTL = 90
-SOCIAL_REFRESH_INTERVAL = 90
-DIRECT_REFRESH_INTERVAL = 30
-PROVIDER_LOOP_INTERVAL = 15
+SOCIAL_REFRESH_INTERVAL = 180
+DIRECT_REFRESH_INTERVAL = 180
+PROVIDER_LOOP_INTERVAL = 30
 SOCIAL_PROVIDER_TIMEOUT = 12
 DIRECT_PROVIDER_TIMEOUT = 9
-PROVIDER_TRANSLATION_BUDGET = 1.6
+PROVIDER_TRANSLATION_BUDGET = 5.0
 
 URGENT_MONITOR_INTERVAL = 30
 URGENT_INITIAL_DELAY = 8
@@ -1163,12 +1163,51 @@ async def get_fresh_news(force_refresh=False):
     return await refresh_all_sources(force=False)
 
 
+def _has_arabic_text(value):
+    return bool(re.search(r"[\u0600-\u06FF]", str(value or "")))
+
+
+def _provider_title_ready(item):
+    """Never expose untranslated social/direct headlines in the Arabic UI."""
+    provider = str(getattr(item, "_provider_kind", "") or "")
+    if provider not in {"social_intel", "direct_radar"}:
+        return True
+    return _has_arabic_text(get_item_title(item))
+
+
+def _balance_topic_sources(items, limit):
+    """Keep ranked recency/quality while preventing one provider/source from owning page 1."""
+    items = list(items or [])
+    if len(items) <= PER_PAGE:
+        return items[:limit]
+
+    first_page = []
+    deferred = []
+    counts = {}
+    # Two stories from the same source are enough on the first five-item page.
+    for item in items:
+        source_key = normalize_text(get_item_source(item)) or _provider_domain(get_item_url(item)) or "unknown"
+        if len(first_page) < PER_PAGE and counts.get(source_key, 0) < 2:
+            first_page.append(item)
+            counts[source_key] = counts.get(source_key, 0) + 1
+        else:
+            deferred.append(item)
+
+    if len(first_page) < PER_PAGE:
+        need = PER_PAGE - len(first_page)
+        first_page.extend(deferred[:need])
+        deferred = deferred[need:]
+    return (first_page + deferred)[:limit]
+
+
 def topic_filter(items, topic_key, max_results=25):
     if topic_key not in TOPICS:
         return []
 
     scored = []
     for item in items:
+        if not _provider_title_ready(item):
+            continue
         forced_topic = str(getattr(item, "_exclusive_topic", "") or "")
         if forced_topic:
             if forced_topic != topic_key:
@@ -1203,7 +1242,8 @@ def topic_filter(items, topic_key, max_results=25):
     ranked = [item for _, item in scored[:max_results * 3]]
     if topic_key == "urg":
         return deduplicate_urgent_events(ranked, limit=max_results)
-    return deduplicate_events(ranked, limit=max_results)
+    deduped = deduplicate_events(ranked, limit=max_results)
+    return _balance_topic_sources(deduped, max_results)
 
 
 def generate_base_report(
@@ -2397,11 +2437,8 @@ async def show_topic(query, user_id, key, page):
             start = (page - 1) * PER_PAGE
             _remember_topic_events(user_id, key, results[start:start + PER_PAGE])
 
-            # Page 1 is returned from the ready snapshot first. Then one global
-            # single-flight refresh may refill the next Hot Cache generation.
-            # Page 2+ keeps this user's current snapshot stable and instant.
-            if page == 1:
-                trigger_background_refresh(force=False)
+            # UI callbacks are cache-only. The shared provider monitor owns
+            # refresh scheduling so button presses never start heavy network work.
             return
 
         # The topic has cached stories, but this user has already seen them.

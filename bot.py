@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import html
 import difflib
@@ -9,7 +10,9 @@ import time
 import json
 from pathlib import Path
 import urllib.parse
+import zlib
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -25,6 +28,7 @@ from google import genai
 from google.genai import types
 
 from news_engine import (
+    NewsItem,
     build_ai_context,
     collect_news,
     collect_breaking_news,
@@ -32,7 +36,24 @@ from news_engine import (
     is_topic_match,
     search_news,
     search_news_online,
+    translate_news_titles,
 )
+
+try:
+    from intel_sources import collect_social_intel
+except Exception:
+    collect_social_intel = None
+    logging.getLogger("pro_news_bot").exception(
+        "intel_sources import failed; social provider disabled."
+    )
+
+try:
+    from direct_sources import collect_direct_radar
+except Exception:
+    collect_direct_radar = None
+    logging.getLogger("pro_news_bot").exception(
+        "direct_sources import failed; direct radar disabled."
+    )
 
 try:
     from themes import (
@@ -84,6 +105,16 @@ APPROVED_USERS: Set[int] = {OWNER_ID}
 BLOCKED_USERS: Set[int] = set()
 PENDING_USERS: Dict[int, Dict[str, Any]] = {}
 
+# Free durable access backup: the latest access state is mirrored into a pinned
+# message in the owner's existing private Telegram chat. This adds no external
+# service and survives Railway container replacement because Telegram is already
+# the bot's transport. Local JSON remains the fast primary runtime copy.
+ACCESS_CLOUD_MARKER = "GLOBAL_INTEL_ACCESS_V1"
+ACCESS_STATE_UPDATED_AT = 0
+ACCESS_BOT = None
+ACCESS_CLOUD_SYNC_TASK = None
+ACCESS_CLOUD_SYNC_DIRTY = False
+
 
 def _safe_user_record(user):
     return {
@@ -95,58 +126,241 @@ def _safe_user_record(user):
     }
 
 
+def _env_id_set(name):
+    """Optional durable bootstrap IDs kept in Railway environment variables."""
+    result = set()
+    for raw in (os.getenv(name, "") or "").replace(";", ",").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            result.add(int(raw))
+        except ValueError:
+            log.warning("Ignoring invalid Telegram ID in %s", name)
+    result.discard(OWNER_ID)
+    return result
+
+
+BOOTSTRAP_APPROVED_USERS = _env_id_set("APPROVED_TELEGRAM_IDS")
+BOOTSTRAP_ADMINS = _env_id_set("ADMIN_TELEGRAM_IDS")
+
+
+def _access_payload(updated_at=None):
+    """Build the canonical access-control snapshot."""
+    if updated_at is None:
+        updated_at = ACCESS_STATE_UPDATED_AT
+    return {
+        "version": 1,
+        "updated_at": int(updated_at or 0),
+        "admins": sorted(int(x) for x in ADMINS if int(x) != OWNER_ID),
+        "approved_users": sorted(int(x) for x in (APPROVED_USERS | {OWNER_ID})),
+        "blocked_users": sorted(int(x) for x in BLOCKED_USERS if int(x) != OWNER_ID),
+        "pending_users": {str(int(k)): dict(v or {}) for k, v in PENDING_USERS.items()},
+    }
+
+
+def _normalize_access_state():
+    """Enforce mutually-exclusive roles after any restore."""
+    ADMINS.discard(OWNER_ID)
+    BLOCKED_USERS.discard(OWNER_ID)
+    ADMINS.difference_update(BLOCKED_USERS)
+    APPROVED_USERS.difference_update(BLOCKED_USERS)
+    APPROVED_USERS.add(OWNER_ID)
+    for uid in list(PENDING_USERS):
+        if uid == OWNER_ID or uid in ADMINS or uid in APPROVED_USERS or uid in BLOCKED_USERS:
+            PENDING_USERS.pop(uid, None)
+
+
+def _apply_access_payload(raw, merge_bootstrap=True):
+    """Validate and apply one access snapshot. Returns its revision timestamp."""
+    global ADMINS, APPROVED_USERS, BLOCKED_USERS, PENDING_USERS, ACCESS_STATE_UPDATED_AT
+    if not isinstance(raw, dict):
+        raise ValueError("access snapshot is not an object")
+
+    admins = {int(x) for x in (raw.get("admins") or []) if int(x) != OWNER_ID}
+    approved = {int(x) for x in (raw.get("approved_users") or [])}
+    blocked = {int(x) for x in (raw.get("blocked_users") or []) if int(x) != OWNER_ID}
+    pending_raw = raw.get("pending_users") or {}
+    if not isinstance(pending_raw, dict):
+        pending_raw = {}
+    pending = {int(k): dict(v or {}) for k, v in pending_raw.items()}
+
+    if merge_bootstrap:
+        admins.update(BOOTSTRAP_ADMINS)
+        approved.update(BOOTSTRAP_APPROVED_USERS)
+    approved.add(OWNER_ID)
+
+    ADMINS = admins
+    APPROVED_USERS = approved
+    BLOCKED_USERS = blocked
+    PENDING_USERS = pending
+    _normalize_access_state()
+    ACCESS_STATE_UPDATED_AT = max(0, int(raw.get("updated_at") or 0))
+    return ACCESS_STATE_UPDATED_AT
+
+
 def load_access_state():
-    """Load access state. Missing/corrupt storage fails closed: owner only."""
-    global ADMINS, APPROVED_USERS, BLOCKED_USERS, PENDING_USERS
-    ADMINS = set()
-    APPROVED_USERS = {OWNER_ID}
+    """Load the local runtime copy; Telegram backup is restored in post_init."""
+    global ADMINS, APPROVED_USERS, BLOCKED_USERS, PENDING_USERS, ACCESS_STATE_UPDATED_AT
+    ADMINS = set(BOOTSTRAP_ADMINS)
+    APPROVED_USERS = {OWNER_ID} | set(BOOTSTRAP_APPROVED_USERS)
     BLOCKED_USERS = set()
     PENDING_USERS = {}
+    ACCESS_STATE_UPDATED_AT = 0
     try:
         if not ACCESS_STATE_PATH.exists():
+            log.info(
+                "Access state file not found at %s; startup will try the Telegram owner backup.",
+                ACCESS_STATE_PATH,
+            )
             return
         raw = json.loads(ACCESS_STATE_PATH.read_text(encoding="utf-8"))
-        ADMINS = {int(x) for x in raw.get("admins", []) if int(x) != OWNER_ID}
-        APPROVED_USERS = {int(x) for x in raw.get("approved_users", [])}
-        APPROVED_USERS.add(OWNER_ID)
-        BLOCKED_USERS = {int(x) for x in raw.get("blocked_users", []) if int(x) != OWNER_ID}
-        pending = raw.get("pending_users", {}) or {}
-        PENDING_USERS = {int(k): dict(v or {}) for k, v in pending.items()}
-
-        # Role precedence: owner > admin > approved > pending > blocked.
-        # Blocked accounts must never remain active in another role.
-        ADMINS.difference_update(BLOCKED_USERS)
-        APPROVED_USERS.difference_update(BLOCKED_USERS)
-        APPROVED_USERS.add(OWNER_ID)
-        for uid in list(PENDING_USERS):
-            if uid == OWNER_ID or uid in ADMINS or uid in APPROVED_USERS or uid in BLOCKED_USERS:
-                PENDING_USERS.pop(uid, None)
+        _apply_access_payload(raw, merge_bootstrap=True)
+        if not ACCESS_STATE_UPDATED_AT:
+            try:
+                ACCESS_STATE_UPDATED_AT = int(ACCESS_STATE_PATH.stat().st_mtime)
+            except OSError:
+                ACCESS_STATE_UPDATED_AT = 0
     except Exception:
-        log.exception("Access state could not be loaded; failing closed to owner-only mode.")
-        ADMINS = set()
-        APPROVED_USERS = {OWNER_ID}
+        log.exception("Access state could not be loaded; startup will try the Telegram owner backup.")
+        ADMINS = set(BOOTSTRAP_ADMINS)
+        APPROVED_USERS = {OWNER_ID} | set(BOOTSTRAP_APPROVED_USERS)
         BLOCKED_USERS = set()
         PENDING_USERS = {}
+        ACCESS_STATE_UPDATED_AT = 0
 
 
-def save_access_state():
-    """Persist access state atomically when the configured path is writable."""
-    payload = {
-        "admins": sorted(ADMINS),
-        "approved_users": sorted(APPROVED_USERS | {OWNER_ID}),
-        "blocked_users": sorted(BLOCKED_USERS),
-        "pending_users": {str(k): v for k, v in PENDING_USERS.items()},
-    }
+def _encode_access_cloud_payload(payload):
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    packed = zlib.compress(raw, level=9)
+    token = base64.urlsafe_b64encode(packed).decode("ascii")
+    return f"🔐 {ACCESS_CLOUD_MARKER}\n{token}"
+
+
+def _decode_access_cloud_payload(text):
+    text = (text or "").strip()
+    prefix = f"🔐 {ACCESS_CLOUD_MARKER}\n"
+    if not text.startswith(prefix):
+        return None
+    token = text[len(prefix):].strip()
+    if not token:
+        return None
+    packed = base64.urlsafe_b64decode(token.encode("ascii"))
+    raw = zlib.decompress(packed)
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict) or int(payload.get("version") or 0) != 1:
+        return None
+    return payload
+
+
+def _write_access_state_file(payload):
     try:
         ACCESS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = ACCESS_STATE_PATH.with_suffix(ACCESS_STATE_PATH.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(ACCESS_STATE_PATH)
+        return True
     except Exception:
-        log.exception(
-            "Access state could not be saved at %s. Configure a persistent Railway Volume or ACCESS_STATE_PATH.",
-            ACCESS_STATE_PATH,
+        log.warning("Local access-state copy could not be written at %s.", ACCESS_STATE_PATH, exc_info=True)
+        return False
+
+
+def _schedule_access_cloud_sync():
+    """Debounced async mirror to Telegram; never blocks an owner/admin action."""
+    global ACCESS_CLOUD_SYNC_TASK, ACCESS_CLOUD_SYNC_DIRTY
+    if ACCESS_BOT is None:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    ACCESS_CLOUD_SYNC_DIRTY = True
+    if ACCESS_CLOUD_SYNC_TASK is None or ACCESS_CLOUD_SYNC_TASK.done():
+        ACCESS_CLOUD_SYNC_TASK = asyncio.create_task(
+            _access_cloud_sync_worker(),
+            name="access-state-telegram-backup",
         )
+
+
+def save_access_state(sync_cloud=True):
+    """Save locally now and mirror to Telegram without delaying the bot UI."""
+    global ACCESS_STATE_UPDATED_AT
+    ACCESS_STATE_UPDATED_AT = max(int(time.time()), int(ACCESS_STATE_UPDATED_AT or 0) + 1)
+    payload = _access_payload(ACCESS_STATE_UPDATED_AT)
+    _write_access_state_file(payload)
+    if sync_cloud:
+        _schedule_access_cloud_sync()
+
+
+async def _sync_access_state_to_telegram(bot):
+    """Persist the canonical snapshot in the owner's private Telegram chat."""
+    payload = _access_payload()
+    text = _encode_access_cloud_payload(payload)
+    if len(text) > 4000:
+        # This should require hundreds of accounts; fail closed rather than
+        # publishing a truncated/invalid authorization snapshot.
+        raise RuntimeError("access backup exceeds Telegram message size")
+
+    chat = await bot.get_chat(OWNER_ID)
+    pinned = getattr(chat, "pinned_message", None)
+    pinned_text = ((getattr(pinned, "text", None) or getattr(pinned, "caption", None) or "") if pinned else "")
+
+    if pinned and pinned_text.startswith(f"🔐 {ACCESS_CLOUD_MARKER}\n"):
+        if pinned_text != text:
+            await bot.edit_message_text(chat_id=OWNER_ID, message_id=pinned.message_id, text=text)
+        # Re-pin silently so our state is the most recent pinned message.
+        await bot.pin_chat_message(chat_id=OWNER_ID, message_id=pinned.message_id, disable_notification=True)
+        return pinned.message_id
+
+    msg = await bot.send_message(chat_id=OWNER_ID, text=text, disable_notification=True)
+    await bot.pin_chat_message(chat_id=OWNER_ID, message_id=msg.message_id, disable_notification=True)
+    return msg.message_id
+
+
+async def _access_cloud_sync_worker():
+    global ACCESS_CLOUD_SYNC_DIRTY
+    while True:
+        ACCESS_CLOUD_SYNC_DIRTY = False
+        try:
+            await _sync_access_state_to_telegram(ACCESS_BOT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Authorization changes remain active in memory/local copy. A Telegram
+            # backup failure must never stop news delivery or lock the owner out.
+            log.warning("Could not mirror access state to Telegram; will retry on next change/startup.", exc_info=True)
+        if not ACCESS_CLOUD_SYNC_DIRTY:
+            return
+        await asyncio.sleep(0)
+
+
+async def restore_access_state_from_telegram(bot):
+    """Restore the newest state from the owner's pinned bot message at startup."""
+    global ACCESS_STATE_UPDATED_AT
+    try:
+        chat = await bot.get_chat(OWNER_ID)
+        pinned = getattr(chat, "pinned_message", None)
+        text = (getattr(pinned, "text", None) or getattr(pinned, "caption", None) or "") if pinned else ""
+        cloud = _decode_access_cloud_payload(text)
+        if cloud is None:
+            # First run with this mechanism: preserve whatever local/bootstrap
+            # state exists and establish the Telegram backup after startup.
+            return False
+
+        cloud_updated = max(0, int(cloud.get("updated_at") or 0))
+        if cloud_updated >= int(ACCESS_STATE_UPDATED_AT or 0):
+            _apply_access_payload(cloud, merge_bootstrap=True)
+            _write_access_state_file(_access_payload())
+            log.info("Access state restored from Telegram owner backup (%s).", cloud_updated)
+            return True
+        return False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Startup continues with local/bootstrap roles; never make Telegram backup
+        # availability a prerequisite for the bot itself to start.
+        log.warning("Telegram access backup could not be restored; using local/bootstrap state.", exc_info=True)
+        return False
 
 
 def is_owner(user_id):
@@ -188,8 +402,18 @@ CALLBACK_ACTION_DEBOUNCE = 5
 GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
+MAX_TOPIC_RESULTS = 60
 PER_PAGE = 5
 CACHE_TTL = 300
+HOT_CACHE_LIMIT = 260
+SOCIAL_CACHE_TTL = 180
+DIRECT_CACHE_TTL = 90
+SOCIAL_REFRESH_INTERVAL = 90
+DIRECT_REFRESH_INTERVAL = 30
+PROVIDER_LOOP_INTERVAL = 15
+SOCIAL_PROVIDER_TIMEOUT = 12
+DIRECT_PROVIDER_TIMEOUT = 9
+PROVIDER_TRANSLATION_BUDGET = 1.6
 
 URGENT_MONITOR_INTERVAL = 30
 URGENT_INITIAL_DELAY = 8
@@ -242,6 +466,8 @@ class SimpleCache:
 
 NEWS_CACHE = SimpleCache(CACHE_TTL)
 BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
+SOCIAL_CACHE = SimpleCache(SOCIAL_CACHE_TTL)
+DIRECT_CACHE = SimpleCache(DIRECT_CACHE_TTL)
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
@@ -259,6 +485,12 @@ URGENT_BASELINE_READY = False
 URGENT_MONITOR_TASK = None
 BACKGROUND_TASKS: Set[asyncio.Task] = set()
 NEWS_COLLECTION_TASK = None
+PROVIDER_REFRESH_TASK = None
+PROVIDER_MONITOR_TASK = None
+PROVIDER_MONITOR_STARTED = False
+LAST_SOCIAL_REFRESH = 0.0
+LAST_DIRECT_REFRESH = 0.0
+LAST_NEWS_REFRESH = 0.0
 SEEN_CALLBACK_IDS: Dict[str, float] = {}
 RECENT_CALLBACK_ACTIONS: Dict[str, float] = {}
 
@@ -515,7 +747,253 @@ async def initialize_custom_emoji_pack(application):
         log.exception("Custom emoji pack failed; fallback enabled.")
 
 
+def _parse_provider_datetime(value):
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _provider_domain(url):
+    try:
+        return (urllib.parse.urlparse(str(url or "")).hostname or "").removeprefix("www.").lower()
+    except Exception:
+        return ""
+
+
+def _provider_event_text(event):
+    return normalize_text(
+        " ".join(
+            str(event.get(key, "") or "")
+            for key in ("title", "original_title", "summary", "source_type", "organization", "organization_ar")
+        )
+    )
+
+
+def _provider_topic(event, provider):
+    """Assign one and only one specialist section from event substance."""
+    text = _provider_event_text(event)
+    route = str(event.get("routing_hint", "") or "")
+
+    economy_terms = (
+        "sanction", "ofac", "designation", "asset freeze", "financial", "tariff",
+        "central bank", "interest rate", "market", "econom", "trade", "energy price",
+        "عقوبات", "تجميد اصول", "تجميد الأصول", "اقتصاد", "اسواق", "أسواق",
+        "بنك مركزي", "فائده", "فائدة", "تعرفه", "تعرفة", "تجاره", "تجارة",
+    )
+    security_terms = (
+        "military", "defence", "defense", "missile", "drone", "airstrike", "navy",
+        "warship", "troops", "attack", "boarding", "hijack", "maritime security",
+        "security incident", "conflict", "weapon", "peacekeeping", "nato",
+        "عسكري", "دفاع", "صاروخ", "طائره مسيره", "طائرة مسيرة", "قصف", "غاره",
+        "غارة", "هجوم", "اشتباك", "قوات", "سلاح", "امن بحري", "أمن بحري",
+    )
+    condemnation_terms = (
+        "condemn", "denounce", "statement on", "expresses concern", "calls for",
+        "ادان", "إدان", "يدين", "تدين", "تعرب عن قلق", "يدعو الى", "يدعو إلى",
+    )
+    breaking_terms = (
+        "explosion", "airstrike", "missile strike", "armed attack", "evacuation",
+        "earthquake", "hijacked", "under attack", "fired upon",
+        "انفجار", "قصف", "غاره", "غارة", "هجوم مسلح", "اخلاء", "إخلاء",
+        "زلزال", "اختطاف سفينه", "اختطاف سفينة", "اطلاق النار", "إطلاق النار",
+    )
+
+    # Breaking is deliberately narrow. Official condemnations do not become breaking.
+    published = _parse_provider_datetime(event.get("published"))
+    recent = True
+    if published is not None:
+        now = datetime.now(timezone.utc)
+        try:
+            recent = abs((now - published.astimezone(timezone.utc)).total_seconds()) <= 6 * 3600
+        except Exception:
+            recent = True
+    status_strength = int(event.get("event_status_strength", 0) or 0)
+    primary = str(event.get("source_role", "") or "") in {"primary", "primary_sensor"}
+    a_plus = str(event.get("source_grade", "") or "") == "A+"
+    concrete_breaking = any(normalize_text(t) in text for t in breaking_terms)
+    condemnation = any(normalize_text(t) in text for t in condemnation_terms)
+    if concrete_breaking and recent and not condemnation and (
+        (provider == "direct_radar" and status_strength >= 80)
+        or (provider == "social_intel" and primary and a_plus)
+    ):
+        return "urg"
+
+    # A diplomatic condemnation/appeal is an official statement even when it
+    # mentions an attack, missile, or conflict in the quoted subject matter.
+    if condemnation:
+        return "forg"
+
+    if any(normalize_text(t) in text for t in economy_terms):
+        return "econ"
+    if any(normalize_text(t) in text for t in security_terms):
+        return "secu"
+
+    # Routing hints are fallback evidence only, never the first classifier.
+    if route == "economy_markets":
+        return "econ"
+    if route == "defense_security":
+        return "secu"
+    if route == "breaking" and concrete_breaking and recent and not condemnation:
+        return "urg"
+    return "forg"
+
+
+def _provider_trust(event):
+    grade = str(event.get("source_grade", "") or "")
+    role = str(event.get("source_role", "") or "")
+    if grade == "A+":
+        base = 99.0
+    elif grade == "A":
+        base = 94.0
+    else:
+        base = 88.0
+    if role in {"support", "support_sensor"}:
+        base -= 2.0
+    return base
+
+
+def _provider_to_news_item(event, provider):
+    title = str(event.get("title", "") or "").strip()
+    if not title:
+        return None
+    content_url = str(event.get("content_url", "") or "").strip()
+    raw_url = str(event.get("url", "") or content_url).strip()
+    display_url = content_url if content_url.startswith(("http://", "https://")) else raw_url
+    if not display_url:
+        return None
+
+    if provider == "social_intel":
+        source = str(
+            event.get("organization_ar")
+            or event.get("organization")
+            or event.get("handle")
+            or "مصدر رسمي"
+        ).strip()
+    else:
+        source = str(
+            event.get("source_name_ar")
+            or event.get("source_name")
+            or "مصدر إنذار رسمي"
+        ).strip()
+
+    attribution = str(event.get("attribution_ar", "") or "").strip()
+    summary = str(event.get("summary", "") or "").strip()
+    if attribution and attribution not in summary:
+        summary = f"{attribution}. {summary}".strip(" .")
+
+    published = _parse_provider_datetime(event.get("published"))
+    topic = _provider_topic(event, provider)
+    item = NewsItem(
+        title=title,
+        url=display_url,
+        source=source,
+        summary=summary,
+        published=published,
+        category=topic,
+        region=str(event.get("region", "") or event.get("entity_ar", "") or "").strip(),
+        original_title=str(event.get("original_title", "") or title).strip(),
+        domain=_provider_domain(display_url),
+        trust_score=_provider_trust(event),
+        urgency_score=20.0 if topic == "urg" else 0.0,
+        relevance_score=float(event.get("priority", 0) or 0) / 10.0,
+        official=True,
+        search_text="",
+        alternate_sources=[],
+        discovery_domain_hint=_provider_domain(display_url),
+        official_source_id="",
+        publication_evidence=f"{provider}:{event.get('source_id', '')}",
+    )
+    item.search_text = normalize_text(
+        f"{item.title} {item.original_title} {item.summary} {item.source} {item.region}"
+    )
+    setattr(item, "_provider_kind", provider)
+    setattr(item, "_exclusive_topic", topic)
+    setattr(item, "_source_role", str(event.get("source_role", "") or ""))
+    setattr(item, "_source_grade", str(event.get("source_grade", "") or ""))
+    setattr(item, "_source_priority", int(event.get("priority", 0) or 0))
+    setattr(item, "_dedup_group", str(event.get("dedup_group", "") or ""))
+    setattr(item, "_canonical_event_url", content_url or display_url)
+    setattr(item, "_event_status", str(event.get("event_status", "") or ""))
+    setattr(item, "_event_status_strength", int(event.get("event_status_strength", 0) or 0))
+    return item
+
+
+async def _adapt_provider_events(events, provider):
+    items = []
+    for event in list(events or []):
+        if not isinstance(event, dict):
+            continue
+        try:
+            item = _provider_to_news_item(event, provider)
+            if item:
+                items.append(item)
+        except Exception:
+            log.exception("Provider event adapter failed provider=%s", provider)
+    if items:
+        try:
+            await translate_news_titles(items, budget=PROVIDER_TRANSLATION_BUDGET)
+        except Exception:
+            log.exception("Provider title translation failed provider=%s", provider)
+
+    # Preserve uncertainty in the visible headline for direct operational reports.
+    if provider == "direct_radar":
+        labels = {
+            "preliminary": "معلومات أولية",
+            "third_party_report": "بلاغ من طرف ثالث",
+            "under_investigation": "قيد التحقيق",
+        }
+        for item in items:
+            label = labels.get(getattr(item, "_event_status", ""))
+            if label and not item.title.startswith(label):
+                item.title = f"{label}: {item.title}"
+                item.search_text = normalize_text(
+                    f"{item.title} {item.original_title} {item.summary} {item.source} {item.region}"
+                )
+    return items
+
+
+def _provider_preference(item):
+    provider = str(getattr(item, "_provider_kind", "") or "")
+    if provider == "direct_radar":
+        provider_rank = 4
+    elif bool(getattr(item, "official", False)) and not provider:
+        provider_rank = 3
+    elif provider == "social_intel":
+        role = str(getattr(item, "_source_role", "") or "")
+        provider_rank = 3 if role == "primary" else 2
+    else:
+        provider_rank = 1
+    return (
+        provider_rank,
+        int(getattr(item, "_event_status_strength", 0) or 0),
+        int(getattr(item, "_source_priority", 0) or 0),
+        float(getattr(item, "trust_score", 0) or 0),
+        _published_seconds(item) or 0,
+    )
+
+
+def _canonical_provider_url(item):
+    value = str(getattr(item, "_canonical_event_url", "") or get_item_url(item) or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        path = re.sub(r"/+", "/", parsed.path or "/").rstrip("/")
+        return f"{host}{path}" if host else ""
+    except Exception:
+        return ""
+
+
 async def _run_news_collection():
+    global LAST_NEWS_REFRESH
     try:
         items = await asyncio.wait_for(
             collect_news(max_items=150),
@@ -524,6 +1002,7 @@ async def _run_news_collection():
         if items:
             items = deduplicate_events(items, limit=150)
             NEWS_CACHE.set("all_news", items)
+            LAST_NEWS_REFRESH = time.monotonic()
             return items
     except asyncio.TimeoutError:
         log.warning("News collection timed out; keeping last available cache.")
@@ -533,17 +1012,12 @@ async def _run_news_collection():
 
 
 async def collect_and_cache_news():
-    """Single-flight collector: concurrent refresh requests share one task."""
+    """Single-flight base collector: concurrent refreshes share one task."""
     global NEWS_COLLECTION_TASK
-
     task = NEWS_COLLECTION_TASK
     if task is None or task.done():
-        task = asyncio.create_task(
-            _run_news_collection(),
-            name="shared-news-collection",
-        )
+        task = asyncio.create_task(_run_news_collection(), name="shared-news-collection")
         NEWS_COLLECTION_TASK = task
-
     try:
         return await asyncio.shield(task)
     finally:
@@ -551,26 +1025,142 @@ async def collect_and_cache_news():
             NEWS_COLLECTION_TASK = None
 
 
-def get_cached_news_view(limit=150):
-    """Read-only UI view: breaking overlay + broad cache, without TTL mutation."""
-    breaking = BREAKING_CACHE.get("breaking_news") or []
+async def _refresh_social_provider():
+    global LAST_SOCIAL_REFRESH
+    if collect_social_intel is None:
+        return SOCIAL_CACHE.peek("social_news") or []
+    try:
+        events = await asyncio.wait_for(collect_social_intel(), timeout=SOCIAL_PROVIDER_TIMEOUT)
+        items = await _adapt_provider_events(events, "social_intel")
+        if items:
+            SOCIAL_CACHE.set("social_news", deduplicate_events(items, limit=80))
+        LAST_SOCIAL_REFRESH = time.monotonic()
+    except asyncio.TimeoutError:
+        log.info("Social provider timed out; keeping previous cache.")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Social provider failed; keeping previous cache.")
+    return SOCIAL_CACHE.peek("social_news") or []
+
+
+async def _refresh_direct_provider():
+    global LAST_DIRECT_REFRESH
+    if collect_direct_radar is None:
+        return DIRECT_CACHE.peek("direct_news") or []
+    try:
+        events = await asyncio.wait_for(collect_direct_radar(), timeout=DIRECT_PROVIDER_TIMEOUT)
+        items = await _adapt_provider_events(events, "direct_radar")
+        if items:
+            DIRECT_CACHE.set("direct_news", deduplicate_events(items, limit=80))
+        LAST_DIRECT_REFRESH = time.monotonic()
+    except asyncio.TimeoutError:
+        log.info("Direct radar timed out; keeping previous cache.")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Direct radar failed; keeping previous cache.")
+    return DIRECT_CACHE.peek("direct_news") or []
+
+
+def get_cached_news_view(limit=HOT_CACHE_LIMIT):
+    """Instant read-only merged snapshot; never performs network I/O."""
+    breaking = BREAKING_CACHE.peek("breaking_news") or []
+    direct = DIRECT_CACHE.peek("direct_news") or []
+    social = SOCIAL_CACHE.peek("social_news") or []
     broad = NEWS_CACHE.peek("all_news") or []
-    return deduplicate_events(list(breaking) + list(broad), limit=limit)
+    return deduplicate_events(
+        list(direct) + list(breaking) + list(social) + list(broad),
+        limit=limit,
+    )
+
+
+def _provider_due(last_refresh, interval):
+    return not last_refresh or (time.monotonic() - last_refresh) >= interval
+
+
+async def _run_all_source_refresh(force=False):
+    jobs = []
+    if force or _provider_due(LAST_NEWS_REFRESH, CACHE_TTL):
+        jobs.append(collect_and_cache_news())
+    if force or _provider_due(LAST_SOCIAL_REFRESH, SOCIAL_REFRESH_INTERVAL):
+        jobs.append(_refresh_social_provider())
+    if force or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL):
+        jobs.append(_refresh_direct_provider())
+    if jobs:
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                log.error("Independent provider refresh failed: %r", result)
+    return get_cached_news_view()
+
+
+async def refresh_all_sources(force=False):
+    """Global single-flight refresh. Provider failures remain isolated."""
+    global PROVIDER_REFRESH_TASK
+    task = PROVIDER_REFRESH_TASK
+    if task is None or task.done():
+        task = asyncio.create_task(
+            _run_all_source_refresh(force=force),
+            name="all-source-refresh",
+        )
+        PROVIDER_REFRESH_TASK = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if PROVIDER_REFRESH_TASK is task and task.done():
+            PROVIDER_REFRESH_TASK = None
+
+
+def trigger_background_refresh(force=False):
+    """Schedule enrichment and return immediately; safe for button handlers."""
+    global PROVIDER_REFRESH_TASK
+    task = PROVIDER_REFRESH_TASK
+    if task is not None and not task.done():
+        return task
+
+    task = asyncio.create_task(
+        _run_all_source_refresh(force=force),
+        name="background-hot-cache-refresh",
+    )
+    PROVIDER_REFRESH_TASK = task
+    BACKGROUND_TASKS.add(task)
+
+    def _done(done_task):
+        global PROVIDER_REFRESH_TASK
+        BACKGROUND_TASKS.discard(done_task)
+        if PROVIDER_REFRESH_TASK is done_task:
+            PROVIDER_REFRESH_TASK = None
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def provider_monitor():
+    """Continuously refill hot caches without putting network work on UI callbacks."""
+    while True:
+        try:
+            await refresh_all_sources(force=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Provider monitor cycle failed.")
+        await asyncio.sleep(PROVIDER_LOOP_INTERVAL)
 
 
 async def get_fresh_news(force_refresh=False):
-    if not force_refresh:
-        cached = NEWS_CACHE.get("all_news")
-        if cached is not None:
-            return deduplicate_events(
-                list(BREAKING_CACHE.get("breaking_news") or []) + list(cached),
-                limit=150,
-            )
-    items = await collect_and_cache_news()
-    return deduplicate_events(
-        list(BREAKING_CACHE.get("breaking_news") or []) + list(items or []),
-        limit=150,
-    )
+    if force_refresh:
+        return await refresh_all_sources(force=True)
+    cached = get_cached_news_view()
+    if cached:
+        if (
+            _provider_due(LAST_NEWS_REFRESH, CACHE_TTL)
+            or _provider_due(LAST_SOCIAL_REFRESH, SOCIAL_REFRESH_INTERVAL)
+            or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL)
+        ):
+            trigger_background_refresh(force=False)
+        return cached
+    return await refresh_all_sources(force=False)
 
 
 def topic_filter(items, topic_key, max_results=25):
@@ -579,7 +1169,11 @@ def topic_filter(items, topic_key, max_results=25):
 
     scored = []
     for item in items:
-        if not is_topic_match(item, topic_key):
+        forced_topic = str(getattr(item, "_exclusive_topic", "") or "")
+        if forced_topic:
+            if forced_topic != topic_key:
+                continue
+        elif not is_topic_match(item, topic_key):
             continue
 
         title = normalize_text(get_item_title(item))
@@ -1207,6 +1801,11 @@ def same_news_event(a, b):
     if na == nb:
         return True
 
+    canonical_a = _canonical_provider_url(a)
+    canonical_b = _canonical_provider_url(b)
+    if canonical_a and canonical_b and canonical_a == canonical_b:
+        return True
+
     ta = news_event_tokens(a)
     tb = news_event_tokens(b)
     if not ta or not tb:
@@ -1291,23 +1890,25 @@ def _merge_event_sources(primary, duplicate):
 
 
 def deduplicate_events(items, limit=None):
-    """Collapse repeated coverage into one event without discarding corroboration."""
-    base = list(deduplicate_news(items or []))
+    """Collapse repeated coverage and retain the closest/highest-authority source."""
+    ordered = sorted(list(items or []), key=_provider_preference, reverse=True)
+    base = list(deduplicate_news(ordered))
     unique = []
     for item in base:
-        matched = None
-        for kept in unique:
+        matched_index = None
+        for idx, kept in enumerate(unique):
             if same_news_event(item, kept):
-                matched = kept
+                matched_index = idx
                 break
-        if matched is not None:
-            _merge_event_sources(matched, item)
+        if matched_index is not None:
+            kept = unique[matched_index]
+            if _provider_preference(item) > _provider_preference(kept):
+                _merge_event_sources(item, kept)
+                unique[matched_index] = item
+            else:
+                _merge_event_sources(kept, item)
             continue
         unique.append(item)
-        if limit is not None and len(unique) >= limit:
-            # Do not stop early: later duplicates may add corroborating sources to
-            # already-kept events.  The slice is applied after the full pass.
-            pass
     return unique[:limit] if limit is not None else unique
 
 
@@ -1603,8 +2204,17 @@ async def urgent_monitor(application):
 
 async def post_init(application):
     global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+    global PROVIDER_MONITOR_STARTED, PROVIDER_MONITOR_TASK
+    global ACCESS_BOT
     if URGENT_MONITOR_STARTED:
         return
+
+    # Railway's container filesystem is disposable. Restore the durable access
+    # snapshot from the owner's existing Telegram private chat before admitting
+    # users or constructing the alert-recipient set. Telegram failure is nonfatal.
+    ACCESS_BOT = application.bot
+    await restore_access_state_from_telegram(application.bot)
+    _schedule_access_cloud_sync()
 
     # Restore only authorized recipients. Old/revoked users are never reconnected.
     ALERT_USERS.clear()
@@ -1616,18 +2226,52 @@ async def post_init(application):
         urgent_monitor(application),
         name="urgent-news-monitor",
     )
+    if not PROVIDER_MONITOR_STARTED:
+        PROVIDER_MONITOR_STARTED = True
+        PROVIDER_MONITOR_TASK = asyncio.create_task(
+            provider_monitor(),
+            name="provider-hot-cache-monitor",
+        )
+
+    # Warm the merged Hot Cache immediately after startup without delaying startup.
+    trigger_background_refresh(force=False)
 
 
 async def post_stop(application):
     global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
+    global PROVIDER_MONITOR_STARTED, PROVIDER_MONITOR_TASK, PROVIDER_REFRESH_TASK
+    global ACCESS_BOT, ACCESS_CLOUD_SYNC_TASK
 
+    access_task = ACCESS_CLOUD_SYNC_TASK
+    ACCESS_CLOUD_SYNC_TASK = None
+    ACCESS_BOT = None
     task = URGENT_MONITOR_TASK
+    provider_task = PROVIDER_MONITOR_TASK
+    PROVIDER_MONITOR_TASK = None
+    PROVIDER_MONITOR_STARTED = False
+    refresh_task = PROVIDER_REFRESH_TASK
+    PROVIDER_REFRESH_TASK = None
     URGENT_MONITOR_TASK = None
     URGENT_MONITOR_STARTED = False
 
     for bg_task in list(BACKGROUND_TASKS):
         if not bg_task.done():
             bg_task.cancel()
+
+    if access_task and not access_task.done():
+        access_task.cancel()
+        try:
+            await access_task
+        except asyncio.CancelledError:
+            pass
+
+    for extra_task in (provider_task, refresh_task):
+        if extra_task and not extra_task.done():
+            extra_task.cancel()
+            try:
+                await extra_task
+            except asyncio.CancelledError:
+                pass
 
     if task and not task.done():
         task.cancel()
@@ -1662,7 +2306,7 @@ async def send_topic_update(message, key, previous_results, user_id=None):
     """Refresh a topic in the background and send only meaningful additions."""
     try:
         fresh = await get_fresh_news(force_refresh=True)
-        current = topic_filter(fresh, key, MAX_SEARCH_RESULTS)
+        current = topic_filter(fresh, key, MAX_TOPIC_RESULTS)
         if not current:
             return
 
@@ -1718,7 +2362,7 @@ async def show_topic(query, user_id, key, page):
         raw_results = []
         if page == 1:
             cached = get_cached_news_view()
-            raw_results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+            raw_results = topic_filter(cached, key, MAX_TOPIC_RESULTS)
             results = _filter_unseen_topic_events(user_id, key, raw_results)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
@@ -1726,7 +2370,7 @@ async def show_topic(query, user_id, key, page):
             results = USER_TOPIC_RESULTS.get(snapshot_key, [])
             if not results:
                 cached = NEWS_CACHE.peek("all_news") or []
-                results = topic_filter(cached, key, MAX_SEARCH_RESULTS)
+                results = topic_filter(cached, key, MAX_TOPIC_RESULTS)
                 if results:
                     USER_TOPIC_RESULTS[snapshot_key] = list(results)
 
@@ -1753,14 +2397,11 @@ async def show_topic(query, user_id, key, page):
             start = (page - 1) * PER_PAGE
             _remember_topic_events(user_id, key, results[start:start + PER_PAGE])
 
-            # A populated section is already useful. Do not launch a forced
-            # refresh merely because the user opened it or pressed "المزيد".
-            # Only a sparse first page may request background enrichment.
-            if page == 1 and len(results) < PER_PAGE:
-                track_task(
-                    send_topic_update(query.message, key, results, user_id),
-                    f"topic-refresh-{user_id}-{key}",
-                )
+            # Page 1 is returned from the ready snapshot first. Then one global
+            # single-flight refresh may refill the next Hot Cache generation.
+            # Page 2+ keeps this user's current snapshot stable and instant.
+            if page == 1:
+                trigger_background_refresh(force=False)
             return
 
         # The topic has cached stories, but this user has already seen them.
@@ -2060,12 +2701,9 @@ async def button_handler(update, context):
         )
 
         try:
-            items = NEWS_CACHE.peek("all_news") or []
+            items = get_cached_news_view()
             if not items:
-                track_task(
-                    collect_and_cache_news(),
-                    f"analysis-cache-warm-{user_id}",
-                )
+                trigger_background_refresh(force=False)
                 await status.edit_text(
                     "🧠 لا توجد بيانات جاهزة للتحليل الآن.\n"
                     "📡 جاري تحديث التغطية في الخلفية، ثم أعد المحاولة بعد قليل."
@@ -2146,7 +2784,7 @@ async def handle_user_message(update, context):
             # Use whatever cache already exists, but never start a full collection
             # while the user's direct search is running. Online discovery below
             # provides fresh results independently.
-            cached = NEWS_CACHE.peek("all_news") or []
+            cached = get_cached_news_view()
 
             local_results = await search_news(
                 cached,

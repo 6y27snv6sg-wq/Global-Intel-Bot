@@ -1,1330 +1,782 @@
-
 """
 Global-Intel-Bot
 Verified International Intelligence Sources
 ============================================
 
-هذا الملف مخصص للمصادر الرسمية الدولية عبر:
-- Telegram
-- X
+مزود Telegram + X للمصادر الرسمية الدولية المثبتة.
 
-قواعد القبول:
-1) لا يدخل المصدر إلا بعد إثبات رسميته من موقع حكومي/مؤسسي أصلي.
-2) لا يكفي أن يكون رسميًا؛ يجب أن يحمل قيمة واضحة في الشؤون الدولية.
-3) A+ = مصدر أولي عالي القيمة والأولوية.
-4) A  = مصدر رسمي مفيد، لكنه ثانوي أو متخصص أو معرض للتكرار.
-5) الحسابات اللغوية/الترجمة لا تُعامل كخبر مستقل إذا سبقها المصدر الرئيسي.
-6) لا يحدد المصدر القسم النهائي للخبر؛ محتوى الحدث هو الذي يحدد القسم.
-7) الخبر الواحد لا يظهر في أكثر من قسم.
-8) الروايات والتصريحات الرسمية تُنسب إلى جهتها ولا تقدم كحقيقة مستقلة.
-
-مهم:
-- لا تضف handle بالتخمين.
-- المصادر غير مكتملة الإثبات تبقى خارج VERIFIED_SOCIAL_SOURCES.
+القواعد:
+1) لا يضاف handle بالتخمين.
+2) المصدر الرسمي لا يكفي وحده؛ يجب أن تكون للمادة قيمة دولية.
+3) الحسابات اللغوية/المساندة لا تنشئ قصة ثانية عند تطابق الحدث.
+4) محتوى الحدث هو الذي يحدد القسم النهائي، وليس اسم الناشر.
+5) التصريحات والروايات الرسمية تُنسب إلى جهتها.
+6) فشل منصة أو مصدر لا يوقف بقية المزودات.
+7) لا توجد عملية polling تلقائية هنا؛ bot.py يستدعي collector لاحقًا من مسار خلفي.
+8) Telegram يُقرأ من صفحة القناة العامة فقط.
+9) X يُقرأ فقط عبر X API الرسمي عند وجود X_BEARER_TOKEN؛ لا scraping هش.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set
+import asyncio
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import urlparse
+
+import aiohttp
 
 
-# =========================================================
-# GRADES
-# =========================================================
+log = logging.getLogger(__name__)
 
 GRADE_A_PLUS = "A+"
 GRADE_A = "A"
-
-VALID_GRADES = {
-    GRADE_A_PLUS,
-    GRADE_A,
-}
-
-
-# =========================================================
-# PLATFORMS
-# =========================================================
+VALID_GRADES = {GRADE_A_PLUS, GRADE_A}
 
 PLATFORM_X = "x"
 PLATFORM_TELEGRAM = "telegram"
-
-VALID_PLATFORMS = {
-    PLATFORM_X,
-    PLATFORM_TELEGRAM,
-}
-
-
-# =========================================================
-# SOURCE ROLES
-# =========================================================
+VALID_PLATFORMS = {PLATFORM_X, PLATFORM_TELEGRAM}
 
 ROLE_PRIMARY = "primary"
 ROLE_SUPPORT = "support"
 ROLE_SPECIALIZED = "specialized"
-
-VALID_ROLES = {
-    ROLE_PRIMARY,
-    ROLE_SUPPORT,
-    ROLE_SPECIALIZED,
-}
-
-
-# =========================================================
-# ROUTING HINTS
-#
-# هذه ليست تصنيفًا نهائيًا.
-# الخبر يُصنف لاحقًا حسب مضمون الحدث.
-# =========================================================
+VALID_ROLES = {ROLE_PRIMARY, ROLE_SUPPORT, ROLE_SPECIALIZED}
 
 ROUTE_OFFICIAL = "official_statement"
 ROUTE_DEFENSE = "defense_security"
 ROUTE_ECONOMY = "economy_markets"
 ROUTE_BREAKING = "breaking"
 ROUTE_DYNAMIC = "dynamic"
-
 VALID_ROUTING_HINTS = {
-    ROUTE_OFFICIAL,
-    ROUTE_DEFENSE,
-    ROUTE_ECONOMY,
-    ROUTE_BREAKING,
-    ROUTE_DYNAMIC,
+    ROUTE_OFFICIAL, ROUTE_DEFENSE, ROUTE_ECONOMY,
+    ROUTE_BREAKING, ROUTE_DYNAMIC,
 }
 
-
-# =========================================================
-# INTERNATIONAL VALUE TOPICS
-# =========================================================
-
 INTERNATIONAL_TOPICS: Set[str] = {
-    "foreign_policy",
-    "diplomacy",
-    "international_relations",
-    "geopolitics",
-    "war",
-    "conflict",
-    "ceasefire",
-    "mediation",
-    "sanctions",
-    "financial_sanctions",
-    "defense",
-    "military",
-    "military_operations",
-    "military_alliances",
-    "international_security",
-    "nuclear",
-    "nuclear_security",
-    "nuclear_safety",
-    "safeguards",
-    "peacekeeping",
-    "strategic_affairs",
-    "international_trade",
-    "global_economy",
-    "energy_security",
-    "international_energy",
-    "summits",
-    "multilateral_relations",
-    "international_decisions",
-    "terrorism",
+    "foreign_policy", "diplomacy", "international_relations", "geopolitics",
+    "war", "conflict", "ceasefire", "mediation", "sanctions",
+    "financial_sanctions", "defense", "military", "military_operations",
+    "military_alliances", "international_security", "nuclear",
+    "nuclear_security", "nuclear_safety", "safeguards", "peacekeeping",
+    "strategic_affairs", "international_trade", "global_economy",
+    "energy_security", "international_energy", "summits",
+    "multilateral_relations", "international_decisions", "terrorism",
     "arms_control",
 }
 
-
-# =========================================================
-# CONTENT TO EXCLUDE
-# =========================================================
-
 EXCLUDED_CONTENT_TYPES: Set[str] = {
-    "local_services",
-    "municipal_news",
-    "routine_domestic_news",
-    "domestic_ceremonies",
-    "routine_protocol",
-    "tourism",
-    "local_events",
-    "recruitment",
-    "jobs",
-    "internal_hr",
-    "passport_services",
-    "visa_services",
-    "routine_consular_services",
-    "customer_service",
-    "traffic",
-    "weather",
-    "sports",
-    "entertainment",
-    "culture_only",
-    "awareness_campaign",
-    "commemoration_only",
-    "human_interest_only",
+    "local_services", "municipal_news", "routine_domestic_news",
+    "domestic_ceremonies", "routine_protocol", "tourism", "local_events",
+    "recruitment", "jobs", "internal_hr", "passport_services",
+    "visa_services", "routine_consular_services", "customer_service",
+    "traffic", "weather", "sports", "entertainment", "culture_only",
+    "awareness_campaign", "commemoration_only", "human_interest_only",
 }
 
+MAX_RESPONSE_BYTES = 900_000
+MAX_POSTS_PER_SOURCE = 8
+HTTP_TIMEOUT_SECONDS = 6
+CIRCUIT_FAILURES = 3
+CIRCUIT_COOLDOWN_SECONDS = 300
+X_USER_ID_CACHE_TTL = 6 * 3600
+X_API_BASE = "https://api.x.com/2"
+USER_AGENT = "Global-Intel-Bot/1.0 (official-social-source monitor)"
+DEFAULT_INCLUDE_SUPPORT = False
 
-# =========================================================
-# VERIFIED SOCIAL SOURCES
-# =========================================================
+_CIRCUIT_STATE: Dict[str, Dict[str, float]] = {}
+_X_USER_ID_CACHE: Dict[str, Tuple[str, float]] = {}
+
+
+def _src(
+    source_id: str,
+    entity: str,
+    entity_ar: str,
+    organization: str,
+    organization_ar: str,
+    platform: str,
+    handle: str,
+    grade: str,
+    role: str,
+    language: str,
+    routing_hint: str,
+    topics: Iterable[str],
+    dedup_group: str,
+    priority: int,
+    official_proof: str,
+    notes: str = "",
+) -> Dict:
+    url = f"https://t.me/{handle}" if platform == PLATFORM_TELEGRAM else f"https://x.com/{handle}"
+    return {
+        "id": source_id, "entity": entity, "entity_ar": entity_ar,
+        "organization": organization, "organization_ar": organization_ar,
+        "platform": platform, "handle": handle, "url": url,
+        "grade": grade, "role": role, "active": True, "language": language,
+        "routing_hint": routing_hint, "topics": set(topics),
+        "dedup_group": dedup_group, "priority": priority,
+        "official_proof": official_proof, "notes": notes,
+    }
+
 
 VERIFIED_SOCIAL_SOURCES: List[Dict] = [
-
-    # =====================================================
-    # MIDDLE EAST
-    # =====================================================
-
-    {
-        "id": "oman_mofa_x",
-        "entity": "Oman",
-        "entity_ar": "سلطنة عُمان",
-        "organization": "Ministry of Foreign Affairs",
-        "organization_ar": "وزارة الخارجية العُمانية",
-        "platform": PLATFORM_X,
-        "handle": "FMofOman",
-        "url": "https://x.com/FMofOman",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "multi",
-        "routing_hint": ROUTE_OFFICIAL,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "mediation",
-            "conflict",
-        },
-        "dedup_group": "oman_mofa",
-        "priority": 100,
-        "official_proof": "https://www.fm.gov.om/",
-        "notes": (
-            "مصدر أساسي للدبلوماسية العُمانية والوساطات "
-            "والملفات الإقليمية والدولية."
-        ),
-    },
-
-
-    # =====================================================
-    # RUSSIA
-    # =====================================================
-
-    {
-        "id": "russia_mofa_telegram",
-        "entity": "Russia",
-        "entity_ar": "روسيا",
-        "organization": "Ministry of Foreign Affairs",
-        "organization_ar": "وزارة الخارجية الروسية",
-        "platform": PLATFORM_TELEGRAM,
-        "handle": "MID_Russia",
-        "url": "https://t.me/MID_Russia",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "ru",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "conflict",
-            "sanctions",
-            "international_security",
-        },
-        "dedup_group": "russia_mofa",
-        "priority": 100,
-        "official_proof": "https://mid.ru/",
-        "notes": (
-            "القناة الروسية الأساسية لوزارة الخارجية. "
-            "تُفضّل على النسخة الإنجليزية عند تطابق الحدث."
-        ),
-    },
-
-    {
-        "id": "russia_mofa_telegram_en",
-        "entity": "Russia",
-        "entity_ar": "روسيا",
-        "organization": "Ministry of Foreign Affairs",
-        "organization_ar": "وزارة الخارجية الروسية",
-        "platform": PLATFORM_TELEGRAM,
-        "handle": "MFARussia",
-        "url": "https://t.me/MFARussia",
-        "grade": GRADE_A,
-        "role": ROLE_SUPPORT,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "conflict",
-            "sanctions",
-        },
-        "dedup_group": "russia_mofa",
-        "priority": 75,
-        "official_proof": "https://mid.ru/",
-        "notes": (
-            "قناة إنجليزية مساندة. "
-            "لا تنشر نفس الحدث مرة ثانية إذا وصل من MID_Russia."
-        ),
-    },
-
-
-    # =====================================================
-    # FRANCE
-    # =====================================================
-
-    {
-        "id": "france_mofa_x",
-        "entity": "France",
-        "entity_ar": "فرنسا",
-        "organization": "Ministry for Europe and Foreign Affairs",
-        "organization_ar": "وزارة أوروبا والشؤون الخارجية الفرنسية",
-        "platform": PLATFORM_X,
-        "handle": "francediplo",
-        "url": "https://x.com/francediplo",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "fr",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "sanctions",
-            "conflict",
-        },
-        "dedup_group": "france_mofa",
-        "priority": 100,
-        "official_proof": "https://www.diplomatie.gouv.fr/",
-        "notes": "الحساب الفرنسي الأساسي للخارجية.",
-    },
-
-    {
-        "id": "france_mofa_x_en",
-        "entity": "France",
-        "entity_ar": "فرنسا",
-        "organization": "Ministry for Europe and Foreign Affairs",
-        "organization_ar": "وزارة أوروبا والشؤون الخارجية الفرنسية",
-        "platform": PLATFORM_X,
-        "handle": "francediplo_EN",
-        "url": "https://x.com/francediplo_EN",
-        "grade": GRADE_A,
-        "role": ROLE_SUPPORT,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-        },
-        "dedup_group": "france_mofa",
-        "priority": 75,
-        "official_proof": "https://www.diplomatie.gouv.fr/",
-        "notes": "نسخة إنجليزية مساندة وليست قصة مستقلة.",
-    },
-
-    {
-        "id": "france_mofa_x_ar",
-        "entity": "France",
-        "entity_ar": "فرنسا",
-        "organization": "Ministry for Europe and Foreign Affairs",
-        "organization_ar": "وزارة أوروبا والشؤون الخارجية الفرنسية",
-        "platform": PLATFORM_X,
-        "handle": "francediplo_AR",
-        "url": "https://x.com/francediplo_AR",
-        "grade": GRADE_A,
-        "role": ROLE_SUPPORT,
-        "active": True,
-        "language": "ar",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-        },
-        "dedup_group": "france_mofa",
-        "priority": 72,
-        "official_proof": "https://www.diplomatie.gouv.fr/",
-        "notes": (
-            "مفيد للنص العربي الرسمي، "
-            "لكن لا يُنشئ خبرًا جديدًا إذا وُجد الحدث من الحساب الأساسي."
-        ),
-    },
-
-
-    # =====================================================
-    # GERMANY
-    # =====================================================
-
-    {
-        "id": "germany_mofa_x",
-        "entity": "Germany",
-        "entity_ar": "ألمانيا",
-        "organization": "Federal Foreign Office",
-        "organization_ar": "وزارة الخارجية الألمانية",
-        "platform": PLATFORM_X,
-        "handle": "AuswaertigesAmt",
-        "url": "https://x.com/AuswaertigesAmt",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "de",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "international_security",
-            "conflict",
-        },
-        "dedup_group": "germany_mofa",
-        "priority": 100,
-        "official_proof": "https://www.auswaertiges-amt.de/",
-        "notes": (
-            "الخارجية الألمانية أثبتت الحساب مجددًا في محتواها الرسمي لعام 2026."
-        ),
-    },
-
-    {
-        "id": "germany_mofa_x_en",
-        "entity": "Germany",
-        "entity_ar": "ألمانيا",
-        "organization": "Federal Foreign Office",
-        "organization_ar": "وزارة الخارجية الألمانية",
-        "platform": PLATFORM_X,
-        "handle": "GermanyDiplo",
-        "url": "https://x.com/GermanyDiplo",
-        "grade": GRADE_A,
-        "role": ROLE_SUPPORT,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "international_security",
-        },
-        "dedup_group": "germany_mofa",
-        "priority": 78,
-        "official_proof": "https://www.auswaertiges-amt.de/",
-        "notes": (
-            "الحساب الإنجليزي الرسمي؛ "
-            "يستخدم كمساند للحساب الألماني الأساسي."
-        ),
-    },
-
-
-    # =====================================================
-    # UNITED KINGDOM - FOREIGN AFFAIRS
-    # =====================================================
-
-    {
-        "id": "uk_fcdo_x",
-        "entity": "United Kingdom",
-        "entity_ar": "المملكة المتحدة",
-        "organization": "Foreign, Commonwealth & Development Office",
-        "organization_ar": "وزارة الخارجية والتنمية البريطانية",
-        "platform": PLATFORM_X,
-        "handle": "FCDOGovUK",
-        "url": "https://x.com/FCDOGovUK",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "sanctions",
-            "conflict",
-            "international_security",
-        },
-        "dedup_group": "uk_fcdo",
-        "priority": 100,
-        "official_proof": "https://www.gov.uk/government/organisations/foreign-commonwealth-development-office",
-        "notes": "الحساب المؤسسي الأساسي للخارجية البريطانية.",
-    },
-
-    {
-        "id": "uk_fcdo_x_ar",
-        "entity": "United Kingdom",
-        "entity_ar": "المملكة المتحدة",
-        "organization": "Foreign, Commonwealth & Development Office",
-        "organization_ar": "وزارة الخارجية والتنمية البريطانية",
-        "platform": PLATFORM_X,
-        "handle": "FCDOArabic",
-        "url": "https://x.com/FCDOArabic",
-        "grade": GRADE_A,
-        "role": ROLE_SUPPORT,
-        "active": True,
-        "language": "ar",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-        },
-        "dedup_group": "uk_fcdo",
-        "priority": 72,
-        "official_proof": "https://www.gov.uk/government/organisations/foreign-commonwealth-development-office",
-        "notes": (
-            "يستخدم لدعم الترجمة العربية فقط عند تطابق الحدث "
-            "ولا يُعامل كمصدر قصة منفصل."
-        ),
-    },
-
-
-    # =====================================================
-    # UNITED KINGDOM - DEFENCE
-    # =====================================================
-
-    {
-        "id": "uk_mod_press_x",
-        "entity": "United Kingdom",
-        "entity_ar": "المملكة المتحدة",
-        "organization": "Ministry of Defence",
-        "organization_ar": "وزارة الدفاع البريطانية",
-        "platform": PLATFORM_X,
-        "handle": "DefenceHQPress",
-        "url": "https://x.com/DefenceHQPress",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "defense",
-            "military",
-            "military_operations",
-            "international_security",
-            "military_alliances",
-            "conflict",
-        },
-        "dedup_group": "uk_mod",
-        "priority": 100,
-        "official_proof": "https://www.gov.uk/government/organisations/ministry-of-defence",
-        "notes": (
-            "الأولوية للمواد الصحفية والعملياتية الدولية "
-            "على الحساب العام لوزارة الدفاع."
-        ),
-    },
-
-    {
-        "id": "uk_mod_x",
-        "entity": "United Kingdom",
-        "entity_ar": "المملكة المتحدة",
-        "organization": "Ministry of Defence",
-        "organization_ar": "وزارة الدفاع البريطانية",
-        "platform": PLATFORM_X,
-        "handle": "DefenceHQ",
-        "url": "https://x.com/DefenceHQ",
-        "grade": GRADE_A,
-        "role": ROLE_SUPPORT,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "defense",
-            "military",
-            "international_security",
-        },
-        "dedup_group": "uk_mod",
-        "priority": 80,
-        "official_proof": "https://www.gov.uk/government/organisations/ministry-of-defence",
-        "notes": "مصدر مساند؛ يمنع تكراره مع DefenceHQPress.",
-    },
-
-
-    # =====================================================
-    # JAPAN
-    # =====================================================
-
-    {
-        "id": "japan_mofa_x_en",
-        "entity": "Japan",
-        "entity_ar": "اليابان",
-        "organization": "Ministry of Foreign Affairs",
-        "organization_ar": "وزارة الخارجية اليابانية",
-        "platform": PLATFORM_X,
-        "handle": "MofaJapan_en",
-        "url": "https://x.com/MofaJapan_en",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "international_security",
-            "sanctions",
-            "strategic_affairs",
-        },
-        "dedup_group": "japan_mofa",
-        "priority": 100,
-        "official_proof": "https://www.mofa.go.jp/",
-        "notes": "الحساب الإنجليزي الرسمي مناسب مباشرة للرصد الدولي.",
-    },
-
-
-    # =====================================================
-    # AUSTRALIA
-    # =====================================================
-
-    {
-        "id": "australia_dfat_x",
-        "entity": "Australia",
-        "entity_ar": "أستراليا",
-        "organization": "Department of Foreign Affairs and Trade",
-        "organization_ar": "وزارة الخارجية والتجارة الأسترالية",
-        "platform": PLATFORM_X,
-        "handle": "DFAT",
-        "url": "https://x.com/DFAT",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "sanctions",
-            "international_trade",
-            "international_security",
-        },
-        "dedup_group": "australia_dfat",
-        "priority": 100,
-        "official_proof": "https://www.dfat.gov.au/",
-        "notes": (
-            "تُستبعد منه تحذيرات السفر والخدمات القنصلية الروتينية."
-        ),
-    },
-
-
-    # =====================================================
-    # INDIA
-    # =====================================================
-
-    {
-        "id": "india_mea_x",
-        "entity": "India",
-        "entity_ar": "الهند",
-        "organization": "Ministry of External Affairs",
-        "organization_ar": "وزارة الشؤون الخارجية الهندية",
-        "platform": PLATFORM_X,
-        "handle": "MEAIndia",
-        "url": "https://x.com/MEAIndia",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "strategic_affairs",
-            "international_security",
-            "conflict",
-        },
-        "dedup_group": "india_mea",
-        "priority": 100,
-        "official_proof": "https://www.mea.gov.in/",
-        "notes": (
-            "تُستبعد حسابات الجوازات والخدمات القنصلية "
-            "ولا تضاف لهذا السجل."
-        ),
-    },
-
-
-    # =====================================================
-    # EUROPEAN UNION - EEAS
-    # =====================================================
-
-    {
-        "id": "eu_eeas_x",
-        "entity": "European Union",
-        "entity_ar": "الاتحاد الأوروبي",
-        "organization": "European External Action Service",
-        "organization_ar": "دائرة العمل الخارجي الأوروبية",
-        "platform": PLATFORM_X,
-        "handle": "eu_eeas",
-        "url": "https://x.com/eu_eeas",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "foreign_policy",
-            "diplomacy",
-            "international_relations",
-            "sanctions",
-            "conflict",
-            "international_security",
-        },
-        "dedup_group": "eu_eeas",
-        "priority": 100,
-        "official_proof": "https://www.eeas.europa.eu/",
-        "notes": "المصدر الأساسي للسياسة الخارجية للاتحاد الأوروبي.",
-    },
-
-    {
-        "id": "eu_security_defence_x",
-        "entity": "European Union",
-        "entity_ar": "الاتحاد الأوروبي",
-        "organization": "EU Security and Defence",
-        "organization_ar": "الأمن والدفاع في الاتحاد الأوروبي",
-        "platform": PLATFORM_X,
-        "handle": "EUSec_Defence",
-        "url": "https://x.com/EUSec_Defence",
-        "grade": GRADE_A,
-        "role": ROLE_SPECIALIZED,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "defense",
-            "military",
-            "international_security",
-            "military_operations",
-        },
-        "dedup_group": "eu_security_defence",
-        "priority": 88,
-        "official_proof": "https://www.eeas.europa.eu/",
-        "notes": "يُستخدم فقط للمواد ذات القيمة الدفاعية والأمنية الدولية.",
-    },
-
-
-    # =====================================================
-    # COUNCIL OF THE EUROPEAN UNION
-    # =====================================================
-
-    {
-        "id": "eu_council_press_x",
-        "entity": "European Union",
-        "entity_ar": "الاتحاد الأوروبي",
-        "organization": "Council of the European Union",
-        "organization_ar": "مجلس الاتحاد الأوروبي",
-        "platform": PLATFORM_X,
-        "handle": "EUCouncilPress",
-        "url": "https://x.com/EUCouncilPress",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "sanctions",
-            "foreign_policy",
-            "international_decisions",
-            "summits",
-            "international_security",
-            "defense",
-        },
-        "dedup_group": "eu_council",
-        "priority": 100,
-        "official_proof": "https://www.consilium.europa.eu/",
-        "notes": (
-            "قوي جدًا للعقوبات وقرارات المجلس "
-            "والقمم والسياسة الخارجية."
-        ),
-    },
-
-
-    # =====================================================
-    # NATO
-    # =====================================================
-
-    {
-        "id": "nato_press_x",
-        "entity": "NATO",
-        "entity_ar": "حلف شمال الأطلسي",
-        "organization": "NATO Press",
-        "organization_ar": "المكتب الصحفي لحلف شمال الأطلسي",
-        "platform": PLATFORM_X,
-        "handle": "NATOPress",
-        "url": "https://x.com/NATOPress",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "defense",
-            "military",
-            "military_operations",
-            "military_alliances",
-            "international_security",
-            "conflict",
-        },
-        "dedup_group": "nato",
-        "priority": 100,
-        "official_proof": "https://www.nato.int/",
-        "notes": "الأولوية لأخبار وبيانات الناتو ذات القيمة الدولية.",
-    },
-
-    {
-        "id": "nato_general_x",
-        "entity": "NATO",
-        "entity_ar": "حلف شمال الأطلسي",
-        "organization": "NATO",
-        "organization_ar": "حلف شمال الأطلسي",
-        "platform": PLATFORM_X,
-        "handle": "NATO",
-        "url": "https://x.com/NATO",
-        "grade": GRADE_A,
-        "role": ROLE_SUPPORT,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "defense",
-            "military_alliances",
-            "international_security",
-        },
-        "dedup_group": "nato",
-        "priority": 82,
-        "official_proof": "https://www.nato.int/",
-        "notes": "يمنع تكراره إذا سبق NATOPress بنفس الحدث.",
-    },
-
-    {
-        "id": "nato_cmc_x",
-        "entity": "NATO",
-        "entity_ar": "حلف شمال الأطلسي",
-        "organization": "NATO Military Committee",
-        "organization_ar": "اللجنة العسكرية لحلف شمال الأطلسي",
-        "platform": PLATFORM_X,
-        "handle": "CMC_NATO",
-        "url": "https://x.com/CMC_NATO",
-        "grade": GRADE_A,
-        "role": ROLE_SPECIALIZED,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "defense",
-            "military",
-            "international_security",
-            "strategic_affairs",
-        },
-        "dedup_group": "nato_military",
-        "priority": 85,
-        "official_proof": "https://www.nato.int/",
-        "notes": "يُقبل عندما يقدم تطورًا عسكريًا دوليًا فريدًا.",
-    },
-
-    {
-        "id": "nato_pascad_x",
-        "entity": "NATO",
-        "entity_ar": "حلف شمال الأطلسي",
-        "organization": "NATO International Military Staff",
-        "organization_ar": "الهيئة العسكرية الدولية في الناتو",
-        "platform": PLATFORM_X,
-        "handle": "NATO_PASCAD",
-        "url": "https://x.com/NATO_PASCAD",
-        "grade": GRADE_A,
-        "role": ROLE_SPECIALIZED,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "defense",
-            "military",
-            "international_security",
-        },
-        "dedup_group": "nato_military",
-        "priority": 82,
-        "official_proof": "https://www.nato.int/",
-        "notes": "مصدر عسكري متخصص، وليس بديلًا عن NATOPress.",
-    },
-
-
-    # =====================================================
-    # IAEA
-    # =====================================================
-
-    {
-        "id": "iaea_x",
-        "entity": "IAEA",
-        "entity_ar": "الوكالة الدولية للطاقة الذرية",
-        "organization": "International Atomic Energy Agency",
-        "organization_ar": "الوكالة الدولية للطاقة الذرية",
-        "platform": PLATFORM_X,
-        "handle": "IAEAorg",
-        "url": "https://x.com/IAEAorg",
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_PRIMARY,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DYNAMIC,
-        "topics": {
-            "nuclear",
-            "nuclear_security",
-            "nuclear_safety",
-            "safeguards",
-            "international_security",
-            "conflict",
-        },
-        "dedup_group": "iaea",
-        "priority": 100,
-        "official_proof": "https://www.iaea.org/",
-        "notes": (
-            "مصدر أولي للضمانات والتفتيش والمنشآت النووية. "
-            "القسم يتحدد حسب مضمون الحدث."
-        ),
-    },
-
-
-    # =====================================================
-    # UNITED NATIONS PEACEKEEPING
-    # =====================================================
-
-    {
-        "id": "un_peacekeeping_x",
-        "entity": "United Nations",
-        "entity_ar": "الأمم المتحدة",
-        "organization": "United Nations Peacekeeping",
-        "organization_ar": "عمليات حفظ السلام التابعة للأمم المتحدة",
-        "platform": PLATFORM_X,
-        "handle": "UNPeacekeeping",
-        "url": "https://x.com/UNPeacekeeping",
-        "grade": GRADE_A,
-        "role": ROLE_SPECIALIZED,
-        "active": True,
-        "language": "en",
-        "routing_hint": ROUTE_DEFENSE,
-        "topics": {
-            "peacekeeping",
-            "conflict",
-            "ceasefire",
-            "international_security",
-        },
-        "dedup_group": "un_peacekeeping",
-        "priority": 86,
-        "official_proof": "https://peacekeeping.un.org/",
-        "notes": (
-            "تُستبعد الحملات التوعوية والمناسبات والمحتوى الإنساني "
-            "الذي لا يحمل تطورًا دوليًا."
-        ),
-    },
+    _src("oman_mofa_x","Oman","سلطنة عُمان","Ministry of Foreign Affairs","وزارة الخارجية العُمانية",PLATFORM_X,"FMofOman",GRADE_A_PLUS,ROLE_PRIMARY,"multi",ROUTE_OFFICIAL,{"foreign_policy","diplomacy","international_relations","mediation","conflict"},"oman_mofa",100,"https://www.fm.gov.om/"),
+    _src("russia_mofa_telegram","Russia","روسيا","Ministry of Foreign Affairs","وزارة الخارجية الروسية",PLATFORM_TELEGRAM,"MID_Russia",GRADE_A_PLUS,ROLE_PRIMARY,"ru",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","conflict","sanctions","international_security"},"russia_mofa",100,"https://mid.ru/"),
+    _src("russia_mofa_telegram_en","Russia","روسيا","Ministry of Foreign Affairs","وزارة الخارجية الروسية",PLATFORM_TELEGRAM,"MFARussia",GRADE_A,ROLE_SUPPORT,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","conflict","sanctions"},"russia_mofa",75,"https://mid.ru/"),
+    _src("france_mofa_x","France","فرنسا","Ministry for Europe and Foreign Affairs","وزارة أوروبا والشؤون الخارجية الفرنسية",PLATFORM_X,"francediplo",GRADE_A_PLUS,ROLE_PRIMARY,"fr",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","sanctions","conflict"},"france_mofa",100,"https://www.diplomatie.gouv.fr/"),
+    _src("france_mofa_x_en","France","فرنسا","Ministry for Europe and Foreign Affairs","وزارة أوروبا والشؤون الخارجية الفرنسية",PLATFORM_X,"francediplo_EN",GRADE_A,ROLE_SUPPORT,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations"},"france_mofa",75,"https://www.diplomatie.gouv.fr/"),
+    _src("france_mofa_x_ar","France","فرنسا","Ministry for Europe and Foreign Affairs","وزارة أوروبا والشؤون الخارجية الفرنسية",PLATFORM_X,"francediplo_AR",GRADE_A,ROLE_SUPPORT,"ar",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations"},"france_mofa",72,"https://www.diplomatie.gouv.fr/"),
+    _src("germany_mofa_x","Germany","ألمانيا","Federal Foreign Office","وزارة الخارجية الألمانية",PLATFORM_X,"AuswaertigesAmt",GRADE_A_PLUS,ROLE_PRIMARY,"de",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","international_security","conflict"},"germany_mofa",100,"https://www.auswaertiges-amt.de/"),
+    _src("germany_mofa_x_en","Germany","ألمانيا","Federal Foreign Office","وزارة الخارجية الألمانية",PLATFORM_X,"GermanyDiplo",GRADE_A,ROLE_SUPPORT,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","international_security"},"germany_mofa",78,"https://www.auswaertiges-amt.de/"),
+    _src("uk_fcdo_x","United Kingdom","المملكة المتحدة","Foreign, Commonwealth & Development Office","وزارة الخارجية والتنمية البريطانية",PLATFORM_X,"FCDOGovUK",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","sanctions","conflict","international_security"},"uk_fcdo",100,"https://www.gov.uk/government/organisations/foreign-commonwealth-development-office"),
+    _src("uk_fcdo_x_ar","United Kingdom","المملكة المتحدة","Foreign, Commonwealth & Development Office","وزارة الخارجية والتنمية البريطانية",PLATFORM_X,"FCDOArabic",GRADE_A,ROLE_SUPPORT,"ar",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations"},"uk_fcdo",72,"https://www.gov.uk/government/organisations/foreign-commonwealth-development-office"),
+    _src("uk_mod_press_x","United Kingdom","المملكة المتحدة","Ministry of Defence","وزارة الدفاع البريطانية",PLATFORM_X,"DefenceHQPress",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DEFENSE,{"defense","military","military_operations","international_security","military_alliances","conflict"},"uk_mod",100,"https://www.gov.uk/government/organisations/ministry-of-defence"),
+    _src("uk_mod_x","United Kingdom","المملكة المتحدة","Ministry of Defence","وزارة الدفاع البريطانية",PLATFORM_X,"DefenceHQ",GRADE_A,ROLE_SUPPORT,"en",ROUTE_DEFENSE,{"defense","military","international_security"},"uk_mod",80,"https://www.gov.uk/government/organisations/ministry-of-defence"),
+    _src("japan_mofa_x_en","Japan","اليابان","Ministry of Foreign Affairs","وزارة الخارجية اليابانية",PLATFORM_X,"MofaJapan_en",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","international_security","sanctions","strategic_affairs"},"japan_mofa",100,"https://www.mofa.go.jp/"),
+    _src("australia_dfat_x","Australia","أستراليا","Department of Foreign Affairs and Trade","وزارة الخارجية والتجارة الأسترالية",PLATFORM_X,"DFAT",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","sanctions","international_trade","international_security"},"australia_dfat",100,"https://www.dfat.gov.au/"),
+    _src("india_mea_x","India","الهند","Ministry of External Affairs","وزارة الشؤون الخارجية الهندية",PLATFORM_X,"MEAIndia",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","strategic_affairs","international_security","conflict"},"india_mea",100,"https://www.mea.gov.in/"),
+    _src("eu_eeas_x","European Union","الاتحاد الأوروبي","European External Action Service","دائرة العمل الخارجي الأوروبية",PLATFORM_X,"eu_eeas",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DYNAMIC,{"foreign_policy","diplomacy","international_relations","sanctions","conflict","international_security"},"eu_eeas",100,"https://www.eeas.europa.eu/"),
+    _src("eu_security_defence_x","European Union","الاتحاد الأوروبي","EU Security and Defence","الأمن والدفاع في الاتحاد الأوروبي",PLATFORM_X,"EUSec_Defence",GRADE_A,ROLE_SPECIALIZED,"en",ROUTE_DEFENSE,{"defense","military","international_security","military_operations"},"eu_security_defence",88,"https://www.eeas.europa.eu/"),
+    _src("eu_council_press_x","European Union","الاتحاد الأوروبي","Council of the European Union","مجلس الاتحاد الأوروبي",PLATFORM_X,"EUCouncilPress",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DYNAMIC,{"sanctions","foreign_policy","international_decisions","summits","international_security","defense"},"eu_council",100,"https://www.consilium.europa.eu/"),
+    _src("nato_press_x","NATO","حلف شمال الأطلسي","NATO Press","المكتب الصحفي لحلف شمال الأطلسي",PLATFORM_X,"NATOPress",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DEFENSE,{"defense","military","military_operations","military_alliances","international_security","conflict"},"nato",100,"https://www.nato.int/"),
+    _src("nato_general_x","NATO","حلف شمال الأطلسي","NATO","حلف شمال الأطلسي",PLATFORM_X,"NATO",GRADE_A,ROLE_SUPPORT,"en",ROUTE_DEFENSE,{"defense","military_alliances","international_security"},"nato",82,"https://www.nato.int/"),
+    _src("nato_cmc_x","NATO","حلف شمال الأطلسي","NATO Military Committee","اللجنة العسكرية لحلف شمال الأطلسي",PLATFORM_X,"CMC_NATO",GRADE_A,ROLE_SPECIALIZED,"en",ROUTE_DEFENSE,{"defense","military","international_security","strategic_affairs"},"nato_military",85,"https://www.nato.int/"),
+    _src("nato_pascad_x","NATO","حلف شمال الأطلسي","NATO International Military Staff","الهيئة العسكرية الدولية في الناتو",PLATFORM_X,"NATO_PASCAD",GRADE_A,ROLE_SPECIALIZED,"en",ROUTE_DEFENSE,{"defense","military","international_security"},"nato_military",82,"https://www.nato.int/"),
+    _src("iaea_x","IAEA","الوكالة الدولية للطاقة الذرية","International Atomic Energy Agency","الوكالة الدولية للطاقة الذرية",PLATFORM_X,"IAEAorg",GRADE_A_PLUS,ROLE_PRIMARY,"en",ROUTE_DYNAMIC,{"nuclear","nuclear_security","nuclear_safety","safeguards","international_security","conflict"},"iaea",100,"https://www.iaea.org/"),
+    _src("un_peacekeeping_x","United Nations","الأمم المتحدة","United Nations Peacekeeping","عمليات حفظ السلام التابعة للأمم المتحدة",PLATFORM_X,"UNPeacekeeping",GRADE_A,ROLE_SPECIALIZED,"en",ROUTE_DEFENSE,{"peacekeeping","conflict","ceasefire","international_security"},"un_peacekeeping",86,"https://peacekeeping.un.org/"),
 ]
 
-
-# =========================================================
-# VERIFIED SOURCE INDEXES
-# =========================================================
-
-VERIFIED_SOURCE_BY_ID: Dict[str, Dict] = {
-    source["id"]: source
-    for source in VERIFIED_SOCIAL_SOURCES
+VERIFIED_SOURCE_BY_ID = {s["id"]: s for s in VERIFIED_SOCIAL_SOURCES}
+VERIFIED_SOURCE_BY_PLATFORM_HANDLE = {
+    f'{s["platform"]}:{s["handle"].lower()}': s for s in VERIFIED_SOCIAL_SOURCES
 }
 
-
-VERIFIED_SOURCE_BY_PLATFORM_HANDLE: Dict[str, Dict] = {
-    f'{source["platform"]}:{source["handle"].lower()}': source
-    for source in VERIFIED_SOCIAL_SOURCES
-}
-
-
-# =========================================================
-# HELPERS
-# =========================================================
 
 def normalize_handle(handle: str) -> str:
     return (handle or "").strip().lstrip("@").lower()
 
 
 def get_source_by_id(source_id: str) -> Optional[Dict]:
-    if not source_id:
-        return None
-
-    source = VERIFIED_SOURCE_BY_ID.get(source_id)
-
-    if not source or not source.get("active"):
-        return None
-
-    return source
+    source = VERIFIED_SOURCE_BY_ID.get(source_id or "")
+    return source if source and source.get("active") else None
 
 
-def get_source(
-    platform: str,
-    handle: str,
-) -> Optional[Dict]:
-    platform = (platform or "").strip().lower()
-    handle = normalize_handle(handle)
-
-    if not platform or not handle:
-        return None
-
-    source = VERIFIED_SOURCE_BY_PLATFORM_HANDLE.get(
-        f"{platform}:{handle}"
-    )
-
-    if not source or not source.get("active"):
-        return None
-
-    return source
+def get_source(platform: str, handle: str) -> Optional[Dict]:
+    key = f"{(platform or '').strip().lower()}:{normalize_handle(handle)}"
+    source = VERIFIED_SOURCE_BY_PLATFORM_HANDLE.get(key)
+    return source if source and source.get("active") else None
 
 
-def is_verified_source(
-    platform: str,
-    handle: str,
-) -> bool:
+def is_verified_source(platform: str, handle: str) -> bool:
     return get_source(platform, handle) is not None
 
 
-def get_active_sources(
-    platform: Optional[str] = None,
-    grade: Optional[str] = None,
-    primary_only: bool = False,
-) -> List[Dict]:
-
-    results: List[Dict] = []
-
+def get_active_sources(platform=None, grade=None, primary_only=False, include_support=True) -> List[Dict]:
+    result = []
     for source in VERIFIED_SOCIAL_SOURCES:
-
         if not source.get("active"):
             continue
-
         if platform and source.get("platform") != platform:
             continue
-
         if grade and source.get("grade") != grade:
             continue
-
         if primary_only and source.get("role") != ROLE_PRIMARY:
             continue
-
-        results.append(source)
-
+        if not include_support and source.get("role") == ROLE_SUPPORT:
+            continue
+        result.append(source)
     return sorted(
-        results,
-        key=lambda item: (
-            item.get("priority", 0),
-            item.get("grade") == GRADE_A_PLUS,
-        ),
+        result,
+        key=lambda s: (s.get("role") == ROLE_PRIMARY, s.get("grade") == GRADE_A_PLUS, s.get("priority", 0)),
         reverse=True,
     )
 
 
-def get_primary_source_for_group(
-    dedup_group: str,
-) -> Optional[Dict]:
-
-    if not dedup_group:
-        return None
-
-    candidates = [
-        source
-        for source in VERIFIED_SOCIAL_SOURCES
-        if source.get("active")
-        and source.get("dedup_group") == dedup_group
-    ]
-
+def get_primary_source_for_group(dedup_group: str) -> Optional[Dict]:
+    candidates = [s for s in VERIFIED_SOCIAL_SOURCES if s.get("active") and s.get("dedup_group") == dedup_group]
     if not candidates:
         return None
-
     candidates.sort(
-        key=lambda item: (
-            item.get("role") == ROLE_PRIMARY,
-            item.get("grade") == GRADE_A_PLUS,
-            item.get("priority", 0),
-        ),
+        key=lambda s: (s.get("role") == ROLE_PRIMARY, s.get("grade") == GRADE_A_PLUS, s.get("priority", 0)),
         reverse=True,
     )
-
     return candidates[0]
 
 
-def get_dedup_group(
-    platform: str,
-    handle: str,
-) -> Optional[str]:
-
+def get_dedup_group(platform: str, handle: str) -> Optional[str]:
     source = get_source(platform, handle)
-
-    if not source:
-        return None
-
-    return source.get("dedup_group")
+    return source.get("dedup_group") if source else None
 
 
-def should_prefer_source(
-    candidate: Dict,
-    existing: Dict,
-) -> bool:
-    """
-    True إذا كان candidate أفضل من existing
-    عند تغطيتهما لنفس الحدث.
-    """
-
+def should_prefer_source(candidate: Dict, existing: Dict) -> bool:
     if not candidate:
         return False
-
     if not existing:
         return True
-
-    candidate_role = candidate.get("role")
-    existing_role = existing.get("role")
-
-    if (
-        candidate_role == ROLE_PRIMARY
-        and existing_role != ROLE_PRIMARY
-    ):
+    if candidate.get("role") == ROLE_PRIMARY and existing.get("role") != ROLE_PRIMARY:
         return True
-
-    if (
-        existing_role == ROLE_PRIMARY
-        and candidate_role != ROLE_PRIMARY
-    ):
+    if existing.get("role") == ROLE_PRIMARY and candidate.get("role") != ROLE_PRIMARY:
         return False
-
-    candidate_grade = candidate.get("grade")
-    existing_grade = existing.get("grade")
-
-    if (
-        candidate_grade == GRADE_A_PLUS
-        and existing_grade != GRADE_A_PLUS
-    ):
+    if candidate.get("grade") == GRADE_A_PLUS and existing.get("grade") != GRADE_A_PLUS:
         return True
-
-    if (
-        existing_grade == GRADE_A_PLUS
-        and candidate_grade != GRADE_A_PLUS
-    ):
+    if existing.get("grade") == GRADE_A_PLUS and candidate.get("grade") != GRADE_A_PLUS:
         return False
-
-    return (
-        candidate.get("priority", 0)
-        >
-        existing.get("priority", 0)
-    )
+    return candidate.get("priority", 0) > existing.get("priority", 0)
 
 
-def should_suppress_duplicate_source(
-    candidate: Dict,
-    selected_source: Dict,
-) -> bool:
-    """
-    يمنع الحسابات اللغوية أو الثانوية من إعادة نفس الحدث.
-    """
-
+def should_suppress_duplicate_source(candidate: Dict, selected_source: Dict) -> bool:
     if not candidate or not selected_source:
         return False
-
-    candidate_group = candidate.get("dedup_group")
-    selected_group = selected_source.get("dedup_group")
-
-    if not candidate_group or not selected_group:
-        return False
-
-    if candidate_group != selected_group:
-        return False
-
-    return not should_prefer_source(
-        candidate,
-        selected_source,
-    )
+    a = candidate.get("dedup_group")
+    b = selected_source.get("dedup_group")
+    return bool(a and b and a == b and not should_prefer_source(candidate, selected_source))
 
 
 def source_has_international_value(source: Dict) -> bool:
-
-    if not source:
-        return False
-
-    topics = set(source.get("topics") or set())
-
-    return bool(topics & INTERNATIONAL_TOPICS)
+    return bool(source and set(source.get("topics") or set()) & INTERNATIONAL_TOPICS)
 
 
-def should_accept_content_type(
-    content_type: Optional[str],
-) -> bool:
-
-    if not content_type:
-        return True
-
-    return content_type not in EXCLUDED_CONTENT_TYPES
+def should_accept_content_type(content_type: Optional[str]) -> bool:
+    return not content_type or content_type not in EXCLUDED_CONTENT_TYPES
 
 
 def attribution_prefix(source: Dict) -> str:
-    """
-    صيغة آمنة لنسبة التصريح إلى الجهة الرسمية.
-    """
-
     if not source:
         return "بحسب المصدر الرسمي"
-
-    organization_ar = source.get("organization_ar")
-
-    if organization_ar:
-        return f"بحسب {organization_ar}"
-
-    entity_ar = source.get("entity_ar")
-
-    if entity_ar:
-        return f"بحسب الجهة الرسمية في {entity_ar}"
-
+    if source.get("organization_ar"):
+        return f'بحسب {source["organization_ar"]}'
+    if source.get("entity_ar"):
+        return f'بحسب الجهة الرسمية في {source["entity_ar"]}'
     return "بحسب المصدر الرسمي"
 
 
-# =========================================================
-# REGISTRY VALIDATION
-# =========================================================
+_WS = re.compile(r"\s+")
+_TAG = re.compile(r"<[^>]+>")
 
-def validate_registry() -> List[str]:
 
-    errors: List[str] = []
+def _clean_text(value: object) -> str:
+    text = html.unescape(str(value or ""))
+    text = _TAG.sub(" ", text)
+    return _WS.sub(" ", text).strip()
 
-    required_fields = {
-        "id",
-        "entity",
-        "entity_ar",
-        "organization",
-        "organization_ar",
-        "platform",
-        "handle",
-        "url",
-        "grade",
-        "role",
-        "active",
-        "language",
-        "routing_hint",
-        "topics",
-        "dedup_group",
-        "priority",
-        "official_proof",
+
+def _fingerprint(text: str) -> str:
+    text = _clean_text(text).lower()
+    text = re.sub(r"[^\w\u0600-\u06ff]+", " ", text)
+    return hashlib.sha1(_WS.sub(" ", text).strip().encode("utf-8", "ignore")).hexdigest()
+
+
+def _canonical_external_url(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if parsed.netloc.lower() in {"t.me","telegram.me","x.com","twitter.com","www.x.com","www.twitter.com"}:
+        return ""
+    return parsed._replace(fragment="").geturl()
+
+
+def _safe_iso_datetime(value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def build_social_event(*, source_id: str, text: str, url: str, published=None, external_id="", content_url="", metadata=None) -> Dict:
+    source = get_source_by_id(source_id)
+    if not source:
+        raise ValueError(f"Unknown/inactive social source: {source_id}")
+    clean = _clean_text(text)
+    return {
+        "provider": "social_intel",
+        "source_id": source_id,
+        "platform": source["platform"],
+        "handle": source["handle"],
+        "entity": source["entity"],
+        "entity_ar": source["entity_ar"],
+        "organization": source["organization"],
+        "organization_ar": source["organization_ar"],
+        "source_grade": source["grade"],
+        "source_role": source["role"],
+        "language": source["language"],
+        "dedup_group": source["dedup_group"],
+        "priority": source["priority"],
+        "routing_hint": source["routing_hint"],
+        "attribution_ar": attribution_prefix(source),
+        "title": clean[:280].rstrip(),
+        "original_title": clean,
+        "summary": "",
+        "url": (url or "").strip(),
+        "published": published,
+        "external_id": (external_id or "").strip(),
+        "content_url": _canonical_external_url(content_url),
+        "metadata": dict(metadata or {}),
     }
 
-    seen_ids: Set[str] = set()
-    seen_handles: Set[str] = set()
 
-    for source in VERIFIED_SOCIAL_SOURCES:
+class _TelegramPublicParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.posts = []
+        self._current = None
+        self._div_depth = 0
+        self._message_depth = None
+        self._text_depth = None
 
-        source_id = source.get("id", "UNKNOWN")
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        cls = set((a.get("class") or "").split())
 
-        missing = required_fields - set(source.keys())
+        if tag == "div":
+            self._div_depth += 1
+            if self._current is None and "tgme_widget_message" in cls and a.get("data-post"):
+                self._current = {
+                    "data_post": a["data-post"], "text_parts": [], "published": "",
+                    "permalink": "", "links": [], "forwarded": False,
+                }
+                self._message_depth = self._div_depth
 
-        if missing:
-            errors.append(
-                f"{source_id}: missing fields: {sorted(missing)}"
-            )
+            if self._current is not None:
+                if "tgme_widget_message_text" in cls:
+                    self._text_depth = self._div_depth
+                if "tgme_widget_message_forwarded_from" in cls:
+                    self._current["forwarded"] = True
+
+        if self._current is None:
+            return
+
+        if tag == "time" and a.get("datetime"):
+            self._current["published"] = a["datetime"]
+
+        if tag == "a":
+            href = (a.get("href") or "").strip()
+            if href:
+                if "tgme_widget_message_date" in cls:
+                    self._current["permalink"] = href
+                else:
+                    self._current["links"].append(href)
+
+    def handle_data(self, data):
+        if self._current is not None and self._text_depth is not None:
+            self._current["text_parts"].append(data)
+
+    def handle_endtag(self, tag):
+        if tag != "div":
+            return
+
+        if self._current is not None:
+            if self._text_depth == self._div_depth:
+                self._text_depth = None
+            if self._message_depth == self._div_depth:
+                self._current["text"] = _clean_text(" ".join(self._current["text_parts"]))
+                self.posts.append(self._current)
+                self._current = None
+                self._message_depth = None
+                self._text_depth = None
+
+        self._div_depth = max(0, self._div_depth - 1)
+
+
+def parse_telegram_public_html(document: str, *, source_id: str, include_forwarded=False) -> List[Dict]:
+    source = get_source_by_id(source_id)
+    if not source or source["platform"] != PLATFORM_TELEGRAM:
+        raise ValueError(f"Not a Telegram source: {source_id}")
+    if not document:
+        return []
+
+    parser = _TelegramPublicParser()
+    try:
+        parser.feed(document)
+    except Exception:
+        return []
+
+    result, seen = [], set()
+    expected_handle = normalize_handle(source["handle"])
+
+    for post in parser.posts:
+        text = _clean_text(post.get("text", ""))
+        if not text or (post.get("forwarded") and not include_forwarded):
             continue
 
-        if source_id in seen_ids:
-            errors.append(
-                f"duplicate source id: {source_id}"
-            )
+        data_post = (post.get("data_post") or "").strip()
+        if "/" not in data_post:
+            continue
 
+        handle, post_id = data_post.split("/", 1)
+        if normalize_handle(handle) != expected_handle:
+            continue
+
+        if post_id in seen:
+            continue
+        seen.add(post_id)
+
+        content_url = ""
+        for href in post.get("links") or []:
+            candidate = _canonical_external_url(href)
+            if candidate:
+                content_url = candidate
+                break
+
+        result.append(
+            build_social_event(
+                source_id=source_id,
+                text=text,
+                url=(post.get("permalink") or f"https://t.me/{handle}/{post_id}"),
+                published=_safe_iso_datetime(post.get("published", "")),
+                external_id=post_id,
+                content_url=content_url,
+                metadata={"forwarded": bool(post.get("forwarded")), "ingest": "telegram_public_page"},
+            )
+        )
+        if len(result) >= MAX_POSTS_PER_SOURCE:
+            break
+
+    return result
+
+
+def parse_x_posts_payload(payload: Dict[str, Any], *, source_id: str) -> List[Dict]:
+    source = get_source_by_id(source_id)
+    if not source or source["platform"] != PLATFORM_X:
+        raise ValueError(f"Not an X source: {source_id}")
+
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return []
+
+    result, seen = [], set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        post_id = str(item.get("id") or "").strip()
+        text = _clean_text(item.get("text") or "")
+        if not post_id or not text or post_id in seen:
+            continue
+        seen.add(post_id)
+
+        content_url = ""
+        entities = item.get("entities") or {}
+        urls = entities.get("urls") if isinstance(entities, dict) else None
+        if isinstance(urls, list):
+            for u in urls:
+                if not isinstance(u, dict):
+                    continue
+                candidate = _canonical_external_url(u.get("expanded_url") or u.get("unwound_url") or "")
+                if candidate:
+                    content_url = candidate
+                    break
+
+        result.append(
+            build_social_event(
+                source_id=source_id,
+                text=text,
+                url=f'https://x.com/{source["handle"]}/status/{post_id}',
+                published=_safe_iso_datetime(str(item.get("created_at") or "")),
+                external_id=post_id,
+                content_url=content_url,
+                metadata={"ingest": "x_api_v2"},
+            )
+        )
+        if len(result) >= MAX_POSTS_PER_SOURCE:
+            break
+
+    return result
+
+
+def _circuit_state(source_id):
+    return _CIRCUIT_STATE.setdefault(source_id, {"failures": 0.0, "open_until": 0.0})
+
+
+def _circuit_is_open(source_id):
+    return _circuit_state(source_id)["open_until"] > time.monotonic()
+
+
+def _circuit_success(source_id):
+    state = _circuit_state(source_id)
+    state["failures"] = 0.0
+    state["open_until"] = 0.0
+
+
+def _circuit_failure(source_id):
+    state = _circuit_state(source_id)
+    state["failures"] += 1.0
+    if state["failures"] >= CIRCUIT_FAILURES:
+        state["open_until"] = time.monotonic() + CIRCUIT_COOLDOWN_SECONDS
+
+
+def reset_circuit_breakers():
+    _CIRCUIT_STATE.clear()
+
+
+async def _read_bounded(response: aiohttp.ClientResponse) -> str:
+    chunks, total = [], 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise ValueError("response exceeds MAX_RESPONSE_BYTES")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    charset = response.charset or "utf-8"
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+async def _get_text(session, url, *, source_id, headers=None, params=None) -> str:
+    if _circuit_is_open(source_id):
+        return ""
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS, connect=2)
+    try:
+        async with session.get(url, headers=headers, params=params, timeout=timeout, allow_redirects=True) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
+            text = await _read_bounded(response)
+        _circuit_success(source_id)
+        return text
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _circuit_failure(source_id)
+        log.warning("social source failed: %s: %s", source_id, exc)
+        return ""
+
+
+async def _get_json(session, url, *, source_id, headers, params=None) -> Dict[str, Any]:
+    text = await _get_text(session, url, source_id=source_id, headers=headers, params=params)
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _collect_telegram_source(session, source, *, include_forwarded):
+    document = await _get_text(session, f'https://t.me/s/{source["handle"]}', source_id=source["id"])
+    if not document:
+        return []
+    try:
+        return parse_telegram_public_html(document, source_id=source["id"], include_forwarded=include_forwarded)
+    except Exception as exc:
+        log.warning("telegram parser failed: %s: %s", source["id"], exc)
+        return []
+
+
+def _x_bearer_token() -> str:
+    return (os.getenv("X_BEARER_TOKEN") or "").strip()
+
+
+async def _resolve_x_user_id(session, source, bearer):
+    handle = source["handle"]
+    cache_key = normalize_handle(handle)
+    cached = _X_USER_ID_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and cached[1] > now:
+        return cached[0]
+
+    headers = {"Authorization": f"Bearer {bearer}"}
+    payload = await _get_json(
+        session,
+        f"{X_API_BASE}/users/by/username/{handle}",
+        source_id=source["id"],
+        headers=headers,
+    )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return ""
+    user_id = str(data.get("id") or "").strip()
+    username = normalize_handle(str(data.get("username") or ""))
+    if not user_id or (username and username != cache_key):
+        return ""
+
+    _X_USER_ID_CACHE[cache_key] = (user_id, now + X_USER_ID_CACHE_TTL)
+    return user_id
+
+
+async def _collect_x_source(session, source, *, bearer):
+    if not bearer:
+        return []
+    user_id = await _resolve_x_user_id(session, source, bearer)
+    if not user_id:
+        return []
+
+    payload = await _get_json(
+        session,
+        f"{X_API_BASE}/users/{user_id}/tweets",
+        source_id=source["id"],
+        headers={"Authorization": f"Bearer {bearer}"},
+        params={
+            "max_results": str(MAX_POSTS_PER_SOURCE),
+            "exclude": "retweets,replies",
+            "tweet.fields": "created_at,entities",
+        },
+    )
+    try:
+        return parse_x_posts_payload(payload, source_id=source["id"])
+    except Exception as exc:
+        log.warning("x parser failed: %s: %s", source["id"], exc)
+        return []
+
+
+def _event_identity(event: Dict) -> Tuple[str, str]:
+    group = _clean_text(event.get("dedup_group", ""))
+    content_url = _canonical_external_url(event.get("content_url", ""))
+    if content_url:
+        return group, content_url.lower()
+    return group, _fingerprint(event.get("original_title") or event.get("title") or "")
+
+
+def deduplicate_social_events(events: Iterable[Dict]) -> List[Dict]:
+    chosen, by_key = [], {}
+    for event in events:
+        key = _event_identity(event)
+        idx = by_key.get(key)
+        if idx is None:
+            by_key[key] = len(chosen)
+            chosen.append(event)
+            continue
+
+        current = chosen[idx]
+        candidate_source = get_source_by_id(event.get("source_id", ""))
+        current_source = get_source_by_id(current.get("source_id", ""))
+        if candidate_source and current_source and should_prefer_source(candidate_source, current_source):
+            chosen[idx] = event
+
+    return sorted(
+        chosen,
+        key=lambda e: (
+            int(e.get("priority", 0)),
+            e.get("published") or datetime.min.replace(tzinfo=timezone.utc),
+        ),
+        reverse=True,
+    )
+
+
+async def collect_social_intel(
+    *,
+    source_ids: Optional[Iterable[str]] = None,
+    include_support: bool = DEFAULT_INCLUDE_SUPPORT,
+    include_forwarded_telegram: bool = False,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> List[Dict]:
+    requested = set(source_ids or [])
+    sources = [
+        source for source in get_active_sources(include_support=include_support)
+        if not requested or source["id"] in requested
+    ]
+    if not sources:
+        return []
+
+    bearer = _x_bearer_token()
+
+    async def run(active_session):
+        tasks, task_sources = [], []
+        for source in sources:
+            if source["platform"] == PLATFORM_TELEGRAM:
+                tasks.append(_collect_telegram_source(active_session, source, include_forwarded=include_forwarded_telegram))
+                task_sources.append(source)
+            elif source["platform"] == PLATFORM_X and bearer:
+                tasks.append(_collect_x_source(active_session, source, bearer=bearer))
+                task_sources.append(source)
+
+        if not tasks:
+            return []
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        merged = []
+        for source, result in zip(task_sources, results):
+            if isinstance(result, BaseException):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                log.warning("isolated social failure: %s: %s", source["id"], result)
+                continue
+            merged.extend(result or [])
+        return deduplicate_social_events(merged)
+
+    if session is not None:
+        return await run(session)
+
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/json"},
+        connector=aiohttp.TCPConnector(limit=12),
+    ) as owned:
+        return await run(owned)
+
+
+def validate_registry() -> List[str]:
+    errors = []
+    required = {
+        "id","entity","entity_ar","organization","organization_ar","platform","handle",
+        "url","grade","role","active","language","routing_hint","topics","dedup_group",
+        "priority","official_proof",
+    }
+    seen_ids, seen_handles = set(), set()
+
+    for source in VERIFIED_SOCIAL_SOURCES:
+        source_id = source.get("id", "UNKNOWN")
+        missing = required - set(source.keys())
+        if missing:
+            errors.append(f"{source_id}: missing fields: {sorted(missing)}")
+            continue
+        if source_id in seen_ids:
+            errors.append(f"duplicate source id: {source_id}")
         seen_ids.add(source_id)
 
-        key = (
-            f'{source["platform"]}:'
-            f'{normalize_handle(source["handle"])}'
-        )
-
+        key = f'{source["platform"]}:{normalize_handle(source["handle"])}'
         if key in seen_handles:
-            errors.append(
-                f"duplicate source handle: {key}"
-            )
-
+            errors.append(f"duplicate source handle: {key}")
         seen_handles.add(key)
 
         if source["grade"] not in VALID_GRADES:
-            errors.append(
-                f"{source_id}: invalid grade"
-            )
-
+            errors.append(f"{source_id}: invalid grade")
         if source["platform"] not in VALID_PLATFORMS:
-            errors.append(
-                f"{source_id}: invalid platform"
-            )
-
+            errors.append(f"{source_id}: invalid platform")
         if source["role"] not in VALID_ROLES:
-            errors.append(
-                f"{source_id}: invalid role"
-            )
-
+            errors.append(f"{source_id}: invalid role")
         if source["routing_hint"] not in VALID_ROUTING_HINTS:
-            errors.append(
-                f"{source_id}: invalid routing_hint"
-            )
-
+            errors.append(f"{source_id}: invalid routing_hint")
         if not source_has_international_value(source):
-            errors.append(
-                f"{source_id}: no international-value topic"
-            )
-
+            errors.append(f"{source_id}: no international-value topic")
         if not str(source["url"]).startswith("https://"):
-            errors.append(
-                f"{source_id}: invalid source url"
-            )
-
-        if not str(source["official_proof"]).startswith(
-            "https://"
-        ):
-            errors.append(
-                f"{source_id}: invalid official proof"
-            )
-
+            errors.append(f"{source_id}: invalid source url")
+        if not str(source["official_proof"]).startswith("https://"):
+            errors.append(f"{source_id}: invalid official proof")
+        if not isinstance(source.get("priority"), int) or not 0 <= source["priority"] <= 100:
+            errors.append(f"{source_id}: invalid priority")
     return errors
 
 
 def registry_stats() -> Dict[str, int]:
-
-    active = [
-        source
-        for source in VERIFIED_SOCIAL_SOURCES
-        if source.get("active")
-    ]
-
+    active = [s for s in VERIFIED_SOCIAL_SOURCES if s.get("active")]
     return {
         "total": len(active),
-        "a_plus": sum(
-            1
-            for source in active
-            if source.get("grade") == GRADE_A_PLUS
-        ),
-        "a": sum(
-            1
-            for source in active
-            if source.get("grade") == GRADE_A
-        ),
-        "x": sum(
-            1
-            for source in active
-            if source.get("platform") == PLATFORM_X
-        ),
-        "telegram": sum(
-            1
-            for source in active
-            if source.get("platform") == PLATFORM_TELEGRAM
-        ),
-        "primary": sum(
-            1
-            for source in active
-            if source.get("role") == ROLE_PRIMARY
-        ),
-        "support": sum(
-            1
-            for source in active
-            if source.get("role") == ROLE_SUPPORT
-        ),
-        "specialized": sum(
-            1
-            for source in active
-            if source.get("role") == ROLE_SPECIALIZED
-        ),
+        "a_plus": sum(1 for s in active if s["grade"] == GRADE_A_PLUS),
+        "a": sum(1 for s in active if s["grade"] == GRADE_A),
+        "x": sum(1 for s in active if s["platform"] == PLATFORM_X),
+        "telegram": sum(1 for s in active if s["platform"] == PLATFORM_TELEGRAM),
+        "primary": sum(1 for s in active if s["role"] == ROLE_PRIMARY),
+        "support": sum(1 for s in active if s["role"] == ROLE_SUPPORT),
+        "specialized": sum(1 for s in active if s["role"] == ROLE_SPECIALIZED),
     }
 
 
 REGISTRY_ERRORS = validate_registry()
-
 if REGISTRY_ERRORS:
     raise RuntimeError(
         "intel_sources registry validation failed:\n- "

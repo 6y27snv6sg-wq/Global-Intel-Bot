@@ -1640,6 +1640,8 @@ def _resolved_topic(item):
         "ministry of foreign affairs", "state department",
         "الرئاسة", "presidency", "الحكومة", "government",
         "الديوان الملكي", "مجلس الوزراء",
+        "وكالة الأنباء السعودية", "وكالة الانباء السعودية",
+        "saudi press agency", "spa",
     )
     explicit_official_terms = (
         "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
@@ -1655,6 +1657,11 @@ def _resolved_topic(item):
         "central bank", "interest rate", "inflation", "monetary policy",
         "stocks", "stock market", "bonds", "gdp", "budget", "oil prices",
         "brent", "opec", "tariff", "financial sanctions",
+    )
+    non_operational_defence_terms = (
+        "جنازة", "تشييع", "يحيي ذكرى", "تحيي ذكرى", "تعزية", "تعازي",
+        "استقبال", "زيارة رسمية", "ذكرى سنوية", "مراسم",
+        "funeral", "memorial", "condolence", "ceremony", "official visit",
     )
     strong_security_terms = (
         "مناورات عسكريه", "مناورات عسكرية", "عمليه عسكريه", "عملية عسكرية",
@@ -1672,10 +1679,13 @@ def _resolved_topic(item):
     source_is_official = _contains_any(source, official_sources)
     strong_econ = _contains_any(title, strong_econ_terms)
     strong_security = _contains_any(title, strong_security_terms)
+    non_operational_defence = _contains_any(title, non_operational_defence_terms)
 
     if source_is_econ:
         return "econ"
     if source_is_security:
+        if non_operational_defence:
+            return "forg"
         return "secu"
 
     # Breaking requires both engine evidence and explicit breaking wording.
@@ -1687,8 +1697,6 @@ def _resolved_topic(item):
     if source_is_official:
         if strong_econ and engine == "econ":
             return "econ"
-        if strong_security and engine == "secu":
-            return "secu"
         return "forg"
 
     if _contains_any(title, explicit_official_terms):
@@ -1700,8 +1708,14 @@ def _resolved_topic(item):
 
     # Preserve trusted official registry specialist labels when explicit source
     # identity above did not resolve them.
-    if getattr(item, "official", False) and engine in {"econ", "forg", "urg", "secu"}:
-        return engine
+    if getattr(item, "official", False):
+        if engine == "econ" and strong_econ:
+            return "econ"
+        if engine == "secu" and strong_security:
+            return "secu"
+        if engine in {"forg", "urg"}:
+            return engine
+        return "forg"
 
     # Geographic residual desks receive general international/regional coverage.
     geo_text = f"{title} {region}"
@@ -2727,12 +2741,16 @@ def _urgent_within_button_window(item, now_epoch=None):
 
 
 def _recent_publishable_urgent(items, limit=MAX_TOPIC_RESULTS):
-    """Canonical recent urgent timeline: trusted, Arabic-ready, last hour only."""
+    """Canonical last-hour breaking timeline for the button.
+
+    The button intentionally has a wider admission rule than push alerts:
+    verified breaking-lane items remain browsable for one hour, while
+    urgent_precision_state() continues to gate unsolicited notifications.
+    """
     recent = [
         item for item in list(items or [])
         if _visible_item_ready(item)
         and _urgent_within_button_window(item)
-        and urgent_precision_state(item)
     ]
     recent = deduplicate_urgent_events(recent)
     recent.sort(

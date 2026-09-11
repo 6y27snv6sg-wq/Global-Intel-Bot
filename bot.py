@@ -468,6 +468,7 @@ NEWS_CACHE = SimpleCache(CACHE_TTL)
 BREAKING_CACHE = SimpleCache(max(CACHE_TTL, URGENT_MONITOR_INTERVAL * 4))
 SOCIAL_CACHE = SimpleCache(SOCIAL_CACHE_TTL)
 DIRECT_CACHE = SimpleCache(DIRECT_CACHE_TTL)
+HOT_VIEW_CACHE = SimpleCache(24 * 3600)
 USER_SEARCH_RESULTS: Dict[int, List[Any]] = {}
 USER_SEARCH_QUERY: Dict[int, str] = {}
 USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
@@ -1002,6 +1003,7 @@ async def _run_news_collection():
         if items:
             items = deduplicate_events(items, limit=150)
             NEWS_CACHE.set("all_news", items)
+            _invalidate_hot_view()
             LAST_NEWS_REFRESH = time.monotonic()
             return items
     except asyncio.TimeoutError:
@@ -1034,6 +1036,7 @@ async def _refresh_social_provider():
         items = await _adapt_provider_events(events, "social_intel")
         if items:
             SOCIAL_CACHE.set("social_news", deduplicate_events(items, limit=80))
+            _invalidate_hot_view()
         LAST_SOCIAL_REFRESH = time.monotonic()
     except asyncio.TimeoutError:
         log.info("Social provider timed out; keeping previous cache.")
@@ -1053,6 +1056,7 @@ async def _refresh_direct_provider():
         items = await _adapt_provider_events(events, "direct_radar")
         if items:
             DIRECT_CACHE.set("direct_news", deduplicate_events(items, limit=80))
+            _invalidate_hot_view()
         LAST_DIRECT_REFRESH = time.monotonic()
     except asyncio.TimeoutError:
         log.info("Direct radar timed out; keeping previous cache.")
@@ -1063,16 +1067,50 @@ async def _refresh_direct_provider():
     return DIRECT_CACHE.peek("direct_news") or []
 
 
+def _has_arabic_text(value):
+    return bool(re.search(r"[\u0600-\u06FF]", str(value or "")))
+
+
+def _provider_title_ready(item):
+    """Only merge translated provider headlines into the Arabic hot view.
+
+    Filtering happens BEFORE cross-provider deduplication so an untranslated
+    social/direct duplicate can never replace a translated native-news item and
+    then disappear from the topic result.
+    """
+    provider = str(getattr(item, "_provider_kind", "") or "")
+    if provider not in {"social_intel", "direct_radar"}:
+        return True
+    return _has_arabic_text(get_item_title(item))
+
+
+def _invalidate_hot_view():
+    HOT_VIEW_CACHE.set("merged", None)
+
+
 def get_cached_news_view(limit=HOT_CACHE_LIMIT):
     """Instant read-only merged snapshot; never performs network I/O."""
+    cached = HOT_VIEW_CACHE.peek("merged")
+    if cached is not None:
+        return list(cached[:limit])
+
     breaking = BREAKING_CACHE.peek("breaking_news") or []
-    direct = DIRECT_CACHE.peek("direct_news") or []
-    social = SOCIAL_CACHE.peek("social_news") or []
+    direct = [
+        item for item in (DIRECT_CACHE.peek("direct_news") or [])
+        if _provider_title_ready(item)
+    ]
+    social = [
+        item for item in (SOCIAL_CACHE.peek("social_news") or [])
+        if _provider_title_ready(item)
+    ]
     broad = NEWS_CACHE.peek("all_news") or []
-    return deduplicate_events(
+
+    merged = deduplicate_events(
         list(direct) + list(breaking) + list(social) + list(broad),
-        limit=limit,
+        limit=HOT_CACHE_LIMIT,
     )
+    HOT_VIEW_CACHE.set("merged", list(merged))
+    return list(merged[:limit])
 
 
 def _provider_due(last_refresh, interval):
@@ -1161,18 +1199,6 @@ async def get_fresh_news(force_refresh=False):
             trigger_background_refresh(force=False)
         return cached
     return await refresh_all_sources(force=False)
-
-
-def _has_arabic_text(value):
-    return bool(re.search(r"[\u0600-\u06FF]", str(value or "")))
-
-
-def _provider_title_ready(item):
-    """Never expose untranslated social/direct headlines in the Arabic UI."""
-    provider = str(getattr(item, "_provider_kind", "") or "")
-    if provider not in {"social_intel", "direct_radar"}:
-        return True
-    return _has_arabic_text(get_item_title(item))
 
 
 def _balance_topic_sources(items, limit):
@@ -2160,6 +2186,7 @@ def _merge_breaking_into_cache(items):
         "breaking_news",
         deduplicate_urgent_events(list(items) + list(cached), limit=80),
     )
+    _invalidate_hot_view()
 
 
 async def initialize_urgent_baseline():

@@ -156,6 +156,35 @@ USER_AGENT = (
 
 # process-local breaker; intentionally does not persist across deploys
 _CIRCUIT_STATE: Dict[str, Dict[str, float]] = {}
+_LAST_ATTEMPT: Dict[str, float] = {}
+_SOURCE_HEALTH: Dict[str, Dict[str, object]] = {}
+
+HEALTH_OK = "ok"
+HEALTH_EMPTY = "empty"
+HEALTH_FETCH_FAILED = "fetch_failed"
+HEALTH_PARSE_FAILED = "parse_failed"
+HEALTH_CIRCUIT_OPEN = "circuit_open"
+HEALTH_NOT_DUE = "not_due"
+
+def _set_source_health(source_id: str, status: str, *, detail: str = "", items: int = 0) -> None:
+    _SOURCE_HEALTH[source_id] = {
+        "status": status,
+        "detail": _clean_text(detail)[:240] if detail else "",
+        "items": max(0, int(items or 0)),
+        "updated_monotonic": time.monotonic(),
+    }
+
+def get_direct_source_health() -> Dict[str, Dict[str, object]]:
+    """Return a copy of process-local sensor health telemetry."""
+    return {key: dict(value) for key, value in _SOURCE_HEALTH.items()}
+
+def _source_due(source: Dict, *, now: Optional[float] = None) -> bool:
+    now = time.monotonic() if now is None else now
+    last = _LAST_ATTEMPT.get(source["id"])
+    if last is None:
+        return True
+    interval = max(15, int(source.get("poll_interval_seconds", 60)))
+    return (now - last) >= interval
 
 # =========================================================
 # DIRECT SOURCES
@@ -221,7 +250,7 @@ DIRECT_SOURCES: List[Dict] = [
         "dedup_group": "ofac",
         "priority": 100,
         "poll_interval_seconds": 60,
-        "timeout_seconds": 5,
+        "timeout_seconds": 7,
         "default_event_status": STATUS_AUTHORITY_CONFIRMED,
         "attribution_ar": (
             "بحسب مكتب مراقبة الأصول الأجنبية بوزارة الخزانة الأمريكية"
@@ -252,7 +281,7 @@ DIRECT_SOURCES: List[Dict] = [
         "dedup_group": "ofac",
         "priority": 98,
         "poll_interval_seconds": 45,
-        "timeout_seconds": 5,
+        "timeout_seconds": 7,
         "default_event_status": STATUS_AUTHORITY_CONFIRMED,
         "attribution_ar": (
             "بحسب مكتب مراقبة الأصول الأجنبية بوزارة الخزانة الأمريكية"
@@ -760,38 +789,72 @@ async def _fetch_text(
             if response.status != 200:
                 raise RuntimeError(f"HTTP {response.status}")
             text = await _read_bounded(response)
-        _circuit_success(source_id)
         return text
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         _circuit_failure(source_id)
+        _set_source_health(source_id, HEALTH_FETCH_FAILED, detail=type(exc).__name__)
         log.warning("direct source failed: %s: %s", source_id, exc)
         return ""
+
+
+def _document_matches_source(source_id: str, document: str) -> bool:
+    """Reject HTTP-200 challenge/error pages before treating a sensor as healthy."""
+    low = (document or "").lower()
+    if not low:
+        return False
+    if source_id == "ukmto_warnings":
+        return "ukmto" in low and any(token in low for token in ("warning", "incident", "maritime"))
+    if source_id in {"ofac_recent_actions", "ofac_sanctions_updates"}:
+        return "ofac" in low and any(token in low for token in ("recent actions", "sanctions", "treasury"))
+    return False
 
 
 async def _collect_one(
     session: aiohttp.ClientSession,
     source: Dict,
 ) -> List[Dict]:
+    source_id = source["id"]
+    if _circuit_is_open(source_id):
+        _set_source_health(source_id, HEALTH_CIRCUIT_OPEN)
+        return []
+
+    _LAST_ATTEMPT[source_id] = time.monotonic()
     document = await _fetch_text(session, source)
     if not document:
         return []
 
-    source_id = source["id"]
+    if not _document_matches_source(source_id, document):
+        _circuit_failure(source_id)
+        _set_source_health(source_id, HEALTH_PARSE_FAILED, detail="unexpected_document_shape")
+        log.warning("direct source returned unexpected document shape: %s", source_id)
+        return []
+
     try:
         if source_id == "ukmto_warnings":
-            return parse_ukmto_html(
+            events = parse_ukmto_html(
                 document,
                 source_id=source_id,
                 base_url=source["url"],
             )
-        if source_id in {"ofac_recent_actions", "ofac_sanctions_updates"}:
-            return parse_ofac_html(document, source_id=source_id)
-        return []
+        elif source_id in {"ofac_recent_actions", "ofac_sanctions_updates"}:
+            events = parse_ofac_html(document, source_id=source_id)
+        else:
+            raise ValueError(f"Unsupported direct source: {source_id}")
+
+        _circuit_success(source_id)
+        _set_source_health(
+            source_id,
+            HEALTH_OK if events else HEALTH_EMPTY,
+            items=len(events),
+        )
+        return events
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        _circuit_failure(source_id)
+        _set_source_health(source_id, HEALTH_PARSE_FAILED, detail=type(exc).__name__)
         # Parsing failure is isolated from the other sensors.
         log.warning("direct parser failed: %s: %s", source_id, exc)
         return []
@@ -885,6 +948,7 @@ async def collect_direct_radar(
     *,
     source_ids: Optional[Iterable[str]] = None,
     session: Optional[aiohttp.ClientSession] = None,
+    force: bool = False,
 ) -> List[Dict]:
     """
     Collect all selected direct sensors concurrently.
@@ -893,10 +957,17 @@ async def collect_direct_radar(
     If session is supplied, the caller owns it.
     """
     selected_ids = set(source_ids or [])
-    sources = [
+    candidates = [
         s for s in get_active_direct_sources()
         if not selected_ids or s["id"] in selected_ids
     ]
+    if force:
+        sources = candidates
+    else:
+        sources = [s for s in candidates if _source_due(s)]
+        for source in candidates:
+            if source not in sources:
+                _set_source_health(source["id"], HEALTH_NOT_DUE)
 
     if not sources:
         return []

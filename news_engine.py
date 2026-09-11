@@ -65,6 +65,7 @@ OFFICIAL_DISCOVERY_ITEMS_PER_SOURCE = 8
 BREAKING_FEED_CONCURRENCY = 12
 
 _FEED_FAILURE_STATE = {}
+_LOG_FAULT_STATE = {}
 _OFFICIAL_PROFILE_ROUND = 0
 _OFFICIAL_RESULT_CACHE = {}
 _NEWS_ENGINE_HEALTH = {
@@ -78,6 +79,51 @@ _NEWS_ENGINE_HEALTH = {
     "official_cache_g20_members": 0,
     "feed_circuits_open": 0,
 }
+
+def _fault_signature(exc=None, detail=""):
+    """Stable, compact signature used to suppress unchanged repeated faults."""
+    if exc is not None:
+        message = " ".join(str(exc).split())[:180]
+        return f"{type(exc).__name__}:{message}"
+    return " ".join(str(detail).split())[:180] or "unknown"
+
+
+def _log_fault_once(key, message, *args, exc=None, level=logging.WARNING):
+    """
+    Log a fault only when it is new or its signature changes.
+
+    Deliberately emits one line (no traceback) so a burst of unreachable official
+    sites cannot exhaust Railway's log-rate budget. Recovery clears the latch.
+    """
+    signature = _fault_signature(exc=exc)
+    previous = _LOG_FAULT_STATE.get(key)
+    if previous == signature:
+        return False
+    _LOG_FAULT_STATE[key] = signature
+    suffix = f" [{signature}]" if signature else ""
+    log.log(level, message + suffix, *args)
+    return True
+
+
+def _log_fault_detail_once(key, detail, message, *args, level=logging.INFO):
+    signature = _fault_signature(detail=detail)
+    previous = _LOG_FAULT_STATE.get(key)
+    if previous == signature:
+        return False
+    _LOG_FAULT_STATE[key] = signature
+    log.log(level, message, *args)
+    return True
+
+
+def _log_recovery(key, message, *args):
+    """Emit one recovery line only if the keyed path had a recorded fault."""
+    if key not in _LOG_FAULT_STATE:
+        return False
+    _LOG_FAULT_STATE.pop(key, None)
+    log.info(message, *args)
+    return True
+
+
 # feedparser is pure-Python and can monopolize the GIL when many feeds parse at once.
 # Keep RSS parsing on a small dedicated pool so background collectors cannot starve
 # Telegram callbacks or the main asyncio loop.
@@ -2203,8 +2249,21 @@ async def _read_official_page(session, url, profile, semaphore):
                         url = urljoin(url, location)
                         continue
                     if response.status != 200:
-                        log.info("Official page rejected source=%s status=%s", profile.get("source_id", ""), response.status)
+                        source_id = profile.get("source_id", "")
+                        _log_fault_detail_once(
+                            f"official_page:{source_id}",
+                            f"http_{response.status}",
+                            "Official page rejected source=%s status=%s",
+                            source_id,
+                            response.status,
+                            level=logging.INFO,
+                        )
                         return None
+                    _log_recovery(
+                        f"official_page:{profile.get('source_id', '')}",
+                        "Official page recovered source=%s",
+                        profile.get("source_id", ""),
+                    )
                     mime = response.headers.get("Content-Type", "").lower()
                     if mime and not any(t in mime for t in ("html", "xml", "text/plain", "rss", "atom")):
                         return None
@@ -2212,7 +2271,14 @@ async def _read_official_page(session, url, profile, semaphore):
                     async for chunk in response.content.iter_chunked(65536):
                         size += len(chunk)
                         if size > OFFICIAL_MAX_PAGE_BYTES:
-                            log.info("Official page rejected source=%s reason=oversized", profile.get("source_id", ""))
+                            source_id = profile.get("source_id", "")
+                            _log_fault_detail_once(
+                                f"official_page:{source_id}",
+                                "oversized",
+                                "Official page rejected source=%s reason=oversized",
+                                source_id,
+                                level=logging.INFO,
+                            )
                             return None
                         chunks.append(chunk)
                     body = b"".join(chunks).decode(response.charset or "utf-8", errors="replace")
@@ -2297,12 +2363,32 @@ published=published, domain=final_domain, official=True, trust_score=99.0,
             log.info("Official article skipped domain=%s reason=outside_current_window date=%s",
                      final_domain, published.date().isoformat())
             return None
-        return classify_item(item)
-    except (asyncio.TimeoutError, aiohttp.ClientError):
-        log.info("Official article unavailable source=%s", profile.get("source_id", ""))
+        result = classify_item(item)
+        _log_recovery(
+            f"official_article:{profile.get('source_id', '')}",
+            "Official article path recovered source=%s",
+            profile.get("source_id", ""),
+        )
+        return result
+    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+        source_id = profile.get("source_id", "")
+        _log_fault_once(
+            f"official_article:{source_id}",
+            "Official article unavailable source=%s",
+            source_id,
+            exc=exc,
+            level=logging.INFO,
+        )
         return None
-    except Exception:
-        log.exception("Official article parse failed source=%s", profile.get("source_id", ""))
+    except Exception as exc:
+        source_id = profile.get("source_id", "")
+        _log_fault_once(
+            f"official_article:{source_id}",
+            "Official article parse failed source=%s",
+            source_id,
+            exc=exc,
+            level=logging.WARNING,
+        )
         return None
 
 
@@ -2318,10 +2404,22 @@ async def _fetch_official_index(session, profile, index_url, semaphore, max_link
         log.info("Official public index source=%s links=%d", profile.get("source_id", ""), len(links))
         dated_links = [(url, title, _official_index_date_hint(
             body, title, profile, article_url=url, document=document)) for url, title in links]
+        _log_recovery(
+            f"official_index:{profile.get('source_id', '')}",
+            "Official index recovered source=%s",
+            profile.get("source_id", ""),
+        )
     except asyncio.CancelledError:
         raise
-    except Exception:
-        log.exception("Official index failed source=%s", profile.get("source_id", ""))
+    except Exception as exc:
+        source_id = profile.get("source_id", "")
+        _log_fault_once(
+            f"official_index:{source_id}",
+            "Official index failed source=%s",
+            source_id,
+            exc=exc,
+            level=logging.WARNING,
+        )
         return []
 
     items = []
@@ -2620,8 +2718,13 @@ async def collect_official_publisher_news():
     if discovery_task in done:
         try:
             discovered = discovery_task.result()
-        except Exception:
-            log.exception("Official public discovery failed")
+        except Exception as exc:
+            _log_fault_once(
+                "official_public_discovery",
+                "Official public discovery failed",
+                exc=exc,
+                level=logging.WARNING,
+            )
     else:
         discovery_task.cancel()
         try:
@@ -3961,8 +4064,13 @@ async def _collect_general_news(max_items=150):
             len(discovery_queries), len(done), len(pending), discovery_added, DISCOVERY_BUDGET,
         )
 
-    except Exception:
-        log.exception("Discovery failed; returning available direct-feed news.")
+    except Exception as exc:
+        _log_fault_once(
+            "background_discovery",
+            "Discovery failed; returning available direct-feed news.",
+            exc=exc,
+            level=logging.WARNING,
+        )
 
     # Bound work before verification, translation and semantic dedup. Discovery
     # can otherwise delay completed official results past the cache timeout.
@@ -4065,8 +4173,13 @@ async def collect_news(max_items=150):
             if task in done:
                 try:
                     items.extend(task.result())
-                except Exception:
-                    log.exception("News collector failed")
+                except Exception as exc:
+                    _log_fault_once(
+                        "news_collector",
+                        "News collector failed",
+                        exc=exc,
+                        level=logging.WARNING,
+                    )
     finally:
         for task in tasks:
             if not task.done():

@@ -160,8 +160,8 @@ DEFERRED_RESULT_CACHE_TTL_SECONDS = 900
 CIRCUIT_FAILURES = 3
 CIRCUIT_COOLDOWN_SECONDS = 300
 USER_AGENT = (
-    "Global-Intel-Bot/1.0 "
-    "(public-source monitor; contact via project operator)"
+    "Al-Arrab-News/1.0 "
+    "(public-source news monitor; contact via project operator)"
 )
 
 # process-local breaker; intentionally does not persist across deploys

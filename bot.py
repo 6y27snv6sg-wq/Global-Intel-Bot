@@ -3170,13 +3170,11 @@ async def show_topic(query, user_id, key, page):
         raw_results = []
         if page == 1:
             raw_results = get_cached_topic_view(key, MAX_TOPIC_RESULTS)
-            # عاجل is a rolling timeline, not an "unread only" inbox. The last
-            # hour remains visible even after the alert was already delivered.
-            results = (
-                list(raw_results)
-                if key == "urg"
-                else _filter_unseen_topic_events(user_id, key, raw_results)
-            )
+            # Section buttons are pure presentation reads. Routing, deduplication,
+            # translation and ranking already happened when HOT_TOPIC_VIEWS was built.
+            # Keep one stable per-user snapshot only for pagination; do not perform
+            # seen-event matching or semantic comparisons on the callback path.
+            results = list(raw_results)
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
         else:
@@ -3206,22 +3204,8 @@ async def show_topic(query, user_id, key, page):
                 disable_web_page_preview=True,
                 parse_mode="HTML",
             )
-            start = (page - 1) * PER_PAGE
-            _remember_topic_events(user_id, key, results[start:start + PER_PAGE])
-
             # UI callbacks are cache-only. The shared provider monitor owns
             # refresh scheduling so button presses never start heavy network work.
-            return
-
-        # The topic has cached stories, but this user has already seen them.
-        # Never launch collection from a button; the provider monitor refreshes it.
-        if page == 1 and raw_results:
-            await query.message.reply_text(
-                f"<b>{safe_html(TOPICS[key][0])}</b>\n\n"
-                "لا توجد أخبار جديدة منذ آخر عرض.\n"
-                "📡 الرصد مستمر تلقائياً.",
-                parse_mode="HTML",
-            )
             return
 
         # "عاجل" is continuously maintained by urgent_monitor. A button press

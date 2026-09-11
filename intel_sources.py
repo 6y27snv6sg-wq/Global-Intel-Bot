@@ -93,6 +93,7 @@ DEFAULT_INCLUDE_SUPPORT = False
 
 _CIRCUIT_STATE: Dict[str, Dict[str, float]] = {}
 _X_USER_ID_CACHE: Dict[str, Tuple[str, float]] = {}
+_SOURCE_HEALTH: Dict[str, Dict[str, Any]] = {}
 
 
 def _src(
@@ -522,6 +523,23 @@ def reset_circuit_breakers():
     _CIRCUIT_STATE.clear()
 
 
+def _record_health(source_id: str, status: str, *, detail: str = "", items: Optional[int] = None) -> None:
+    state = _SOURCE_HEALTH.setdefault(source_id, {})
+    state["status"] = status
+    state["updated_monotonic"] = time.monotonic()
+    if detail:
+        state["detail"] = _clean_text(detail)[:240]
+    else:
+        state.pop("detail", None)
+    if items is not None:
+        state["items"] = max(0, int(items))
+
+
+def source_health() -> Dict[str, Dict[str, Any]]:
+    """Return a read-only snapshot of current process-local source health."""
+    return {source_id: dict(state) for source_id, state in _SOURCE_HEALTH.items()}
+
+
 async def _read_bounded(response: aiohttp.ClientResponse) -> str:
     chunks, total = [], 0
     async for chunk in response.content.iter_chunked(64 * 1024):
@@ -537,8 +555,9 @@ async def _read_bounded(response: aiohttp.ClientResponse) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-async def _get_text(session, url, *, source_id, headers=None, params=None) -> str:
+async def _get_text(session, url, *, source_id, headers=None, params=None, mark_success=True) -> str:
     if _circuit_is_open(source_id):
+        _record_health(source_id, "circuit_open")
         return ""
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS, connect=2)
     try:
@@ -546,35 +565,57 @@ async def _get_text(session, url, *, source_id, headers=None, params=None) -> st
             if response.status != 200:
                 raise RuntimeError(f"HTTP {response.status}")
             text = await _read_bounded(response)
-        _circuit_success(source_id)
+        if mark_success:
+            _circuit_success(source_id)
+            _record_health(source_id, "ok")
         return text
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         _circuit_failure(source_id)
+        _record_health(source_id, "fetch_failed", detail=str(exc))
         log.warning("social source failed: %s: %s", source_id, exc)
         return ""
 
 
 async def _get_json(session, url, *, source_id, headers, params=None) -> Dict[str, Any]:
-    text = await _get_text(session, url, source_id=source_id, headers=headers, params=params)
+    text = await _get_text(
+        session, url, source_id=source_id, headers=headers, params=params, mark_success=False
+    )
     if not text:
         return {}
     try:
         payload = json.loads(text)
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
+        if not isinstance(payload, dict):
+            raise ValueError("JSON payload is not an object")
+        _circuit_success(source_id)
+        _record_health(source_id, "ok")
+        return payload
+    except Exception as exc:
+        _circuit_failure(source_id)
+        _record_health(source_id, "parse_failed", detail=str(exc))
+        log.warning("social JSON parser failed: %s: %s", source_id, exc)
         return {}
 
 
 async def _collect_telegram_source(session, source, *, include_forwarded):
-    document = await _get_text(session, f'https://t.me/s/{source["handle"]}', source_id=source["id"])
+    source_id = source["id"]
+    document = await _get_text(
+        session, f'https://t.me/s/{source["handle"]}', source_id=source_id, mark_success=False
+    )
     if not document:
         return []
     try:
-        return parse_telegram_public_html(document, source_id=source["id"], include_forwarded=include_forwarded)
+        events = parse_telegram_public_html(
+            document, source_id=source_id, include_forwarded=include_forwarded
+        )
+        _circuit_success(source_id)
+        _record_health(source_id, "ok" if events else "empty", items=len(events))
+        return events
     except Exception as exc:
-        log.warning("telegram parser failed: %s: %s", source["id"], exc)
+        _circuit_failure(source_id)
+        _record_health(source_id, "parse_failed", detail=str(exc))
+        log.warning("telegram parser failed: %s: %s", source_id, exc)
         return []
 
 
@@ -610,16 +651,20 @@ async def _resolve_x_user_id(session, source, bearer):
 
 
 async def _collect_x_source(session, source, *, bearer):
+    source_id = source["id"]
     if not bearer:
+        _record_health(source_id, "disabled", detail="X_BEARER_TOKEN missing")
         return []
     user_id = await _resolve_x_user_id(session, source, bearer)
     if not user_id:
+        if not _circuit_is_open(source_id):
+            _record_health(source_id, "unavailable", detail="X user lookup returned no usable account")
         return []
 
     payload = await _get_json(
         session,
         f"{X_API_BASE}/users/{user_id}/tweets",
-        source_id=source["id"],
+        source_id=source_id,
         headers={"Authorization": f"Bearer {bearer}"},
         params={
             "max_results": str(MAX_POSTS_PER_SOURCE),
@@ -627,10 +672,17 @@ async def _collect_x_source(session, source, *, bearer):
             "tweet.fields": "created_at,entities",
         },
     )
+    if not payload:
+        return []
     try:
-        return parse_x_posts_payload(payload, source_id=source["id"])
+        events = parse_x_posts_payload(payload, source_id=source_id)
+        _circuit_success(source_id)
+        _record_health(source_id, "ok" if events else "empty", items=len(events))
+        return events
     except Exception as exc:
-        log.warning("x parser failed: %s: %s", source["id"], exc)
+        _circuit_failure(source_id)
+        _record_health(source_id, "parse_failed", detail=str(exc))
+        log.warning("x parser failed: %s: %s", source_id, exc)
         return []
 
 
@@ -685,15 +737,28 @@ async def collect_social_intel(
 
     bearer = _x_bearer_token()
 
+    # X is an optional enrichment layer. When it is unavailable, include verified
+    # Telegram support mirrors so the social provider does not collapse to a
+    # single active channel. Cross-language mirrors are still deduplicated later.
+    if not bearer and not include_support:
+        sources = [
+            source for source in get_active_sources(include_support=True)
+            if (not requested or source["id"] in requested)
+            and source["platform"] == PLATFORM_TELEGRAM
+        ]
+
     async def run(active_session):
         tasks, task_sources = [], []
         for source in sources:
             if source["platform"] == PLATFORM_TELEGRAM:
                 tasks.append(_collect_telegram_source(active_session, source, include_forwarded=include_forwarded_telegram))
                 task_sources.append(source)
-            elif source["platform"] == PLATFORM_X and bearer:
-                tasks.append(_collect_x_source(active_session, source, bearer=bearer))
-                task_sources.append(source)
+            elif source["platform"] == PLATFORM_X:
+                if bearer:
+                    tasks.append(_collect_x_source(active_session, source, bearer=bearer))
+                    task_sources.append(source)
+                else:
+                    _record_health(source["id"], "disabled", detail="X_BEARER_TOKEN missing")
 
         if not tasks:
             return []

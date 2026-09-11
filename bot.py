@@ -428,7 +428,7 @@ load_access_state()
 NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
 CALLBACK_ACK_TIMEOUT = 0.20
-TELEGRAM_CONCURRENT_UPDATES = 16
+TELEGRAM_CONCURRENT_UPDATES = 8
 CALLBACK_DEDUP_TTL = 60
 CALLBACK_ACTION_DEBOUNCE = 5
 GEMINI_TIMEOUT = 35
@@ -743,6 +743,20 @@ def get_item_summary(item):
 
 def expand_search_query(query):
     normalized = normalize_text(query)
+
+    # Institution searches need a precise canonical query. The previous generic
+    # country expansion diluted "وزارة الخارجية الأمريكية" into country terms.
+    us_state_markers = (
+        "وزارة الخارجية الامريكية",
+        "الخارجية الامريكية",
+        "وزاره الخارجيه الامريكيه",
+        "us department of state",
+        "u s department of state",
+        "state department",
+    )
+    if any(normalize_text(marker) in normalized for marker in us_state_markers):
+        return 'site:state.gov "U.S. Department of State"'
+
     values = [query]
     for key, aliases in SEARCH_ALIASES.items():
         if normalize_text(key) in normalized:
@@ -1141,11 +1155,29 @@ async def _ensure_arabic_titles(items, *, budget, cap):
     return items
 
 
+async def _run_async_collector_isolated(async_fn, /, *args, **kwargs):
+    """Run one async provider on its own worker-thread event loop.
+
+    Some third-party parsing/translation code inside the news engine is
+    synchronous even though the top-level collector is async. Running the
+    complete collector in a dedicated worker event loop prevents those blocking
+    sections from freezing Telegram's main event loop. The coroutine is created
+    and awaited inside the worker; no coroutine object crosses threads.
+    """
+    def runner():
+        return asyncio.run(async_fn(*args, **kwargs))
+
+    return await asyncio.to_thread(runner)
+
+
 async def _run_news_collection():
     global LAST_NEWS_REFRESH, NEWS_PROVIDER_HEALTH
     try:
         items = await asyncio.wait_for(
-            collect_news(max_items=NEWS_PROVIDER_ITEM_LIMIT),
+            _run_async_collector_isolated(
+                collect_news,
+                max_items=NEWS_PROVIDER_ITEM_LIMIT,
+            ),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
         if get_news_engine_health is not None:
@@ -3310,23 +3342,24 @@ async def progressive_online_search(
     if not additions:
         return
 
-    first_additions = additions[:PER_PAGE]
+    # One user search owns one Telegram message. Fresh online discoveries update
+    # that message in place instead of producing a second reply for one request.
     report = generate_base_report(
-        first_additions,
+        merged,
         1,
         PER_PAGE,
-        heading_html=(
-            f"{status_visual('monitoring')} "
-            f"{safe_html('تحديث البحث')}"
-        ),
-        subheading=f"+{len(additions)} نتائج إضافية حديثة عن: {raw_query}",
+        heading=f"🔎 {raw_query}",
+        subheading=f"✓ تم العثور على {len(merged)} نتائج بعد تحديث البحث",
     )
-    await message.reply_text(
-        report,
-        reply_markup=search_result_keyboard(user_id, 1),
-        disable_web_page_preview=True,
-        parse_mode="HTML",
-    )
+    try:
+        await status.edit_text(
+            report,
+            reply_markup=search_result_keyboard(user_id, 1),
+            disable_web_page_preview=True,
+            parse_mode="HTML",
+        )
+    except Exception:
+        log.info("Search result message could not be upgraded in place.")
 
 
 async def button_handler(update, context):

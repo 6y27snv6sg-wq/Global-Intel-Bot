@@ -571,14 +571,14 @@ SEEN_CALLBACK_IDS: Dict[str, float] = {}
 RECENT_CALLBACK_ACTIONS: Dict[str, float] = {}
 
 TOPICS = {
-    "econ": (
-        "📈 اقتصاد وأسواق",
+    # Presentation and refresh priority is deliberate: urgent first, then the
+    # highest-value specialist desks, followed by regional/general coverage.
+    "urg": (
+        "🚨 عاجل",
         [
-            "اقتصاد", "اقتصادي", "أسواق", "أسهم", "بورصة", "الذهب",
-            "فائدة", "عملات", "عملات رقمية", "بيتكوين", "تداول",
-            "نفط", "أوبك", "خام", "تضخم", "أسواق المال", "برنت",
-            "طاقة", "غاز", "استثمار", "سندات", "ميزانية", "ناتج محلي",
-            "بنك مركزي", "دولار", "واردات", "صادرات", "استثمارات",
+            "عاجل", "طارئ", "هجوم", "انفجار", "قصف", "صاروخ", "زلزال",
+            "اشتباك", "غارة", "إخلاء", "حالة طوارئ", "تحذير عاجل",
+            "هجوم مسلح", "أزمة", "استهداف", "غارات", "إطلاق النار",
         ],
     ),
     "forg": (
@@ -591,12 +591,24 @@ TOPICS = {
             "الحكومة تعلن", "الحكومة تؤكد", "الرئاسة تعلن", "الرئاسة تؤكد",
         ],
     ),
-    "urg": (
-        "🚨 عاجل",
+    "secu": (
+        "🛡 دفاع وأمن",
         [
-            "عاجل", "طارئ", "هجوم", "انفجار", "قصف", "صاروخ", "زلزال",
-            "اشتباك", "غارة", "إخلاء", "حالة طوارئ", "تحذير عاجل",
-            "هجوم مسلح", "أزمة", "استهداف", "غارات", "إطلاق النار",
+            "الدفاع", "الأمن القومي", "تسليح", "مناورات", "عسكري", "جيش",
+            "قوات", "أمن", "دفاع", "قاعدة عسكرية", "أسلحة", "صاروخ",
+            "طيران عسكري", "قصف", "هجوم", "اشتباك", "غارة", "استهداف",
+            "عملية عسكرية", "عمليات عسكرية", "قوات خاصة", "دفاع جوي",
+            "منظومة دفاع", "ذخائر", "مقاتلات", "طائرات مسيرة",
+        ],
+    ),
+    "econ": (
+        "📈 اقتصاد وأسواق",
+        [
+            "اقتصاد", "اقتصادي", "أسواق", "أسهم", "بورصة", "الذهب",
+            "فائدة", "عملات", "عملات رقمية", "بيتكوين", "تداول",
+            "نفط", "أوبك", "خام", "تضخم", "أسواق المال", "برنت",
+            "طاقة", "غاز", "استثمار", "سندات", "ميزانية", "ناتج محلي",
+            "بنك مركزي", "دولار", "واردات", "صادرات", "استثمارات",
         ],
     ),
     "gulf": (
@@ -615,17 +627,10 @@ TOPICS = {
             "أستراليا", "أفريقيا", "أمريكا الجنوبية", "دولية", "قمة",
         ],
     ),
-    "secu": (
-        "🛡 دفاع وأمن",
-        [
-            "الدفاع", "الأمن القومي", "تسليح", "مناورات", "عسكري", "جيش",
-            "قوات", "أمن", "دفاع", "قاعدة عسكرية", "أسلحة", "صاروخ",
-            "طيران عسكري", "قصف", "هجوم", "اشتباك", "غارة", "استهداف",
-            "عملية عسكرية", "عمليات عسكرية", "قوات خاصة", "دفاع جوي",
-            "منظومة دفاع", "ذخائر", "مقاتلات", "طائرات مسيرة",
-        ],
-    ),
 }
+
+TOPIC_REFRESH_PRIORITY = ("urg", "forg", "secu", "econ", "gulf", "wrld")
+
 
 SEARCH_ALIASES = {
     "بريطانيا": ["المملكة المتحدة", "UK", "United Kingdom"],
@@ -1428,14 +1433,15 @@ def _rebuild_hot_views():
     else:
         merged = list(candidate)
 
-    # Build every desk locally first. Nothing below this point is visible to a
-    # Telegram callback until the single HOT_PRESENTATION_SNAPSHOT assignment.
-    next_topics = {
-        key: topic_filter(merged, key, MAX_TOPIC_RESULTS)
-        for key in TOPICS
-        if key != "urg"
-    }
-    next_topics["urg"] = list(urgent_timeline)
+    # Build desks strictly by operational priority so CPU-heavy routing does not
+    # fan out across all sections at once. Urgent is already prepared from the
+    # breaking lane; the remaining desks are routed one at a time.
+    next_topics = {}
+    for key in TOPIC_REFRESH_PRIORITY:
+        if key == "urg":
+            next_topics[key] = list(urgent_timeline)
+        else:
+            next_topics[key] = topic_filter(merged, key, MAX_TOPIC_RESULTS)
 
     # During a guarded/degraded cycle, preserve an existing non-empty desk if a
     # partial provider result would otherwise make that one desk disappear.
@@ -1588,51 +1594,44 @@ def _effective_social_interval():
 
 
 async def _run_all_source_refresh(force=False):
+    """Refresh providers in priority stages, never as one competing network burst.
+
+    Direct radar is refreshed first so عاجل can be served quickly. The broad news
+    engine follows, then social enrichment. A presentation rebuild is published
+    between stages, keeping Telegram callbacks on ready snapshots while network
+    work continues separately.
+    """
     jobs = []
-    if force or _provider_due(LAST_NEWS_REFRESH, _effective_news_interval()):
-        jobs.append(("news", collect_and_cache_news()))
-    if force or _provider_due(LAST_SOCIAL_REFRESH, _effective_social_interval()):
-        jobs.append(("social", _refresh_social_provider()))
     if force or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL):
-        jobs.append(("direct", _refresh_direct_provider(force=force)))
+        jobs.append(("direct", lambda: _refresh_direct_provider(force=force)))
+    if force or _provider_due(LAST_NEWS_REFRESH, _effective_news_interval()):
+        jobs.append(("news", collect_and_cache_news))
+    if force or _provider_due(LAST_SOCIAL_REFRESH, _effective_social_interval()):
+        jobs.append(("social", _refresh_social_provider))
 
     if jobs:
-        tasks = [
-            asyncio.create_task(coro, name=f"provider-refresh-{name}")
-            for name, coro in jobs
-        ]
+        for name, factory in jobs:
+            try:
+                await factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Independent provider refresh failed stage=%s error=%r", name, exc)
 
-        # Cold start only: publish the first useful provider result instead of
-        # keeping every section empty until the slowest provider finishes. This
-        # costs at most one extra off-thread presentation build per process start.
-        if not get_cached_news_view():
-            pending = set(tasks)
-            while pending and not get_cached_news_view():
-                done, pending = await asyncio.wait(
-                    pending,
-                    return_when=asyncio.FIRST_COMPLETED,
+            # Publish whatever is ready after each provider stage. The rebuild is
+            # off the Telegram event loop and desks are routed by fixed priority.
+            if (
+                NEWS_CACHE.peek("all_news")
+                or SOCIAL_CACHE.peek("social_news")
+                or DIRECT_CACHE.peek("direct_news")
+                or BREAKING_CACHE.peek("breaking_news")
+            ):
+                await _rebuild_hot_views_async()
+                log.info(
+                    "Priority refresh stage=%s hot=%d",
+                    name,
+                    len(get_cached_news_view()),
                 )
-                if (
-                    NEWS_CACHE.peek("all_news")
-                    or SOCIAL_CACHE.peek("social_news")
-                    or DIRECT_CACHE.peek("direct_news")
-                ):
-                    await _rebuild_hot_views_async()
-                    if get_cached_news_view():
-                        log.info(
-                            "Cold-start Hot Cache bootstrap published=%d pending_providers=%d",
-                            len(get_cached_news_view()),
-                            len(pending),
-                        )
-                        break
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
-                log.error("Independent provider refresh failed: %r", result)
-
-        # Final publication includes every provider that completed this cycle.
-        await _rebuild_hot_views_async()
 
         health = get_network_health()
         log.info(
@@ -3486,7 +3485,8 @@ async def button_handler(update, context):
         await query.message.reply_text(
             f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n\n"
             "اختر القسم المطلوب. الأخبار المتاحة تظهر أولاً "
-            "والرصد يستمر في الخلفية.",
+            "والرصد يستمر في الخلفية.\n\n"
+            "🔄 <b>اضغط زر التحديث وانتظر اكتمال التحديث، ثم اختر القسم المطلوب.</b>",
             reply_markup=main_keyboard(user_id),
             parse_mode="HTML",
         )

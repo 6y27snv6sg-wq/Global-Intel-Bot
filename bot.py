@@ -430,7 +430,7 @@ ONLINE_SEARCH_TIMEOUT = 6
 CALLBACK_ACK_TIMEOUT = 0.20
 TELEGRAM_CONCURRENT_UPDATES = 8
 CALLBACK_DEDUP_TTL = 60
-CALLBACK_ACTION_DEBOUNCE = 5
+CALLBACK_ACTION_DEBOUNCE = 8
 GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
@@ -741,12 +741,9 @@ def get_item_summary(item):
     ).strip()
 
 
-def expand_search_query(query):
+def _is_us_state_department_query(query):
     normalized = normalize_text(query)
-
-    # Institution searches need a precise canonical query. The previous generic
-    # country expansion diluted "وزارة الخارجية الأمريكية" into country terms.
-    us_state_markers = (
+    markers = (
         "وزارة الخارجية الامريكية",
         "الخارجية الامريكية",
         "وزاره الخارجيه الامريكيه",
@@ -754,7 +751,48 @@ def expand_search_query(query):
         "u s department of state",
         "state department",
     )
-    if any(normalize_text(marker) in normalized for marker in us_state_markers):
+    return any(normalize_text(marker) in normalized for marker in markers)
+
+
+def _is_us_state_department_item(item):
+    raw_url = get_item_url(item)
+    host = ""
+    try:
+        host = (urllib.parse.urlparse(raw_url).hostname or "").lower()
+    except Exception:
+        host = ""
+
+    if host == "state.gov" or host.endswith(".state.gov"):
+        return True
+
+    source = normalize_text(get_item_source(item))
+    return any(
+        marker in source
+        for marker in (
+            "u s department of state",
+            "us department of state",
+            "department of state",
+            "state gov",
+            "الخارجيه الامريكيه",
+            "وزارة الخارجيه الامريكيه",
+        )
+    )
+
+
+def _filter_precise_search_results(raw_query, items):
+    values = list(items or [])
+    if _is_us_state_department_query(raw_query):
+        return [item for item in values if _is_us_state_department_item(item)]
+    return values
+
+
+def expand_search_query(query):
+    normalized = normalize_text(query)
+
+    # The online discovery engine understands site: constraints. Local cache
+    # matching is filtered separately so generic "وزارة الخارجية" terms cannot
+    # pull Egyptian, Saudi or other foreign ministries into a U.S. State query.
+    if _is_us_state_department_query(query):
         return 'site:state.gov "U.S. Department of State"'
 
     values = [query]
@@ -849,8 +887,9 @@ def claim_callback(query, user_id, data):
 
     message = getattr(query, "message", None)
     chat_id = getattr(getattr(message, "chat", None), "id", "")
-    message_id = getattr(message, "message_id", "")
-    action_key = f"{user_id}:{chat_id}:{message_id}:{data}"
+    # A user can have several old bot keyboards still visible. Treat the same
+    # action as one action across those messages during the debounce window.
+    action_key = f"{user_id}:{chat_id}:{data}"
     seen_at = RECENT_CALLBACK_ACTIONS.get(action_key)
     if seen_at is not None and now - seen_at < CALLBACK_ACTION_DEBOUNCE:
         log.info("Repeated callback action ignored: %s", data)
@@ -3284,6 +3323,7 @@ async def progressive_online_search(
         return
 
     online = deduplicate_events(online or [], limit=MAX_SEARCH_RESULTS)
+    online = _filter_precise_search_results(raw_query, online)
     local_keys = {urgent_key(item) for item in local_results}
     additions = [
         item for item in online
@@ -3408,7 +3448,7 @@ async def button_handler(update, context):
         )
 
         cached = get_cached_news_view()
-        await query.message.reply_text(
+        refresh_status = await query.message.reply_text(
             f"{status_visual('monitoring')} <b>تحديث التغطية</b>\n\n"
             f"● المتاح الآن: {len(cached)} خبر\n"
             "◌ جاري توسيع التغطية في الخلفية...",
@@ -3424,7 +3464,7 @@ async def button_handler(update, context):
             after = len(fresh)
             guarded = bool(LAST_HOT_SNAPSHOT_GUARDED)
             try:
-                await query.message.reply_text(
+                await refresh_status.edit_text(
                     f"✅ <b>اكتملت جولة التحديث</b>\n\n"
                     f"الأخبار المتاحة الآن: {after}"
                     + (
@@ -3581,6 +3621,9 @@ async def handle_user_message(update, context):
 
         try:
             query_text = expand_search_query(text)
+            local_query_text = (
+                text if _is_us_state_department_query(text) else query_text
+            )
 
             # User search has priority over the heavy global collector.
             # Use whatever cache already exists, but never start a full collection
@@ -3590,10 +3633,11 @@ async def handle_user_message(update, context):
 
             local_results = await search_news(
                 cached,
-                query_text,
+                local_query_text,
                 MAX_SEARCH_RESULTS,
             )
             local_results = deduplicate_events(local_results, limit=MAX_SEARCH_RESULTS)
+            local_results = _filter_precise_search_results(text, local_results)
 
             USER_SEARCH_QUERY[user_id] = text
 

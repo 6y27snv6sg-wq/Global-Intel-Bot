@@ -148,9 +148,15 @@ VALID_ROUTING_HINTS = {
 
 MAX_RESPONSE_BYTES = 900_000
 MAX_ITEMS_PER_SOURCE = 20
-DIRECT_COLLECTION_BUDGET_SECONDS = 4.8
-DIRECT_END_TO_END_BUDGET_SECONDS = 6.0
+
+# The interactive Direct provider returns the fast sensors under a short bounded
+# budget. Slow-but-important sensors (currently OFAC) run in an isolated lane,
+# keep their own deadline, and publish their completed snapshot into the next
+# bot merge cycle instead of delaying UKMTO/USGS/EASA/GDACS.
+DIRECT_FAST_COLLECTION_BUDGET_SECONDS = 4.6
+DIRECT_END_TO_END_BUDGET_SECONDS = 5.8
 DIRECT_TASK_GRACE_SECONDS = 0.10
+DEFERRED_RESULT_CACHE_TTL_SECONDS = 900
 CIRCUIT_FAILURES = 3
 CIRCUIT_COOLDOWN_SECONDS = 300
 USER_AGENT = (
@@ -163,6 +169,11 @@ _CIRCUIT_STATE: Dict[str, Dict[str, float]] = {}
 _LAST_ATTEMPT: Dict[str, float] = {}
 _SOURCE_HEALTH: Dict[str, Dict[str, object]] = {}
 _LAST_SUCCESS: Dict[str, float] = {}
+
+# Background lane state is intentionally process-local, like the circuit breaker.
+# It contains only completed normalized events and one task per deferred sensor.
+_DEFERRED_TASKS: Dict[str, asyncio.Task] = {}
+_DEFERRED_RESULT_CACHE: Dict[str, Dict[str, object]] = {}
 
 HEALTH_OK = "ok"
 HEALTH_EMPTY = "empty"
@@ -320,8 +331,9 @@ DIRECT_SOURCES: List[Dict] = [
         "dedup_group": "ofac",
         "priority": 100,
         "poll_interval_seconds": 60,
-        "timeout_seconds": 7,
-        "per_url_timeout_seconds": 2.2,
+        "collection_lane": "deferred",
+        "timeout_seconds": 8,
+        "per_url_timeout_seconds": 2.4,
         "default_event_status": STATUS_AUTHORITY_CONFIRMED,
         "attribution_ar": (
             "بحسب مكتب مراقبة الأصول الأجنبية بوزارة الخزانة الأمريكية"
@@ -1372,6 +1384,82 @@ def _log_direct_health_summary() -> None:
 
 
 
+def _is_deferred_source(source: Dict) -> bool:
+    return str(source.get("collection_lane") or "fast") == "deferred"
+
+
+def _cached_deferred_events(source_id: str, *, now: Optional[float] = None) -> List[Dict]:
+    entry = _DEFERRED_RESULT_CACHE.get(source_id)
+    if not entry:
+        return []
+    now = time.monotonic() if now is None else now
+    updated = float(entry.get("updated_monotonic") or 0.0)
+    if updated <= 0 or (now - updated) > DEFERRED_RESULT_CACHE_TTL_SECONDS:
+        _DEFERRED_RESULT_CACHE.pop(source_id, None)
+        return []
+    return [dict(item) for item in (entry.get("events") or [])]
+
+
+async def _run_deferred_source(source: Dict) -> List[Dict]:
+    """Collect one slow sensor with its own session and deadline."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json,application/geo+json,application/xml,text/xml,text/html;q=0.8,*/*;q=0.5",
+    }
+    connector = aiohttp.TCPConnector(limit=3, enable_cleanup_closed=True)
+    timeout_seconds = float(source.get("timeout_seconds", 5)) + 0.75
+    async with aiohttp.ClientSession(headers=headers, connector=connector) as owned:
+        async with asyncio.timeout(timeout_seconds):
+            return await _collect_one(owned, source)
+
+
+def _finish_deferred_source(source_id: str, task: asyncio.Task) -> None:
+    """Commit only healthy completed snapshots; retain last-good cache on failure."""
+    if _DEFERRED_TASKS.get(source_id) is task:
+        _DEFERRED_TASKS.pop(source_id, None)
+
+    try:
+        events = task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        _circuit_failure(source_id)
+        _set_source_health(
+            source_id,
+            HEALTH_FETCH_FAILED,
+            detail=f"deferred_{type(exc).__name__}: {exc}",
+        )
+        log.warning("deferred direct source isolated failure: %s: %s", source_id, exc)
+        return
+
+    status = str(_SOURCE_HEALTH.get(source_id, {}).get("status") or HEALTH_UNKNOWN)
+    if status in {HEALTH_OK, HEALTH_EMPTY}:
+        _DEFERRED_RESULT_CACHE[source_id] = {
+            "updated_monotonic": time.monotonic(),
+            "events": [dict(item) for item in events],
+        }
+
+
+def _ensure_deferred_source_task(source: Dict, *, force: bool = False) -> None:
+    """Start at most one background task for a deferred sensor."""
+    source_id = source["id"]
+    current = _DEFERRED_TASKS.get(source_id)
+    if current is not None and not current.done():
+        return
+
+    if not force and not _source_due(source):
+        return
+
+    task = asyncio.create_task(
+        _run_deferred_source(source),
+        name=f"direct-deferred:{source_id}",
+    )
+    _DEFERRED_TASKS[source_id] = task
+    task.add_done_callback(
+        lambda done, sid=source_id: _finish_deferred_source(sid, done)
+    )
+
+
 async def _collect_sources_with_budget(
     session: aiohttp.ClientSession,
     sources: List[Dict],
@@ -1455,36 +1543,52 @@ async def collect_direct_radar(
     force: bool = False,
 ) -> List[Dict]:
     """
-    Collect selected direct sensors under a hard end-to-end deadline.
+    Collect Direct radar without allowing one slow sensor to delay the provider.
 
-    The internal deadline includes sensor I/O, cancellation and owned-session cleanup,
-    so the provider returns before the orchestrator's outer timeout.
+    Fast sensors are awaited under the provider budget. Deferred sensors own a
+    separate deadline and commit only a completed healthy snapshot. The bot gets
+    that snapshot on the same call if already available, otherwise on the next
+    refresh cycle; fast alerts are never held behind the deferred lane.
     """
     selected_ids = set(source_ids or [])
     candidates = [
         s for s in get_active_direct_sources()
         if not selected_ids or s["id"] in selected_ids
     ]
-    if force:
-        sources = candidates
-    else:
-        sources = [s for s in candidates if _source_due(s)]
-        for source in candidates:
-            _ensure_health_entry(source["id"])
 
-    if not sources:
+    for source in candidates:
+        _ensure_health_entry(source["id"])
+
+    deferred_sources = [s for s in candidates if _is_deferred_source(s)]
+    fast_candidates = [s for s in candidates if not _is_deferred_source(s)]
+
+    for source in deferred_sources:
+        _ensure_deferred_source_task(source, force=force)
+
+    deferred_events: List[Dict] = []
+    for source in deferred_sources:
+        deferred_events.extend(_cached_deferred_events(source["id"]))
+
+    if force:
+        fast_sources = fast_candidates
+    else:
+        fast_sources = [s for s in fast_candidates if _source_due(s)]
+
+    if not fast_sources:
+        output = deduplicate_radar_events(deferred_events)
         _log_direct_health_summary()
-        return []
+        return output
 
     completed: List[Dict] = []
 
     async def run(active_session: aiohttp.ClientSession) -> List[Dict]:
         merged = await _collect_sources_with_budget(
             active_session,
-            sources,
-            budget_seconds=DIRECT_COLLECTION_BUDGET_SECONDS,
+            fast_sources,
+            budget_seconds=DIRECT_FAST_COLLECTION_BUDGET_SECONDS,
             completed_sink=completed,
         )
+        merged.extend(deferred_events)
         return deduplicate_radar_events(merged)
 
     async def run_owned() -> List[Dict]:
@@ -1493,21 +1597,20 @@ async def collect_direct_radar(
             "Accept": "application/json,application/geo+json,application/xml,text/xml,text/html;q=0.8,*/*;q=0.5",
         }
         connector = aiohttp.TCPConnector(
-            limit=max(4, len(sources) * 2),
+            limit=max(4, len(fast_sources) * 2),
             enable_cleanup_closed=True,
         )
         owned = aiohttp.ClientSession(headers=headers, connector=connector)
         try:
             return await run(owned)
         finally:
-            # Session cleanup is inside the same hard provider deadline.
             await owned.close()
 
     try:
         async with asyncio.timeout(DIRECT_END_TO_END_BUDGET_SECONDS):
             output = await (run(session) if session is not None else run_owned())
     except asyncio.TimeoutError:
-        for source in sources:
+        for source in fast_sources:
             source_id = source["id"]
             current = str(_SOURCE_HEALTH.get(source_id, {}).get("status") or HEALTH_UNKNOWN)
             if current in {HEALTH_UNKNOWN, HEALTH_OK, HEALTH_EMPTY}:
@@ -1515,11 +1618,11 @@ async def collect_direct_radar(
                 _set_source_health(
                     source_id,
                     HEALTH_FETCH_FAILED,
-                    detail="end_to_end_budget_exhausted",
+                    detail="fast_lane_end_to_end_budget_exhausted",
                 )
-        output = deduplicate_radar_events(completed)
+        output = deduplicate_radar_events([*completed, *deferred_events])
         log.warning(
-            "Direct radar hard deadline reached; returning partial results items=%d",
+            "Direct fast lane hard deadline reached; returning partial results items=%d",
             len(output),
         )
 
@@ -1585,6 +1688,10 @@ def validate_direct_sources() -> List[str]:
         timeout = source.get("timeout_seconds", 0)
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 15:
             errors.append(f"{source_id}: invalid timeout_seconds")
+
+        lane = str(source.get("collection_lane") or "fast")
+        if lane not in {"fast", "deferred"}:
+            errors.append(f"{source_id}: invalid collection_lane")
 
         for field in ("url", "official_proof"):
             value = str(source.get(field, ""))

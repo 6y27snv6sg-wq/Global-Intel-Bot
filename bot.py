@@ -537,6 +537,7 @@ LAST_USER_STATE_PRUNE = 0.0
 # own translation, deduplication, routing and rebuilding in the background.
 HOT_TOPIC_VIEWS: Dict[str, List[Any]] = {}
 HOT_VIEW_DIRTY = True
+PRESENTATION_REBUILD_TASK = None
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
 SENT_URGENT_KEYS = deque(maxlen=MAX_SENT_URGENT_KEYS)
@@ -1315,27 +1316,48 @@ def _rebuild_hot_views():
     return list(merged)
 
 
+def _rebuild_urgent_view():
+    """Refresh only the rolling urgent button; never rebuild all six sections."""
+    HOT_TOPIC_VIEWS["urg"] = _recent_publishable_urgent(
+        BREAKING_CACHE.peek("breaking_news") or [],
+        limit=MAX_TOPIC_RESULTS,
+    )
+    return list(HOT_TOPIC_VIEWS["urg"])
+
+
+async def _rebuild_hot_views_async():
+    """Run CPU-heavy presentation work off the Telegram event loop."""
+    global PRESENTATION_REBUILD_TASK
+
+    task = PRESENTATION_REBUILD_TASK
+    if task is None or task.done():
+        task = asyncio.create_task(
+            asyncio.to_thread(_rebuild_hot_views),
+            name="presentation-hot-view-rebuild",
+        )
+        PRESENTATION_REBUILD_TASK = task
+
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if PRESENTATION_REBUILD_TASK is task and task.done():
+            PRESENTATION_REBUILD_TASK = None
+
+
 def get_cached_news_view(limit=HOT_CACHE_LIMIT):
-    """Instant read-only merged snapshot; never performs network I/O."""
+    """Instant read-only merged snapshot; never performs network or heavy CPU work."""
     cached = HOT_VIEW_CACHE.peek("merged")
     if cached is not None:
         return list(cached[:limit])
-
-    # Startup-only fallback before the first monitor cycle completes.
-    return list(_rebuild_hot_views()[:limit])
+    # During startup the background monitor owns the first rebuild. Returning an
+    # empty ready view is preferable to freezing Telegram callbacks.
+    return []
 
 
 def get_cached_topic_view(topic_key, limit=MAX_TOPIC_RESULTS):
-    """Return a ready section index without re-running routing/dedup on a button."""
+    """Return a ready section index without routing/dedup work on a button."""
     if topic_key not in TOPICS:
         return []
-    cached = HOT_TOPIC_VIEWS.get(topic_key)
-    if cached is not None:
-        return list(cached[:limit])
-
-    # Startup-only fallback. Normal cycles build all topic indexes in advance.
-    if HOT_VIEW_CACHE.peek("merged") is None:
-        _rebuild_hot_views()
     return list(HOT_TOPIC_VIEWS.get(topic_key, [])[:limit])
 
 
@@ -1421,7 +1443,7 @@ async def _run_all_source_refresh(force=False):
             if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                 log.error("Independent provider refresh failed: %r", result)
 
-        _rebuild_hot_views()
+        await _rebuild_hot_views_async()
 
         health = get_network_health()
         log.info(
@@ -1434,7 +1456,7 @@ async def _run_all_source_refresh(force=False):
         )
 
     if HOT_VIEW_CACHE.peek("merged") is None:
-        _rebuild_hot_views()
+        await _rebuild_hot_views_async()
     return get_cached_news_view()
 
 
@@ -2741,7 +2763,7 @@ def _merge_breaking_into_cache(items):
         merged[:BREAKING_PROVIDER_ITEM_LIMIT],
     )
     _invalidate_hot_view()
-    _rebuild_hot_views()
+    _rebuild_urgent_view()
 
 
 async def initialize_urgent_baseline():
@@ -2860,7 +2882,7 @@ async def post_init(application):
 async def post_stop(application):
     global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
     global PROVIDER_MONITOR_STARTED, PROVIDER_MONITOR_TASK, PROVIDER_REFRESH_TASK
-    global NEWS_COLLECTION_TASK
+    global NEWS_COLLECTION_TASK, PRESENTATION_REBUILD_TASK
     global ACCESS_BOT, ACCESS_CLOUD_SYNC_TASK
 
     access_task = ACCESS_CLOUD_SYNC_TASK

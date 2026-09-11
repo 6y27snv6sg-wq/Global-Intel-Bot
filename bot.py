@@ -367,11 +367,6 @@ def is_owner(user_id):
     return int(user_id) == OWNER_ID
 
 
-def is_admin(user_id):
-    uid = int(user_id)
-    return uid == OWNER_ID or uid in ADMINS
-
-
 def is_authorized(user_id):
     uid = int(user_id)
     return uid == OWNER_ID or uid in ADMINS or uid in APPROVED_USERS
@@ -1248,58 +1243,42 @@ def _balance_topic_sources(items, limit):
     return balanced[:limit]
 
 
-MIDDLE_EAST_GEO_TERMS = {
-    "السعودية", "الإمارات", "الامارات", "قطر", "الكويت", "البحرين",
-    "عمان", "سلطنة عمان", "العراق", "إيران", "ايران", "اليمن", "سوريا",
-    "لبنان", "الأردن", "الاردن", "فلسطين", "إسرائيل", "اسرائيل",
-    "مصر", "تركيا", "الخليج", "الشرق الأوسط", "الشرق الاوسط",
-}
-
-WORLD_GEO_TERMS = {
-    "الولايات المتحدة", "أمريكا", "امريكا", "كندا", "المكسيك",
-    "أوروبا", "اوروبا", "بريطانيا", "المملكة المتحدة", "فرنسا", "ألمانيا",
-    "المانيا", "إيطاليا", "ايطاليا", "إسبانيا", "اسبانيا", "أوكرانيا",
-    "اوكرانيا", "روسيا", "بولندا", "السويد", "النرويج", "فنلندا",
-    "الصين", "اليابان", "الهند", "كوريا", "إندونيسيا", "اندونيسيا",
-    "ماليزيا", "سنغافورة", "تايلاند", "فيتنام", "الفلبين", "باكستان",
-    "أفغانستان", "افغانستان", "تايوان", "أستراليا", "استراليا",
-    "نيوزيلندا", "أفريقيا", "افريقيا", "جنوب أفريقيا", "جنوب افريقيا",
-    "نيجيريا", "كينيا", "إثيوبيا", "اثيوبيا", "المغرب", "الجزائر",
-    "تونس", "ليبيا", "السودان", "البرازيل", "الأرجنتين", "الارجنتين",
-    "تشيلي", "كولومبيا", "بيرو", "فنزويلا", "الاتحاد الأوروبي",
-    "الاتحاد الاوروبي", "الأمم المتحدة", "الامم المتحدة", "الناتو",
-}
+SPECIALIST_TOPICS = ("econ", "forg", "urg", "secu")
 
 
-def _geographic_topic_match(item, topic_key):
-    """Evaluate World/Middle-East as geographic browsing lenses."""
+def _specialist_topic(item):
+    """Return the item's specialist desk, if any."""
+    forced = str(getattr(item, "_exclusive_topic", "") or "")
+    if forced in SPECIALIST_TOPICS:
+        return forced
+    for key in SPECIALIST_TOPICS:
+        if is_topic_match(item, key):
+            return key
+    return ""
+
+
+def _general_geo_match(item, topic_key):
+    """World/Middle-East contain only general news, never specialist-desk items."""
+    if _specialist_topic(item):
+        return False
+
     region = normalize_text(str(getattr(item, "region", "") or ""))
-    text = normalize_text(
-        " ".join(
-            [
-                get_item_title(item),
-                get_item_summary(item),
-                get_item_source(item),
-                str(getattr(item, "_provider_entity_ar", "") or ""),
-                str(getattr(item, "_provider_entity", "") or ""),
-            ]
-        )
-    )
-
-    is_middle_east = (
-        "الشرق الاوسط" in region
-        or any(normalize_text(term) in text for term in MIDDLE_EAST_GEO_TERMS)
-    )
 
     if topic_key == "gulf":
-        return is_middle_east
+        return (
+            is_topic_match(item, "gulf")
+            or "الشرق الاوسط" in region
+        )
 
     if topic_key == "wrld":
-        if is_middle_east:
+        if is_topic_match(item, "gulf") or "الشرق الاوسط" in region:
             return False
-        if region and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}:
+        if is_topic_match(item, "wrld"):
             return True
-        return any(normalize_text(term) in text for term in WORLD_GEO_TERMS)
+        return bool(
+            region
+            and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}
+        )
 
     return False
 
@@ -1310,11 +1289,8 @@ def topic_filter(items, topic_key, max_results=25):
 
     scored = []
     for item in items:
-        if not _provider_title_ready(item):
-            continue
-
         if topic_key in {"gulf", "wrld"}:
-            if not _geographic_topic_match(item, topic_key):
+            if not _general_geo_match(item, topic_key):
                 continue
         else:
             forced_topic = str(getattr(item, "_exclusive_topic", "") or "")
@@ -1506,11 +1482,6 @@ def _display_user(meta, user_id):
         pieces.append(f"@{username}")
     pieces.append(str(user_id))
     return " | ".join(pieces)
-
-
-def _known_user_meta(user_id):
-    uid = int(user_id)
-    return PENDING_USERS.get(uid, {})
 
 
 async def notify_owner_access_request(context, user, first_request=True):

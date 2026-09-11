@@ -159,25 +159,85 @@ USER_AGENT = (
 _CIRCUIT_STATE: Dict[str, Dict[str, float]] = {}
 _LAST_ATTEMPT: Dict[str, float] = {}
 _SOURCE_HEALTH: Dict[str, Dict[str, object]] = {}
+_LAST_SUCCESS: Dict[str, float] = {}
 
 HEALTH_OK = "ok"
 HEALTH_EMPTY = "empty"
 HEALTH_FETCH_FAILED = "fetch_failed"
 HEALTH_PARSE_FAILED = "parse_failed"
 HEALTH_CIRCUIT_OPEN = "circuit_open"
-HEALTH_NOT_DUE = "not_due"
+HEALTH_UNKNOWN = "unknown"
 
 def _set_source_health(source_id: str, status: str, *, detail: str = "", items: int = 0) -> None:
+    now = time.monotonic()
+    previous = _SOURCE_HEALTH.get(source_id, {})
+    if status in {HEALTH_OK, HEALTH_EMPTY}:
+        _LAST_SUCCESS[source_id] = now
     _SOURCE_HEALTH[source_id] = {
         "status": status,
         "detail": _clean_text(detail)[:240] if detail else "",
         "items": max(0, int(items or 0)),
-        "updated_monotonic": time.monotonic(),
+        "updated_monotonic": now,
+        "last_attempt_monotonic": _LAST_ATTEMPT.get(source_id),
+        "last_success_monotonic": _LAST_SUCCESS.get(source_id),
+        "consecutive_failures": int(_circuit_state(source_id)["failures"]),
+        "circuit_open_until": float(_circuit_state(source_id)["open_until"]),
+        "previous_status": previous.get("status", ""),
     }
 
+def _ensure_health_entry(source_id: str) -> None:
+    """Create an explicit unknown entry without overwriting a real prior state."""
+    if source_id not in _SOURCE_HEALTH:
+        _SOURCE_HEALTH[source_id] = {
+            "status": HEALTH_UNKNOWN,
+            "detail": "",
+            "items": 0,
+            "updated_monotonic": 0.0,
+            "last_attempt_monotonic": _LAST_ATTEMPT.get(source_id),
+            "last_success_monotonic": _LAST_SUCCESS.get(source_id),
+            "consecutive_failures": int(_circuit_state(source_id)["failures"]),
+            "circuit_open_until": float(_circuit_state(source_id)["open_until"]),
+            "previous_status": "",
+        }
+
 def get_direct_source_health() -> Dict[str, Dict[str, object]]:
-    """Return a copy of process-local sensor health telemetry."""
-    return {key: dict(value) for key, value in _SOURCE_HEALTH.items()}
+    """Return truthful process-local sensor health without false not-due recovery."""
+    for source in get_active_direct_sources():
+        _ensure_health_entry(source["id"])
+    snapshot = {}
+    for source_id, value in _SOURCE_HEALTH.items():
+        item = dict(value)
+        source = get_direct_source(source_id)
+        if source:
+            item["due"] = _source_due(source)
+        item["consecutive_failures"] = int(_circuit_state(source_id)["failures"])
+        item["circuit_open_until"] = float(_circuit_state(source_id)["open_until"])
+        snapshot[source_id] = item
+    return snapshot
+
+def get_direct_network_health() -> Dict[str, object]:
+    """Aggregate direct-radar health for diagnostics; no network I/O."""
+    snapshot = get_direct_source_health()
+    statuses = [str(v.get("status") or HEALTH_UNKNOWN) for v in snapshot.values()]
+    healthy = sum(s in {HEALTH_OK, HEALTH_EMPTY} for s in statuses)
+    failed = sum(s in {HEALTH_FETCH_FAILED, HEALTH_PARSE_FAILED, HEALTH_CIRCUIT_OPEN} for s in statuses)
+    unknown = sum(s == HEALTH_UNKNOWN for s in statuses)
+    if failed and healthy:
+        state = "degraded"
+    elif failed and not healthy:
+        state = "unavailable"
+    elif healthy:
+        state = "ok"
+    else:
+        state = "unknown"
+    return {
+        "state": state,
+        "active_sensors": len(snapshot),
+        "healthy_sensors": healthy,
+        "failed_sensors": failed,
+        "unknown_sensors": unknown,
+        "sensors": snapshot,
+    }
 
 def _source_due(source: Dict, *, now: Optional[float] = None) -> bool:
     now = time.monotonic() if now is None else now
@@ -238,6 +298,10 @@ DIRECT_SOURCES: List[Dict] = [
         "role": ROLE_PRIMARY_SENSOR,
         "active": True,
         "url": "https://ofac.treasury.gov/recent-actions",
+        "fallback_urls": (
+            "https://ofac.treasury.gov/recent-actions/sanctions-list-updates",
+            "https://ofac.treasury.gov/recent-actions/regulations-and-guidance",
+        ),
         "parser": "ofac_html",
         "official_proof": "https://ofac.treasury.gov/",
         "regions": {"Global"},
@@ -253,7 +317,8 @@ DIRECT_SOURCES: List[Dict] = [
         "dedup_group": "ofac",
         "priority": 100,
         "poll_interval_seconds": 60,
-        "timeout_seconds": 4,
+        "timeout_seconds": 7,
+        "per_url_timeout_seconds": 2.2,
         "default_event_status": STATUS_AUTHORITY_CONFIRMED,
         "attribution_ar": (
             "بحسب مكتب مراقبة الأصول الأجنبية بوزارة الخزانة الأمريكية"
@@ -1055,6 +1120,9 @@ def _circuit_failure(source_id: str) -> None:
 
 def reset_circuit_breakers() -> None:
     _CIRCUIT_STATE.clear()
+    _LAST_ATTEMPT.clear()
+    _LAST_SUCCESS.clear()
+    _SOURCE_HEALTH.clear()
 
 
 # =========================================================
@@ -1087,34 +1155,51 @@ async def _fetch_text(
     if _circuit_is_open(source_id):
         return ""
 
-    timeout_seconds = float(source.get("timeout_seconds", 5))
-    timeout = aiohttp.ClientTimeout(
-        total=timeout_seconds,
-        connect=min(1.5, timeout_seconds),
-        sock_connect=min(1.5, timeout_seconds),
-        sock_read=min(2.5, timeout_seconds),
+    total_timeout = float(source.get("timeout_seconds", 5))
+    per_url_timeout = float(
+        source.get("per_url_timeout_seconds", min(2.5, total_timeout))
     )
+    urls = [source["url"], *list(source.get("fallback_urls") or ())]
+    started = time.monotonic()
+    last_exc: Optional[BaseException] = None
 
-    try:
-        async with session.get(
-            source["url"],
-            timeout=timeout,
-            allow_redirects=True,
-        ) as response:
-            if response.status != 200:
-                raise RuntimeError(f"HTTP {response.status}")
-            text = await _read_bounded(response)
-        return text
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        _circuit_failure(source_id)
-        _set_source_health(source_id, HEALTH_FETCH_FAILED, detail=type(exc).__name__)
-        detail = type(exc).__name__
-        if str(exc):
-            detail = f"{detail}: {exc}"
-        log.warning("direct source failed: %s: %s", source_id, detail)
-        return ""
+    for url in urls:
+        remaining = total_timeout - (time.monotonic() - started)
+        if remaining <= 0.2:
+            break
+
+        attempt_timeout = max(0.2, min(per_url_timeout, remaining))
+        timeout = aiohttp.ClientTimeout(
+            total=attempt_timeout,
+            connect=min(1.25, attempt_timeout),
+            sock_connect=min(1.25, attempt_timeout),
+            sock_read=max(0.2, min(1.8, attempt_timeout)),
+        )
+
+        try:
+            async with session.get(
+                url,
+                timeout=timeout,
+                allow_redirects=True,
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"HTTP {response.status}")
+                document = await _read_bounded(response)
+            if document:
+                return document
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    _circuit_failure(source_id)
+    detail = type(last_exc).__name__ if last_exc else "all_routes_failed"
+    if last_exc and str(last_exc):
+        detail = f"{detail}: {last_exc}"
+    _set_source_health(source_id, HEALTH_FETCH_FAILED, detail=detail)
+    log.warning("direct source failed after all official routes: %s: %s", source_id, detail)
+    return ""
 
 
 def _document_matches_source(source: Dict, document: str) -> bool:
@@ -1143,7 +1228,7 @@ async def _collect_one(
 ) -> List[Dict]:
     source_id = source["id"]
     if _circuit_is_open(source_id):
-        _set_source_health(source_id, HEALTH_CIRCUIT_OPEN)
+        _set_source_health(source_id, HEALTH_CIRCUIT_OPEN, detail="cooldown")
         return []
 
     _LAST_ATTEMPT[source_id] = time.monotonic()
@@ -1267,6 +1352,22 @@ def deduplicate_radar_events(events: Iterable[Dict]) -> List[Dict]:
     )
 
 
+def _log_direct_health_summary() -> None:
+    health = get_direct_network_health()
+    sensors = health["sensors"]
+    compact = " ".join(
+        f"{source['id']}={sensors.get(source['id'], {}).get('status', HEALTH_UNKNOWN)}"
+        for source in get_active_direct_sources()
+    )
+    log.info(
+        "Direct radar sensors state=%s healthy=%d/%d %s",
+        health["state"],
+        health["healthy_sensors"],
+        health["active_sensors"],
+        compact,
+    )
+
+
 # =========================================================
 # PUBLIC COLLECTOR
 # =========================================================
@@ -1293,10 +1394,10 @@ async def collect_direct_radar(
     else:
         sources = [s for s in candidates if _source_due(s)]
         for source in candidates:
-            if source not in sources:
-                _set_source_health(source["id"], HEALTH_NOT_DUE)
+            _ensure_health_entry(source["id"])
 
     if not sources:
+        _log_direct_health_summary()
         return []
 
     async def run(active_session: aiohttp.ClientSession) -> List[Dict]:
@@ -1314,7 +1415,9 @@ async def collect_direct_radar(
                 continue
             merged.extend(result or [])
 
-        return deduplicate_radar_events(merged)
+        output = deduplicate_radar_events(merged)
+        _log_direct_health_summary()
+        return output
 
     if session is not None:
         return await run(session)
@@ -1358,6 +1461,12 @@ def validate_direct_sources() -> List[str]:
             errors.append(f"{source_id}: invalid role")
         if source.get("source_type") not in VALID_SOURCE_TYPES:
             errors.append(f"{source_id}: invalid source_type")
+        for candidate_url in [source.get("url"), *list(source.get("fallback_urls") or ())]:
+            parsed = urlparse(str(candidate_url or ""))
+            if parsed.scheme != "https" or not parsed.netloc:
+                errors.append(f"{source_id}: invalid HTTPS source URL: {candidate_url}")
+        if not source.get("parser"):
+            errors.append(f"{source_id}: missing parser")
         if source.get("parser") not in {"ukmto_html", "ofac_html", "usgs_geojson", "gdacs_rss", "easa_json"}:
             errors.append(f"{source_id}: invalid parser")
         if source.get("routing_hint") not in VALID_ROUTING_HINTS:

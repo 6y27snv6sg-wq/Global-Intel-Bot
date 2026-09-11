@@ -428,6 +428,7 @@ load_access_state()
 NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
 CALLBACK_ACK_TIMEOUT = 0.20
+TELEGRAM_CONCURRENT_UPDATES = 16
 CALLBACK_DEDUP_TTL = 60
 CALLBACK_ACTION_DEBOUNCE = 5
 GEMINI_TIMEOUT = 35
@@ -3372,7 +3373,10 @@ async def button_handler(update, context):
         return
 
     if data == "home":
-        await safe_query_answer(query, "🏠 مركز الأخبار")
+        track_task(
+            safe_query_answer(query),
+            f"callback-ack-{getattr(query, 'id', '') or user_id}-home",
+        )
         await query.message.reply_text(
             f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n\n"
             "اختر القسم المطلوب. الأخبار المتاحة تظهر أولاً "
@@ -3383,7 +3387,10 @@ async def button_handler(update, context):
         return
 
     if data == "refresh":
-        await safe_query_answer(query, "🔄 بدأ التحديث", show_alert=False)
+        track_task(
+            safe_query_answer(query),
+            f"callback-ack-{getattr(query, 'id', '') or user_id}-refresh",
+        )
 
         cached = get_cached_news_view()
         await query.message.reply_text(
@@ -3426,7 +3433,10 @@ async def button_handler(update, context):
         return
 
     if data == "more":
-        await safe_query_answer(query, "🔎 البحث متاح الآن")
+        track_task(
+            safe_query_answer(query),
+            f"callback-ack-{getattr(query, 'id', '') or user_id}-more",
+        )
         await query.message.reply_text(
             "➕ <b>المزيد</b>\n\n"
             "اكتب مباشرة اسم دولة أو مدينة أو موضوع.\n\n"
@@ -3455,7 +3465,10 @@ async def button_handler(update, context):
             await safe_query_answer(query, "⚠️ صفحة غير صالحة.")
             return
 
-        await safe_query_answer(query, "📄 جاري عرض النتائج...")
+        track_task(
+            safe_query_answer(query),
+            f"callback-ack-{getattr(query, 'id', '') or user_id}-search-{page}",
+        )
         await show_search_page(query, user_id, page)
         return
 
@@ -3464,7 +3477,10 @@ async def button_handler(update, context):
         if key not in TOPICS:
             return
 
-        await safe_query_answer(query, "🧠 جاري تجهيز التحليل...")
+        track_task(
+            safe_query_answer(query),
+            f"callback-ack-{getattr(query, 'id', '') or user_id}-analyze-{key}",
+        )
         status = await query.message.reply_text(
             "🧠 جاري تحليل البيانات..."
         )
@@ -3637,6 +3653,12 @@ def main():
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        # Telegram updates were previously processed serially. A slow search,
+        # analysis, admin action, or transient Bot API call could therefore hold
+        # every button behind it. Keep concurrency bounded so independent users
+        # and cache-only navigation can proceed immediately without overloading
+        # the free Railway container.
+        .concurrent_updates(TELEGRAM_CONCURRENT_UPDATES)
         .post_init(post_init)
         .post_stop(post_stop)
         .build()

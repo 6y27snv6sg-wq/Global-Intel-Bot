@@ -427,7 +427,7 @@ load_access_state()
 
 NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
-CALLBACK_ACK_TIMEOUT = 0.45
+CALLBACK_ACK_TIMEOUT = 0.20
 CALLBACK_DEDUP_TTL = 60
 CALLBACK_ACTION_DEBOUNCE = 5
 GEMINI_TIMEOUT = 35
@@ -905,6 +905,20 @@ def _provider_topic(event, provider):
         "عسكري", "دفاع", "صاروخ", "طائره مسيره", "طائرة مسيرة", "قصف", "غاره",
         "غارة", "هجوم", "اشتباك", "قوات", "سلاح", "امن بحري", "أمن بحري",
     )
+    diplomatic_source_terms = (
+        "foreign ministry", "ministry of foreign affairs", "state department",
+        "mfa", "وزارة الخارجية", "الخارجية", "الرئاسة", "presidency",
+        "government", "الحكومة", "مجلس الوزراء", "الديوان الملكي",
+    )
+    provider_source_text = normalize_text(
+        " ".join(
+            str(event.get(key, "") or "")
+            for key in (
+                "organization", "organization_ar", "source_name",
+                "source_name_ar", "handle", "source_id",
+            )
+        )
+    )
     condemnation_terms = (
         "condemn", "denounce", "statement on", "expresses concern", "calls for",
         "ادان", "إدان", "يدين", "تدين", "تعرب عن قلق", "يدعو الى", "يدعو إلى",
@@ -935,6 +949,11 @@ def _provider_topic(event, provider):
         or (provider == "social_intel" and primary and a_plus)
     ):
         return "urg"
+
+    # Diplomatic/government institutions are authoritative for routing. Their
+    # statements do not become Security merely because the subject mentions war.
+    if any(normalize_text(t) in provider_source_text for t in diplomatic_source_terms):
+        return "forg"
 
     # A diplomatic condemnation/appeal is an official statement even when it
     # mentions an attack, missile, or conflict in the quoted subject matter.
@@ -1298,11 +1317,18 @@ def _rebuild_hot_views():
     broad = NEWS_CACHE.peek("all_news") or []
     previous = HOT_VIEW_CACHE.peek("merged") or []
 
-    # Filter untranslated leftovers before cross-provider preference. This avoids
-    # a high-authority English duplicate replacing a translated Arabic version.
+    urgent_timeline = _recent_publishable_urgent(
+        breaking,
+        limit=MAX_TOPIC_RESULTS,
+    )
+
+    # Breaking-cache items belong exclusively to عاجل. For the remaining desks,
+    # merge only non-breaking providers and remove any event already active in
+    # the one-hour urgent timeline.
     ready = [
-        item for item in (list(direct) + list(breaking) + list(social) + list(broad))
+        item for item in (list(direct) + list(social) + list(broad))
         if _visible_item_ready(item)
+        and not any(same_urgent_event(item, urgent) for urgent in urgent_timeline)
     ]
     candidate = deduplicate_events(ready, limit=HOT_CACHE_LIMIT)
     LAST_HOT_CANDIDATE_COUNT = len(candidate)
@@ -1356,11 +1382,8 @@ def _rebuild_hot_views():
         if key != "urg"
     }
 
-    # "عاجل" remains a dedicated rolling one-hour lane.
-    HOT_TOPIC_VIEWS["urg"] = _recent_publishable_urgent(
-        breaking,
-        limit=MAX_TOPIC_RESULTS,
-    )
+    # "عاجل" remains the exclusive rolling one-hour lane.
+    HOT_TOPIC_VIEWS["urg"] = list(urgent_timeline)
 
     HOT_VIEW_DIRTY = False
     return list(merged)
@@ -1666,16 +1689,13 @@ def _contains_any(text, terms):
 def _resolved_topic(item):
     """Resolve every story to exactly one visible section.
 
-    Priority:
-    provider hard-route -> specialist institution -> explicit specialist event ->
-    official institution -> residual geography. Generic words such as "security",
-    "attack" or "forces" cannot by themselves hijack a story into Security.
+    Institution identity is authoritative. Security requires a defence/military
+    institution or concrete operational evidence; an engine label alone is not
+    sufficient. This prevents diplomacy and generic crime/politics from leaking
+    into Defense & Security.
     """
-    forced = str(getattr(item, "_exclusive_topic", "") or "")
-    if forced in TOPICS:
-        return forced
-
     engine = _engine_topic(item)
+    forced = str(getattr(item, "_exclusive_topic", "") or "")
     title = normalize_text(get_item_title(item))
     source = normalize_text(get_item_source(item))
     region = normalize_text(str(getattr(item, "region", "") or ""))
@@ -1692,11 +1712,11 @@ def _resolved_topic(item):
     )
     official_sources = (
         "وزارة الخارجية", "الخارجية", "foreign ministry",
-        "ministry of foreign affairs", "state department",
+        "ministry of foreign affairs", "state department", "mfa",
         "الرئاسة", "presidency", "الحكومة", "government",
         "الديوان الملكي", "مجلس الوزراء",
         "وكالة الأنباء السعودية", "وكالة الانباء السعودية",
-        "saudi press agency", "spa",
+        "saudi press agency",
     )
     explicit_official_terms = (
         "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
@@ -1719,14 +1739,14 @@ def _resolved_topic(item):
         "funeral", "memorial", "condolence", "ceremony", "official visit",
     )
     strong_security_terms = (
-        "مناورات عسكريه", "مناورات عسكرية", "عمليه عسكريه", "عملية عسكرية",
-        "عمليات عسكريه", "عمليات عسكرية", "دفاع جوي", "قاعده عسكريه",
-        "قاعدة عسكرية", "تسليح", "اسلحه", "أسلحة", "صاروخ باليستي",
-        "طائره مسيره", "طائرة مسيرة", "سفينه حربيه", "سفينة حربية",
-        "اشتباكات مسلحه", "اشتباكات مسلحة", "قوات خاصه", "قوات خاصة",
-        "military exercise", "military operation", "air defense",
-        "military base", "weapons", "ballistic missile", "drone strike",
-        "warship", "armed clashes", "special forces",
+        "مناورات عسكريه", "مناورات عسكرية", "تمرين عسكري", "تدريب عسكري",
+        "عمليه عسكريه", "عملية عسكرية", "عمليات عسكريه", "عمليات عسكرية",
+        "دفاع جوي", "قاعده عسكريه", "قاعدة عسكرية", "تسليح", "اسلحه", "أسلحة",
+        "صاروخ باليستي", "طائره مسيره", "طائرة مسيرة", "سفينه حربيه",
+        "سفينة حربية", "اشتباكات مسلحه", "اشتباكات مسلحة", "قوات خاصه",
+        "قوات خاصة", "military exercise", "military drill", "military operation",
+        "air defense", "military base", "weapons", "ballistic missile",
+        "drone strike", "warship", "armed clashes", "special forces",
     )
 
     source_is_econ = _contains_any(source, econ_sources)
@@ -1736,23 +1756,25 @@ def _resolved_topic(item):
     strong_security = _contains_any(title, strong_security_terms)
     non_operational_defence = _contains_any(title, non_operational_defence_terms)
 
+    # Institution identity wins even over a provider hard-route.
     if source_is_econ:
         return "econ"
+    if source_is_official:
+        if strong_econ and engine == "econ":
+            return "econ"
+        return "forg"
     if source_is_security:
         if non_operational_defence:
             return "forg"
         return "secu"
 
-    # Breaking requires both engine evidence and explicit breaking wording.
-    if engine == "urg" and _contains_any(title, TOPICS["urg"][1]):
-        return "urg"
-
-    # Foreign ministries/presidencies/governments remain Official unless the
-    # substance is unmistakably economic or a concrete military operation.
-    if source_is_official:
-        if strong_econ and engine == "econ":
-            return "econ"
-        return "forg"
+    # Provider hard-routes remain authoritative only after institutional checks.
+    if forced in {"econ", "forg", "secu"}:
+        if forced == "secu" and not strong_security:
+            # A support/provider label is insufficient without concrete evidence.
+            pass
+        else:
+            return forced
 
     if _contains_any(title, explicit_official_terms):
         return "forg"
@@ -1761,18 +1783,21 @@ def _resolved_topic(item):
     if strong_security:
         return "secu"
 
-    # Preserve trusted official registry specialist labels when explicit source
-    # identity above did not resolve them.
+    # Native official-registry items default to Official unless specialist
+    # evidence proves Economy or Security.
     if getattr(item, "official", False):
         if engine == "econ" and strong_econ:
             return "econ"
         if engine == "secu" and strong_security:
             return "secu"
-        if engine in {"forg", "urg"}:
-            return engine
         return "forg"
 
-    # Geographic residual desks receive general international/regional coverage.
+    # Breaking is handled by its dedicated one-hour lane and is deliberately not
+    # routed into any other specialist section here.
+    if forced == "urg":
+        return ""
+
+    # Geographic residual desks receive all general/non-specialist coverage.
     geo_text = f"{title} {region}"
     if (
         engine == "gulf"
@@ -1785,9 +1810,8 @@ def _resolved_topic(item):
     if region and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}:
         return "wrld"
 
-    if engine in {"econ", "forg", "urg", "secu"}:
-        return engine
-    return ""
+    # Do not trust weak engine specialist labels without positive evidence.
+    return "wrld"
 
 
 def topic_filter(items, topic_key, max_results=25):
@@ -3076,11 +3100,13 @@ async def send_topic_update(message, key, previous_results, user_id=None):
 async def show_topic(query, user_id, key, page):
     """Instant topic pagination from a stable cache snapshot.
 
-    Opening a populated section never starts a new collection cycle. Page 2+
-    always uses the same result snapshot created on page 1, so "المزيد" is
-    pure pagination and cannot be delayed or reshuffled by background refreshes.
+    Topic buttons are presentation-only: they never wait for callback ACK and
+    never trigger provider/network collection. The provider monitor owns refresh.
     """
-    await safe_query_answer(query)
+    track_task(
+        safe_query_answer(query),
+        f"topic-ack-{getattr(query, 'id', '') or user_id}-{key}-{page}",
+    )
 
     snapshot_key = f"{user_id}:{key}"
 
@@ -3134,18 +3160,14 @@ async def show_topic(query, user_id, key, page):
             return
 
         # The topic has cached stories, but this user has already seen them.
-        # Do not resend the same event; search for genuine additions in background.
+        # Never launch collection from a button; the provider monitor refreshes it.
         if page == 1 and raw_results:
             await query.message.reply_text(
                 f"<b>{safe_html(TOPICS[key][0])}</b>\n\n"
-                "لا توجد أخبار جديدة منذ آخر عرض.",
+                "لا توجد أخبار جديدة منذ آخر عرض.\n"
+                "📡 الرصد مستمر تلقائياً.",
                 parse_mode="HTML",
             )
-            if key != "urg":
-                track_task(
-                    send_topic_update(query.message, key, raw_results, user_id),
-                    f"topic-refresh-{user_id}-{key}",
-                )
             return
 
         # "عاجل" is continuously maintained by urgent_monitor. A button press
@@ -3159,17 +3181,13 @@ async def show_topic(query, user_id, key, page):
             )
             return
 
-        # Other empty sections may request background discovery.
+        # Empty sections remain cache-only as well. Provider monitor owns refresh.
         if page == 1:
             await query.message.reply_text(
                 f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
-                "◌ لا توجد نتائج جاهزة في الذاكرة الآن.\n"
-                "📡 جاري توسيع التغطية في الخلفية...",
+                "◌ لا توجد نتائج جاهزة لهذا القسم الآن.\n"
+                "📡 الرصد والتحديث مستمران تلقائياً.",
                 parse_mode="HTML",
-            )
-            track_task(
-                send_topic_update(query.message, key, [], user_id),
-                f"topic-refresh-{user_id}-{key}",
             )
         else:
             await query.message.reply_text(

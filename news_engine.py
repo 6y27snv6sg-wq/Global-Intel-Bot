@@ -425,7 +425,7 @@ async def translate_title_to_arabic(session, title: str) -> str:
             _TRANSLATION_ENDPOINT,
             params=params,
             timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": "Al-Arrab-News/1.0"},
         ) as response:
             if response.status != 200:
                 raise RuntimeError(f"translation_http_{response.status}")
@@ -2241,7 +2241,7 @@ async def _read_official_page(session, url, profile, semaphore):
                     return None
                 timeout = aiohttp.ClientTimeout(total=OFFICIAL_INDEX_TIMEOUT, connect=FETCH_CONNECT_TIMEOUT)
                 async with session.get(url, timeout=timeout, allow_redirects=False,
-                                       headers={"User-Agent": "Global-Intel-Bot/2.0"}) as response:
+                                       headers={"User-Agent": "Al-Arrab-News/1.0"}) as response:
                     if response.status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if not location:
@@ -3257,7 +3257,7 @@ async def _fetch_publication_date(session, item, semaphore):
             )
             async with session.get(
                 item.url, timeout=timeout, allow_redirects=True,
-                headers={"User-Agent": "Global-Intel-Bot/2.0"},
+                headers={"User-Agent": "Al-Arrab-News/1.0"},
             ) as response:
                 if response.status != 200:
                     return None
@@ -3419,7 +3419,7 @@ async def fetch_feed(session, source, url):
         async with session.get(
             url,
             timeout=timeout,
-            headers={"User-Agent": "Global-Intel-Bot/2.0"},
+            headers={"User-Agent": "Al-Arrab-News/1.0"},
         ) as response:
             if response.status != 200:
                 log.warning("Feed HTTP %s: %s", response.status, source)

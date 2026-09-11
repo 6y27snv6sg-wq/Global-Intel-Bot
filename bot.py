@@ -1155,29 +1155,11 @@ async def _ensure_arabic_titles(items, *, budget, cap):
     return items
 
 
-async def _run_async_collector_isolated(async_fn, /, *args, **kwargs):
-    """Run one async provider on its own worker-thread event loop.
-
-    Some third-party parsing/translation code inside the news engine is
-    synchronous even though the top-level collector is async. Running the
-    complete collector in a dedicated worker event loop prevents those blocking
-    sections from freezing Telegram's main event loop. The coroutine is created
-    and awaited inside the worker; no coroutine object crosses threads.
-    """
-    def runner():
-        return asyncio.run(async_fn(*args, **kwargs))
-
-    return await asyncio.to_thread(runner)
-
-
 async def _run_news_collection():
     global LAST_NEWS_REFRESH, NEWS_PROVIDER_HEALTH
     try:
         items = await asyncio.wait_for(
-            _run_async_collector_isolated(
-                collect_news,
-                max_items=NEWS_PROVIDER_ITEM_LIMIT,
-            ),
+            collect_news(max_items=NEWS_PROVIDER_ITEM_LIMIT),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
         if get_news_engine_health is not None:

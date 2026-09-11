@@ -15,6 +15,7 @@ Direct Intelligence Radar Sources
 4) تكرار الحدث داخل العائلة المؤسسية يُدمج، ويُفضّل المصدر الأعلى أولوية.
 5) routing_hint إشارة فقط؛ التصنيف النهائي يتم لاحقًا حسب مضمون الحدث.
 6) لا توجد أي عملية polling تلقائية هنا. يستدعي bot.py هذا المزود لاحقًا من مسار خلفي مستقل.
+7) OFAC يُقرأ من صفحة Recent Actions الجامعة فقط لتجنب طلبات مكررة لنفس العائلة المؤسسية.
 """
 
 from __future__ import annotations
@@ -250,44 +251,13 @@ DIRECT_SOURCES: List[Dict] = [
         "dedup_group": "ofac",
         "priority": 100,
         "poll_interval_seconds": 60,
-        "timeout_seconds": 7,
+        "timeout_seconds": 4,
         "default_event_status": STATUS_AUTHORITY_CONFIRMED,
         "attribution_ar": (
             "بحسب مكتب مراقبة الأصول الأجنبية بوزارة الخزانة الأمريكية"
         ),
         "notes": (
             "المصدر الأولي للعقوبات والتعيينات والتحديثات المرتبطة بـOFAC."
-        ),
-    },
-    {
-        "id": "ofac_sanctions_updates",
-        "entity": "United States",
-        "entity_ar": "الولايات المتحدة",
-        "organization": "Office of Foreign Assets Control",
-        "organization_ar": "مكتب مراقبة الأصول الأجنبية - وزارة الخزانة الأمريكية",
-        "source_type": TYPE_SANCTIONS,
-        "grade": GRADE_A_PLUS,
-        "role": ROLE_SPECIALIZED_SENSOR,
-        "active": True,
-        "url": "https://ofac.treasury.gov/recent-actions/sanctions-list-updates",
-        "official_proof": "https://ofac.treasury.gov/",
-        "regions": {"Global"},
-        "topics": {
-            "sanctions", "financial_sanctions", "asset_freeze",
-            "designation", "international_security",
-        },
-        "product_types": {"sanctions_list_update"},
-        "routing_hint": ROUTE_ECONOMY,
-        "dedup_group": "ofac",
-        "priority": 98,
-        "poll_interval_seconds": 45,
-        "timeout_seconds": 7,
-        "default_event_status": STATUS_AUTHORITY_CONFIRMED,
-        "attribution_ar": (
-            "بحسب مكتب مراقبة الأصول الأجنبية بوزارة الخزانة الأمريكية"
-        ),
-        "notes": (
-            "مسار متخصص داخل OFAC. نفس dedup_group لمنع تكرار المادة."
         ),
     },
 ]
@@ -647,7 +617,7 @@ _OFAC_ACTION_PATH = re.compile(
 )
 
 def parse_ofac_html(document: str, *, source_id: str) -> List[Dict]:
-    if source_id not in {"ofac_recent_actions", "ofac_sanctions_updates"}:
+    if source_id != "ofac_recent_actions":
         raise ValueError(f"Unsupported OFAC source: {source_id}")
     if not document:
         return []
@@ -672,14 +642,6 @@ def parse_ofac_html(document: str, *, source_id: str) -> List[Dict]:
         low_path = path.lower()
 
         is_action = bool(_OFAC_ACTION_PATH.search(path))
-        # The specialized page may expose action/detail links outside the
-        # exact recent-actions pattern; keep only OFAC detail-like links.
-        if source_id == "ofac_sanctions_updates" and not is_action:
-            is_action = (
-                "/sanctions-list-updates/" in low_path
-                or "/sanctions/" in low_path
-            )
-
         if not is_action:
             continue
 
@@ -777,7 +739,9 @@ async def _fetch_text(
     timeout_seconds = float(source.get("timeout_seconds", 5))
     timeout = aiohttp.ClientTimeout(
         total=timeout_seconds,
-        connect=min(2.0, timeout_seconds),
+        connect=min(1.5, timeout_seconds),
+        sock_connect=min(1.5, timeout_seconds),
+        sock_read=min(2.5, timeout_seconds),
     )
 
     try:
@@ -795,7 +759,10 @@ async def _fetch_text(
     except Exception as exc:
         _circuit_failure(source_id)
         _set_source_health(source_id, HEALTH_FETCH_FAILED, detail=type(exc).__name__)
-        log.warning("direct source failed: %s: %s", source_id, exc)
+        detail = type(exc).__name__
+        if str(exc):
+            detail = f"{detail}: {exc}"
+        log.warning("direct source failed: %s: %s", source_id, detail)
         return ""
 
 
@@ -806,7 +773,7 @@ def _document_matches_source(source_id: str, document: str) -> bool:
         return False
     if source_id == "ukmto_warnings":
         return "ukmto" in low and any(token in low for token in ("warning", "incident", "maritime"))
-    if source_id in {"ofac_recent_actions", "ofac_sanctions_updates"}:
+    if source_id == "ofac_recent_actions":
         return "ofac" in low and any(token in low for token in ("recent actions", "sanctions", "treasury"))
     return False
 
@@ -821,7 +788,17 @@ async def _collect_one(
         return []
 
     _LAST_ATTEMPT[source_id] = time.monotonic()
-    document = await _fetch_text(session, source)
+    timeout_seconds = float(source.get("timeout_seconds", 5))
+    try:
+        document = await asyncio.wait_for(
+            _fetch_text(session, source),
+            timeout=timeout_seconds + 0.5,
+        )
+    except asyncio.TimeoutError:
+        _circuit_failure(source_id)
+        _set_source_health(source_id, HEALTH_FETCH_FAILED, detail="hard_timeout")
+        log.warning("direct source hard timeout: %s", source_id)
+        return []
     if not document:
         return []
 
@@ -838,7 +815,7 @@ async def _collect_one(
                 source_id=source_id,
                 base_url=source["url"],
             )
-        elif source_id in {"ofac_recent_actions", "ofac_sanctions_updates"}:
+        elif source_id == "ofac_recent_actions":
             events = parse_ofac_html(document, source_id=source_id)
         else:
             raise ValueError(f"Unsupported direct source: {source_id}")

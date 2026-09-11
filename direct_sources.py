@@ -148,8 +148,9 @@ VALID_ROUTING_HINTS = {
 
 MAX_RESPONSE_BYTES = 900_000
 MAX_ITEMS_PER_SOURCE = 20
-DIRECT_COLLECTION_BUDGET_SECONDS = 7.5
-DIRECT_TASK_GRACE_SECONDS = 0.35
+DIRECT_COLLECTION_BUDGET_SECONDS = 4.8
+DIRECT_END_TO_END_BUDGET_SECONDS = 6.0
+DIRECT_TASK_GRACE_SECONDS = 0.10
 CIRCUIT_FAILURES = 3
 CIRCUIT_COOLDOWN_SECONDS = 300
 USER_AGENT = (
@@ -1376,6 +1377,7 @@ async def _collect_sources_with_budget(
     sources: List[Dict],
     *,
     budget_seconds: float,
+    completed_sink: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """Return completed sensor results before the provider hard budget expires."""
     if not sources:
@@ -1404,6 +1406,8 @@ async def _collect_sources_with_budget(
             result = task.result()
             if result:
                 merged.extend(result)
+                if completed_sink is not None:
+                    completed_sink.extend(result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1451,10 +1455,10 @@ async def collect_direct_radar(
     force: bool = False,
 ) -> List[Dict]:
     """
-    Collect all selected direct sensors concurrently.
+    Collect selected direct sensors under a hard end-to-end deadline.
 
-    No exception from one source escapes and blocks the others.
-    If session is supplied, the caller owns it.
+    The internal deadline includes sensor I/O, cancellation and owned-session cleanup,
+    so the provider returns before the orchestrator's outer timeout.
     """
     selected_ids = set(source_ids or [])
     candidates = [
@@ -1472,26 +1476,55 @@ async def collect_direct_radar(
         _log_direct_health_summary()
         return []
 
+    completed: List[Dict] = []
+
     async def run(active_session: aiohttp.ClientSession) -> List[Dict]:
         merged = await _collect_sources_with_budget(
             active_session,
             sources,
             budget_seconds=DIRECT_COLLECTION_BUDGET_SECONDS,
+            completed_sink=completed,
         )
-        output = deduplicate_radar_events(merged)
-        _log_direct_health_summary()
-        return output
+        return deduplicate_radar_events(merged)
 
-    if session is not None:
-        return await run(session)
+    async def run_owned() -> List[Dict]:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json,application/geo+json,application/xml,text/xml,text/html;q=0.8,*/*;q=0.5",
+        }
+        connector = aiohttp.TCPConnector(
+            limit=max(4, len(sources) * 2),
+            enable_cleanup_closed=True,
+        )
+        owned = aiohttp.ClientSession(headers=headers, connector=connector)
+        try:
+            return await run(owned)
+        finally:
+            # Session cleanup is inside the same hard provider deadline.
+            await owned.close()
 
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json,application/geo+json,application/xml,text/xml,text/html;q=0.8,*/*;q=0.5",
-    }
-    connector = aiohttp.TCPConnector(limit=max(4, len(sources) * 2))
-    async with aiohttp.ClientSession(headers=headers, connector=connector) as owned:
-        return await run(owned)
+    try:
+        async with asyncio.timeout(DIRECT_END_TO_END_BUDGET_SECONDS):
+            output = await (run(session) if session is not None else run_owned())
+    except asyncio.TimeoutError:
+        for source in sources:
+            source_id = source["id"]
+            current = str(_SOURCE_HEALTH.get(source_id, {}).get("status") or HEALTH_UNKNOWN)
+            if current in {HEALTH_UNKNOWN, HEALTH_OK, HEALTH_EMPTY}:
+                _circuit_failure(source_id)
+                _set_source_health(
+                    source_id,
+                    HEALTH_FETCH_FAILED,
+                    detail="end_to_end_budget_exhausted",
+                )
+        output = deduplicate_radar_events(completed)
+        log.warning(
+            "Direct radar hard deadline reached; returning partial results items=%d",
+            len(output),
+        )
+
+    _log_direct_health_summary()
+    return output
 
 
 # =========================================================

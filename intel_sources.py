@@ -14,7 +14,7 @@ Verified International Intelligence Sources
 6) فشل منصة أو مصدر لا يوقف بقية المزودات.
 7) لا توجد عملية polling تلقائية هنا؛ bot.py يستدعي collector لاحقًا من مسار خلفي.
 8) Telegram يُقرأ من صفحة القناة العامة فقط.
-9) X يُقرأ فقط عبر X API الرسمي عند وجود X_BEARER_TOKEN؛ لا scraping هش.
+9) X API الرسمي هو المسار الأول عند وجود X_BEARER_TOKEN؛ وعند غيابه يُستخدم اكتشاف بحث عام محدود للحسابات الموثقة فقط، بلا scraping مباشر لـX.
 """
 
 from __future__ import annotations
@@ -27,10 +27,12 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+import xml.etree.ElementTree as ET
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
@@ -88,12 +90,27 @@ CIRCUIT_FAILURES = 3
 CIRCUIT_COOLDOWN_SECONDS = 300
 X_USER_ID_CACHE_TTL = 6 * 3600
 X_API_BASE = "https://api.x.com/2"
+
+# Free/no-token fallback. It does not scrape X itself: it asks a public search
+# endpoint for already-indexed x.com status URLs, then accepts only exact handles
+# that already exist in VERIFIED_SOCIAL_SOURCES.
+X_SEARCH_RSS_URL = "https://www.bing.com/search"
+X_SEARCH_REFRESH_SECONDS = 300
+X_SEARCH_MAX_AGE_HOURS = 48
+X_SEARCH_BATCH_SIZE = 4
+X_SEARCH_MAX_RESULTS_PER_BATCH = 30
+X_SEARCH_TIMEOUT_SECONDS = 5
+X_SEARCH_CACHE_TTL_SECONDS = 3 * 3600
+X_SEARCH_CIRCUIT_ID = "__x_search_engine__"
+
 USER_AGENT = "Global-Intel-Bot/1.0 (official-social-source monitor)"
 DEFAULT_INCLUDE_SUPPORT = False
 
 _CIRCUIT_STATE: Dict[str, Dict[str, float]] = {}
 _X_USER_ID_CACHE: Dict[str, Tuple[str, float]] = {}
 _SOURCE_HEALTH: Dict[str, Dict[str, Any]] = {}
+_X_SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
+_X_SEARCH_LAST_RUN = 0.0
 
 
 def _src(
@@ -523,7 +540,15 @@ def reset_circuit_breakers():
     _CIRCUIT_STATE.clear()
 
 
-def _record_health(source_id: str, status: str, *, detail: str = "", items: Optional[int] = None) -> None:
+def _record_health(
+    source_id: str,
+    status: str,
+    *,
+    detail: str = "",
+    items: Optional[int] = None,
+    transport: str = "",
+    x_api_status: str = "",
+) -> None:
     state = _SOURCE_HEALTH.setdefault(source_id, {})
     state["status"] = status
     state["updated_monotonic"] = time.monotonic()
@@ -533,6 +558,10 @@ def _record_health(source_id: str, status: str, *, detail: str = "", items: Opti
         state.pop("detail", None)
     if items is not None:
         state["items"] = max(0, int(items))
+    if transport:
+        state["transport"] = transport
+    if x_api_status:
+        state["x_api_status"] = x_api_status
 
 
 def source_health() -> Dict[str, Dict[str, Any]]:
@@ -610,7 +639,7 @@ async def _collect_telegram_source(session, source, *, include_forwarded):
             document, source_id=source_id, include_forwarded=include_forwarded
         )
         _circuit_success(source_id)
-        _record_health(source_id, "ok" if events else "empty", items=len(events))
+        _record_health(source_id, "ok" if events else "empty", items=len(events), transport="telegram_public_page")
         return events
     except Exception as exc:
         _circuit_failure(source_id)
@@ -653,7 +682,7 @@ async def _resolve_x_user_id(session, source, bearer):
 async def _collect_x_source(session, source, *, bearer):
     source_id = source["id"]
     if not bearer:
-        _record_health(source_id, "disabled", detail="X_BEARER_TOKEN missing")
+        _record_health(source_id, "disabled", detail="X_BEARER_TOKEN missing", transport="x_api", x_api_status="disabled")
         return []
     user_id = await _resolve_x_user_id(session, source, bearer)
     if not user_id:
@@ -677,13 +706,278 @@ async def _collect_x_source(session, source, *, bearer):
     try:
         events = parse_x_posts_payload(payload, source_id=source_id)
         _circuit_success(source_id)
-        _record_health(source_id, "ok" if events else "empty", items=len(events))
+        _record_health(source_id, "ok" if events else "empty", items=len(events), transport="x_api_v2", x_api_status="enabled")
         return events
     except Exception as exc:
         _circuit_failure(source_id)
         _record_health(source_id, "parse_failed", detail=str(exc))
         log.warning("x parser failed: %s: %s", source_id, exc)
         return []
+
+
+
+_X_STATUS_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]{1,15})/status/(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _rss_text(value: str) -> str:
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"<[^>]+>", " ", value)
+    return _clean_text(value)
+
+
+def _extract_exact_x_status_url(raw: str, allowed_handles: Dict[str, Dict]) -> Tuple[str, str, str]:
+    """Return (source_id, canonical_url, post_id) only for a verified exact handle."""
+    raw = html.unescape(str(raw or "")).strip()
+    candidates = [raw]
+
+    try:
+        parsed = urlparse(raw)
+        if parsed.netloc.lower().endswith("bing.com"):
+            query = parse_qs(parsed.query)
+            for key in ("url", "u", "r"):
+                for value in query.get(key, []):
+                    if value:
+                        candidates.append(unquote(value))
+    except Exception:
+        pass
+
+    candidates.extend(match.group(0) for match in _X_STATUS_URL_RE.finditer(raw))
+
+    for candidate in candidates:
+        match = _X_STATUS_URL_RE.search(candidate)
+        if not match:
+            continue
+        handle, post_id = match.group(1), match.group(2)
+        source = allowed_handles.get(normalize_handle(handle))
+        if not source:
+            continue
+        return (
+            source["id"],
+            f'https://x.com/{source["handle"]}/status/{post_id}',
+            post_id,
+        )
+    return "", "", ""
+
+
+def _safe_rss_datetime(value: str) -> Optional[datetime]:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return _safe_iso_datetime(value)
+
+
+def parse_x_search_rss(document: str, *, sources: Iterable[Dict]) -> Dict[str, List[Dict]]:
+    """Parse search RSS and accept only direct status URLs from verified X handles."""
+    allowed = {
+        normalize_handle(source["handle"]): source
+        for source in sources
+        if source.get("platform") == PLATFORM_X
+    }
+    output: Dict[str, List[Dict]] = {source["id"]: [] for source in allowed.values()}
+    if not document or not allowed:
+        return output
+
+    try:
+        root = ET.fromstring(document)
+    except ET.ParseError:
+        raise ValueError("search RSS is not valid XML")
+
+    now = datetime.now(timezone.utc)
+    oldest = now - timedelta(hours=X_SEARCH_MAX_AGE_HOURS)
+    seen: Set[Tuple[str, str]] = set()
+
+    for item in root.findall(".//item"):
+        title = _rss_text(item.findtext("title") or "")
+        description = _rss_text(item.findtext("description") or "")
+        link = _clean_text(item.findtext("link") or "")
+        guid = _clean_text(item.findtext("guid") or "")
+        raw_blob = " ".join([link, guid, item.findtext("description") or "", item.findtext("title") or ""])
+
+        source_id, canonical_url, post_id = _extract_exact_x_status_url(raw_blob, allowed)
+        if not source_id or not canonical_url or not post_id:
+            continue
+
+        published = _safe_rss_datetime(item.findtext("pubDate") or "")
+        if published is None or published < oldest or published > now + timedelta(minutes=15):
+            continue
+
+        key = (source_id, post_id)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        text_value = description if len(description) > len(title) else title
+        if not text_value:
+            continue
+
+        output[source_id].append(
+            build_social_event(
+                source_id=source_id,
+                text=text_value,
+                url=canonical_url,
+                published=published,
+                external_id=post_id,
+                metadata={
+                    "ingest": "x_search_discovery",
+                    "discovery_engine": "bing_rss",
+                    "x_api": "disabled",
+                },
+            )
+        )
+
+    for source_id in output:
+        output[source_id] = sorted(
+            output[source_id],
+            key=lambda event: event.get("published") or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )[:MAX_POSTS_PER_SOURCE]
+    return output
+
+
+def _x_search_cache_events(source_id: str, *, now: Optional[float] = None) -> List[Dict]:
+    entry = _X_SEARCH_CACHE.get(source_id)
+    if not entry:
+        return []
+    now = time.monotonic() if now is None else now
+    updated = float(entry.get("updated_monotonic") or 0.0)
+    if updated <= 0 or (now - updated) > X_SEARCH_CACHE_TTL_SECONDS:
+        _X_SEARCH_CACHE.pop(source_id, None)
+        return []
+    return [dict(event) for event in (entry.get("events") or [])]
+
+
+def _x_search_query(batch: List[Dict]) -> str:
+    clauses = [f'site:x.com/{source["handle"]}/status' for source in batch]
+    return " OR ".join(clauses)
+
+
+async def _fetch_x_search_rss(session: aiohttp.ClientSession, query: str) -> str:
+    if _circuit_is_open(X_SEARCH_CIRCUIT_ID):
+        return ""
+
+    timeout = aiohttp.ClientTimeout(total=X_SEARCH_TIMEOUT_SECONDS, connect=2)
+    params = {
+        "q": query,
+        "format": "rss",
+        "count": str(X_SEARCH_MAX_RESULTS_PER_BATCH),
+        "setlang": "en-us",
+    }
+    try:
+        async with session.get(
+            X_SEARCH_RSS_URL,
+            params=params,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.5"},
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
+            document = await _read_bounded(response)
+        _circuit_success(X_SEARCH_CIRCUIT_ID)
+        return document
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _circuit_failure(X_SEARCH_CIRCUIT_ID)
+        log.warning("X search discovery failed: %s", exc)
+        return ""
+
+
+async def _collect_x_via_search(session: aiohttp.ClientSession, sources: List[Dict]) -> List[Dict]:
+    """Free best-effort X discovery; cached and batched to avoid hammering search."""
+    global _X_SEARCH_LAST_RUN
+
+    if not sources:
+        return []
+
+    now = time.monotonic()
+    due = not _X_SEARCH_LAST_RUN or (now - _X_SEARCH_LAST_RUN) >= X_SEARCH_REFRESH_SECONDS
+    if not due:
+        merged = []
+        for source in sources:
+            cached = _x_search_cache_events(source["id"], now=now)
+            merged.extend(cached)
+            _record_health(
+                source["id"],
+                "ok" if cached else "empty",
+                detail="cached search discovery",
+                items=len(cached),
+                transport="x_search_discovery",
+                x_api_status="disabled",
+            )
+        return merged
+
+    _X_SEARCH_LAST_RUN = now
+    batches = [
+        sources[index:index + X_SEARCH_BATCH_SIZE]
+        for index in range(0, len(sources), X_SEARCH_BATCH_SIZE)
+    ]
+
+    tasks = [
+        asyncio.create_task(_fetch_x_search_rss(session, _x_search_query(batch)))
+        for batch in batches
+    ]
+    documents = await asyncio.gather(*tasks, return_exceptions=True)
+
+    refreshed: Set[str] = set()
+    merged: List[Dict] = []
+
+    for batch, document in zip(batches, documents):
+        if isinstance(document, BaseException):
+            if isinstance(document, asyncio.CancelledError):
+                raise document
+            document = ""
+
+        if document:
+            try:
+                parsed = parse_x_search_rss(document, sources=batch)
+            except Exception as exc:
+                log.warning("X search RSS parser failed: %s", exc)
+                parsed = {}
+                document = ""
+
+        if not document:
+            for source in batch:
+                cached = _x_search_cache_events(source["id"], now=now)
+                merged.extend(cached)
+                _record_health(
+                    source["id"],
+                    "fetch_failed",
+                    detail="search discovery unavailable; using cache" if cached else "search discovery unavailable",
+                    items=len(cached),
+                    transport="x_search_discovery",
+                    x_api_status="disabled",
+                )
+            continue
+
+        for source in batch:
+            source_id = source["id"]
+            events = list((parsed or {}).get(source_id) or [])
+            _X_SEARCH_CACHE[source_id] = {
+                "updated_monotonic": now,
+                "events": [dict(event) for event in events],
+            }
+            refreshed.add(source_id)
+            merged.extend(events)
+            _record_health(
+                source_id,
+                "ok" if events else "empty",
+                detail="X API disabled; search discovery active",
+                items=len(events),
+                transport="x_search_discovery",
+                x_api_status="disabled",
+            )
+
+    return merged
 
 
 def _event_identity(event: Dict) -> Tuple[str, str]:
@@ -737,28 +1031,45 @@ async def collect_social_intel(
 
     bearer = _x_bearer_token()
 
-    # X is an optional enrichment layer. When it is unavailable, include verified
-    # Telegram support mirrors so the social provider does not collapse to a
-    # single active channel. Cross-language mirrors are still deduplicated later.
+    # Without an X token, retain the verified X registry and discover only exact
+    # x.com status URLs through the bounded search fallback. Telegram support
+    # mirrors are added as an independent free lane, then all events are deduped.
     if not bearer and not include_support:
-        sources = [
+        primary_x = [
+            source for source in sources
+            if source["platform"] == PLATFORM_X
+        ]
+        telegram_sources = [
             source for source in get_active_sources(include_support=True)
             if (not requested or source["id"] in requested)
             and source["platform"] == PLATFORM_TELEGRAM
         ]
+        sources = [*primary_x, *telegram_sources]
 
     async def run(active_session):
         tasks, task_sources = [], []
+        x_search_sources: List[Dict] = []
+
         for source in sources:
             if source["platform"] == PLATFORM_TELEGRAM:
-                tasks.append(_collect_telegram_source(active_session, source, include_forwarded=include_forwarded_telegram))
+                tasks.append(
+                    _collect_telegram_source(
+                        active_session,
+                        source,
+                        include_forwarded=include_forwarded_telegram,
+                    )
+                )
                 task_sources.append(source)
             elif source["platform"] == PLATFORM_X:
                 if bearer:
                     tasks.append(_collect_x_source(active_session, source, bearer=bearer))
                     task_sources.append(source)
                 else:
-                    _record_health(source["id"], "disabled", detail="X_BEARER_TOKEN missing")
+                    x_search_sources.append(source)
+
+        if x_search_sources:
+            tasks.append(_collect_x_via_search(active_session, x_search_sources))
+            task_sources.append({"id": "x_search_discovery"})
 
         if not tasks:
             return []
@@ -778,7 +1089,7 @@ async def collect_social_intel(
         return await run(session)
 
     async with aiohttp.ClientSession(
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/json"},
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/json,application/rss+xml"},
         connector=aiohttp.TCPConnector(limit=12),
     ) as owned:
         return await run(owned)

@@ -40,17 +40,19 @@ from news_engine import (
 )
 
 try:
-    from intel_sources import collect_social_intel
+    from intel_sources import collect_social_intel, source_health as get_social_source_health
 except Exception:
     collect_social_intel = None
+    get_social_source_health = None
     logging.getLogger("pro_news_bot").exception(
         "intel_sources import failed; social provider disabled."
     )
 
 try:
-    from direct_sources import collect_direct_radar
+    from direct_sources import collect_direct_radar, get_direct_source_health
 except Exception:
     collect_direct_radar = None
+    get_direct_source_health = None
     logging.getLogger("pro_news_bot").exception(
         "direct_sources import failed; direct radar disabled."
     )
@@ -424,10 +426,10 @@ HOT_CACHE_LIMIT = 260
 SOCIAL_CACHE_TTL = 180
 DIRECT_CACHE_TTL = 90
 SOCIAL_REFRESH_INTERVAL = 180
-DIRECT_REFRESH_INTERVAL = 180
+DIRECT_REFRESH_INTERVAL = 30
 PROVIDER_LOOP_INTERVAL = 30
 SOCIAL_PROVIDER_TIMEOUT = 12
-DIRECT_PROVIDER_TIMEOUT = 9
+DIRECT_PROVIDER_TIMEOUT = 10
 PROVIDER_TRANSLATION_BUDGET = 5.0
 
 URGENT_MONITOR_INTERVAL = 30
@@ -506,6 +508,8 @@ PROVIDER_MONITOR_TASK = None
 PROVIDER_MONITOR_STARTED = False
 LAST_SOCIAL_REFRESH = 0.0
 LAST_DIRECT_REFRESH = 0.0
+SOCIAL_PROVIDER_HEALTH = {}
+DIRECT_PROVIDER_HEALTH = {}
 LAST_NEWS_REFRESH = 0.0
 SEEN_CALLBACK_IDS: Dict[str, float] = {}
 RECENT_CALLBACK_ACTIONS: Dict[str, float] = {}
@@ -1043,11 +1047,13 @@ async def collect_and_cache_news():
 
 
 async def _refresh_social_provider():
-    global LAST_SOCIAL_REFRESH
+    global LAST_SOCIAL_REFRESH, SOCIAL_PROVIDER_HEALTH
     if collect_social_intel is None:
         return SOCIAL_CACHE.peek("social_news") or []
     try:
         events = await asyncio.wait_for(collect_social_intel(), timeout=SOCIAL_PROVIDER_TIMEOUT)
+        if get_social_source_health is not None:
+            SOCIAL_PROVIDER_HEALTH = get_social_source_health()
         items = await _adapt_provider_events(events, "social_intel")
         if items:
             SOCIAL_CACHE.set("social_news", deduplicate_events(items, limit=80))
@@ -1062,12 +1068,17 @@ async def _refresh_social_provider():
     return SOCIAL_CACHE.peek("social_news") or []
 
 
-async def _refresh_direct_provider():
-    global LAST_DIRECT_REFRESH
+async def _refresh_direct_provider(force=False):
+    global LAST_DIRECT_REFRESH, DIRECT_PROVIDER_HEALTH
     if collect_direct_radar is None:
         return DIRECT_CACHE.peek("direct_news") or []
     try:
-        events = await asyncio.wait_for(collect_direct_radar(), timeout=DIRECT_PROVIDER_TIMEOUT)
+        events = await asyncio.wait_for(
+            collect_direct_radar(force=force),
+            timeout=DIRECT_PROVIDER_TIMEOUT,
+        )
+        if get_direct_source_health is not None:
+            DIRECT_PROVIDER_HEALTH = get_direct_source_health()
         items = await _adapt_provider_events(events, "direct_radar")
         if items:
             DIRECT_CACHE.set("direct_news", deduplicate_events(items, limit=80))
@@ -1139,7 +1150,7 @@ async def _run_all_source_refresh(force=False):
     if force or _provider_due(LAST_SOCIAL_REFRESH, SOCIAL_REFRESH_INTERVAL):
         jobs.append(_refresh_social_provider())
     if force or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL):
-        jobs.append(_refresh_direct_provider())
+        jobs.append(_refresh_direct_provider(force=force))
     if jobs:
         results = await asyncio.gather(*jobs, return_exceptions=True)
         for result in results:

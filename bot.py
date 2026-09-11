@@ -465,6 +465,8 @@ NEWS_TRANSLATION_BUDGET = 4.0
 NEWS_TRANSLATION_CAP = 120
 BREAKING_TRANSLATION_BUDGET = 2.0
 BREAKING_TRANSLATION_CAP = 40
+HOT_SNAPSHOT_MIN_RETAIN_RATIO = 0.70
+HOT_SNAPSHOT_MIN_ABSOLUTE = 25
 USER_STATE_TTL = 24 * 3600
 USER_STATE_PRUNE_INTERVAL = 300
 MAX_RUNTIME_USERS = 1500
@@ -538,6 +540,9 @@ LAST_USER_STATE_PRUNE = 0.0
 HOT_TOPIC_VIEWS: Dict[str, List[Any]] = {}
 HOT_VIEW_DIRTY = True
 PRESENTATION_REBUILD_TASK = None
+LAST_HOT_CANDIDATE_COUNT = 0
+LAST_HOT_PUBLISHED_COUNT = 0
+LAST_HOT_SNAPSHOT_GUARDED = False
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
 SENT_URGENT_KEYS = deque(maxlen=MAX_SENT_URGENT_KEYS)
@@ -1278,13 +1283,20 @@ def _invalidate_hot_view():
 
 
 def _rebuild_hot_views():
-    """Build merged + six section indexes once on a background refresh path."""
+    """Publish one stable merged snapshot and precompute all visible sections.
+
+    A transient provider failure is allowed to add fresh items, but it is never
+    allowed to replace a large working snapshot with a tiny partial one.
+    """
     global HOT_TOPIC_VIEWS, HOT_VIEW_DIRTY
+    global LAST_HOT_CANDIDATE_COUNT, LAST_HOT_PUBLISHED_COUNT
+    global LAST_HOT_SNAPSHOT_GUARDED
 
     breaking = BREAKING_CACHE.peek("breaking_news") or []
     direct = DIRECT_CACHE.peek("direct_news") or []
     social = SOCIAL_CACHE.peek("social_news") or []
     broad = NEWS_CACHE.peek("all_news") or []
+    previous = HOT_VIEW_CACHE.peek("merged") or []
 
     # Filter untranslated leftovers before cross-provider preference. This avoids
     # a high-authority English duplicate replacing a translated Arabic version.
@@ -1292,8 +1304,49 @@ def _rebuild_hot_views():
         item for item in (list(direct) + list(breaking) + list(social) + list(broad))
         if _visible_item_ready(item)
     ]
-    merged = deduplicate_events(ready, limit=HOT_CACHE_LIMIT)
+    candidate = deduplicate_events(ready, limit=HOT_CACHE_LIMIT)
+    LAST_HOT_CANDIDATE_COUNT = len(candidate)
+
+    news_state = _sensor_network_state(NEWS_PROVIDER_HEALTH)
+    previous_count = len(previous)
+    retain_floor = max(
+        HOT_SNAPSHOT_MIN_ABSOLUTE,
+        int(previous_count * HOT_SNAPSHOT_MIN_RETAIN_RATIO),
+    ) if previous_count else 0
+
+    # Guard against catastrophic shrinkage. During degraded/unavailable news
+    # collection, or whenever the candidate falls below 70% of a working view,
+    # merge fresh candidates into the previous snapshot rather than replacing it.
+    guarded = bool(
+        previous
+        and (
+            len(candidate) < retain_floor
+            or (
+                news_state in {"degraded", "unavailable"}
+                and len(candidate) < previous_count
+            )
+        )
+    )
+
+    if guarded:
+        merged = deduplicate_events(
+            list(candidate) + list(previous),
+            limit=HOT_CACHE_LIMIT,
+        )
+        log.warning(
+            "Hot snapshot guard retained last-known-good view previous=%d "
+            "candidate=%d published=%d news=%s",
+            previous_count,
+            len(candidate),
+            len(merged),
+            news_state,
+        )
+    else:
+        merged = list(candidate)
+
     HOT_VIEW_CACHE.set("merged", list(merged))
+    LAST_HOT_PUBLISHED_COUNT = len(merged)
+    LAST_HOT_SNAPSHOT_GUARDED = guarded
 
     # Precompute routing, ranking and deduplication once. Button handlers are then
     # O(page_size), not O(cache_size^2).
@@ -1303,10 +1356,7 @@ def _rebuild_hot_views():
         if key != "urg"
     }
 
-    # "عاجل" is a dedicated lane, not a generic classification bucket. If we
-    # force breaking-feed items through the normal router, an otherwise valid
-    # alert can disappear into World/Security because of its wording. Build the
-    # urgent button directly from the verified breaking overlay instead.
+    # "عاجل" remains a dedicated rolling one-hour lane.
     HOT_TOPIC_VIEWS["urg"] = _recent_publishable_urgent(
         breaking,
         limit=MAX_TOPIC_RESULTS,
@@ -1411,6 +1461,8 @@ def get_network_health():
         "direct_radar": _sensor_network_state(DIRECT_PROVIDER_HEALTH),
         "hot_cache_items": len(merged),
         "target_items": NETWORK_TARGET_ITEMS,
+        "candidate_items": LAST_HOT_CANDIDATE_COUNT,
+        "snapshot_guarded": LAST_HOT_SNAPSHOT_GUARDED,
     }
 
 
@@ -1447,9 +1499,12 @@ async def _run_all_source_refresh(force=False):
 
         health = get_network_health()
         log.info(
-            "Network orchestrator hot=%d/%d news=%s social=%s direct=%s",
+            "Network orchestrator hot=%d/%d candidate=%d guarded=%s "
+            "news=%s social=%s direct=%s",
             health["hot_cache_items"],
             health["target_items"],
+            health["candidate_items"],
+            health["snapshot_guarded"],
             health["news_engine"],
             health["social_intel"],
             health["direct_radar"],
@@ -3327,6 +3382,7 @@ async def button_handler(update, context):
             if not _runtime_access_allowed(user_id):
                 return
             after = len(fresh)
+            guarded = bool(LAST_HOT_SNAPSHOT_GUARDED)
             try:
                 await query.message.reply_text(
                     f"✅ <b>اكتملت جولة التحديث</b>\n\n"
@@ -3334,6 +3390,10 @@ async def button_handler(update, context):
                     + (
                         f"\n+{max(0, after - before)} إضافة جديدة"
                         if after > before else ""
+                    )
+                    + (
+                        "\n🛡 تم الاحتفاظ بآخر تغطية سليمة لأن الجولة الجديدة كانت ناقصة."
+                        if guarded else ""
                     ),
                     parse_mode="HTML",
                     reply_markup=main_keyboard(user_id),

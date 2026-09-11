@@ -67,6 +67,17 @@ BREAKING_FEED_CONCURRENCY = 12
 _FEED_FAILURE_STATE = {}
 _OFFICIAL_PROFILE_ROUND = 0
 _OFFICIAL_RESULT_CACHE = {}
+_NEWS_ENGINE_HEALTH = {
+    "state": "initializing",
+    "updated_at": 0.0,
+    "registry_items": 0,
+    "general_items": 0,
+    "returned_items": 0,
+    "official_cache_sources": 0,
+    "official_cache_members": 0,
+    "official_cache_g20_members": 0,
+    "feed_circuits_open": 0,
+}
 # feedparser is pure-Python and can monopolize the GIL when many feeds parse at once.
 # Keep RSS parsing on a small dedicated pool so background collectors cannot starve
 # Telegram callbacks or the main asyncio loop.
@@ -99,7 +110,6 @@ ADDITIONAL_TRUSTED_FEEDS = {
     # These feeds are official publisher feeds; Telegram keeps only the
     # translated headline and links to the original article.
     "CNA": "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
-    "Euronews": "https://feeds.euronews.com/rss/en/home",
     "Africanews": "https://www.africanews.com/feed/rss",
 }
 
@@ -2666,6 +2676,9 @@ async def collect_official_publisher_news():
         "Official rolling cache sources=%d members=%d g20_members=%d/%d accepted=%d",
         len(cached_source_ids), len(cached_members), len(cached_g20), len(G20_MEMBERS), len(result),
     )
+    _NEWS_ENGINE_HEALTH["official_cache_sources"] = len(cached_source_ids)
+    _NEWS_ENGINE_HEALTH["official_cache_members"] = len(cached_members)
+    _NEWS_ENGINE_HEALTH["official_cache_g20_members"] = len(cached_g20)
     return result
 
 
@@ -3239,6 +3252,18 @@ def parse_entry(entry, source, category="general"):
         domain=publisher_domain,
     )
     return classify_item(item)
+
+def get_news_engine_health():
+    """Return a read-only provider health snapshot for bot.py orchestration."""
+    snapshot = dict(_NEWS_ENGINE_HEALTH)
+    now = time.monotonic()
+    open_circuits = 0
+    for _source, (_failures, blocked_until) in _FEED_FAILURE_STATE.items():
+        if blocked_until and now < blocked_until:
+            open_circuits += 1
+    snapshot["feed_circuits_open"] = open_circuits
+    return snapshot
+
 
 def _feed_circuit_open(source):
     state = _FEED_FAILURE_STATE.get(source)
@@ -4099,6 +4124,16 @@ async def collect_news(max_items=150):
         len(registry_lane), len(general_lane), len(result),
         sum(not getattr(item, "official_source_id", "") for item in result),
     )
+    _NEWS_ENGINE_HEALTH["updated_at"] = time.time()
+    _NEWS_ENGINE_HEALTH["registry_items"] = len(registry_lane)
+    _NEWS_ENGINE_HEALTH["general_items"] = len(general_lane)
+    _NEWS_ENGINE_HEALTH["returned_items"] = len(result)
+    if result and registry_lane and general_lane:
+        _NEWS_ENGINE_HEALTH["state"] = "ok"
+    elif result:
+        _NEWS_ENGINE_HEALTH["state"] = "degraded"
+    else:
+        _NEWS_ENGINE_HEALTH["state"] = "unavailable"
     return result[:limit]
 
 

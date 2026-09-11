@@ -1202,28 +1202,106 @@ async def get_fresh_news(force_refresh=False):
 
 
 def _balance_topic_sources(items, limit):
-    """Keep ranked recency/quality while preventing one provider/source from owning page 1."""
-    items = list(items or [])
-    if len(items) <= PER_PAGE:
-        return items[:limit]
+    """Re-rank every five-item page without dropping any valid story.
 
-    first_page = []
-    deferred = []
-    counts = {}
-    # Two stories from the same source are enough on the first five-item page.
-    for item in items:
-        source_key = normalize_text(get_item_source(item)) or _provider_domain(get_item_url(item)) or "unknown"
-        if len(first_page) < PER_PAGE and counts.get(source_key, 0) < 2:
-            first_page.append(item)
+    At most two items from the same source are placed on a page when enough
+    source diversity exists. If diversity is insufficient, the remaining best
+    ranked items fill the page. The full result set is preserved.
+    """
+    remaining = list(items or [])[:limit]
+    balanced = []
+
+    while remaining and len(balanced) < limit:
+        selected = []
+        selected_indices = set()
+        counts = {}
+
+        for idx, item in enumerate(remaining):
+            source_key = (
+                normalize_text(get_item_source(item))
+                or _provider_domain(get_item_url(item))
+                or "unknown"
+            )
+            if counts.get(source_key, 0) >= 2:
+                continue
+            selected.append(item)
+            selected_indices.add(idx)
             counts[source_key] = counts.get(source_key, 0) + 1
-        else:
-            deferred.append(item)
+            if len(selected) >= PER_PAGE:
+                break
 
-    if len(first_page) < PER_PAGE:
-        need = PER_PAGE - len(first_page)
-        first_page.extend(deferred[:need])
-        deferred = deferred[need:]
-    return (first_page + deferred)[:limit]
+        if len(selected) < PER_PAGE:
+            for idx, item in enumerate(remaining):
+                if idx in selected_indices:
+                    continue
+                selected.append(item)
+                selected_indices.add(idx)
+                if len(selected) >= PER_PAGE:
+                    break
+
+        balanced.extend(selected)
+        remaining = [
+            item for idx, item in enumerate(remaining)
+            if idx not in selected_indices
+        ]
+
+    return balanced[:limit]
+
+
+MIDDLE_EAST_GEO_TERMS = {
+    "السعودية", "الإمارات", "الامارات", "قطر", "الكويت", "البحرين",
+    "عمان", "سلطنة عمان", "العراق", "إيران", "ايران", "اليمن", "سوريا",
+    "لبنان", "الأردن", "الاردن", "فلسطين", "إسرائيل", "اسرائيل",
+    "مصر", "تركيا", "الخليج", "الشرق الأوسط", "الشرق الاوسط",
+}
+
+WORLD_GEO_TERMS = {
+    "الولايات المتحدة", "أمريكا", "امريكا", "كندا", "المكسيك",
+    "أوروبا", "اوروبا", "بريطانيا", "المملكة المتحدة", "فرنسا", "ألمانيا",
+    "المانيا", "إيطاليا", "ايطاليا", "إسبانيا", "اسبانيا", "أوكرانيا",
+    "اوكرانيا", "روسيا", "بولندا", "السويد", "النرويج", "فنلندا",
+    "الصين", "اليابان", "الهند", "كوريا", "إندونيسيا", "اندونيسيا",
+    "ماليزيا", "سنغافورة", "تايلاند", "فيتنام", "الفلبين", "باكستان",
+    "أفغانستان", "افغانستان", "تايوان", "أستراليا", "استراليا",
+    "نيوزيلندا", "أفريقيا", "افريقيا", "جنوب أفريقيا", "جنوب افريقيا",
+    "نيجيريا", "كينيا", "إثيوبيا", "اثيوبيا", "المغرب", "الجزائر",
+    "تونس", "ليبيا", "السودان", "البرازيل", "الأرجنتين", "الارجنتين",
+    "تشيلي", "كولومبيا", "بيرو", "فنزويلا", "الاتحاد الأوروبي",
+    "الاتحاد الاوروبي", "الأمم المتحدة", "الامم المتحدة", "الناتو",
+}
+
+
+def _geographic_topic_match(item, topic_key):
+    """Evaluate World/Middle-East as geographic browsing lenses."""
+    region = normalize_text(str(getattr(item, "region", "") or ""))
+    text = normalize_text(
+        " ".join(
+            [
+                get_item_title(item),
+                get_item_summary(item),
+                get_item_source(item),
+                str(getattr(item, "_provider_entity_ar", "") or ""),
+                str(getattr(item, "_provider_entity", "") or ""),
+            ]
+        )
+    )
+
+    is_middle_east = (
+        "الشرق الاوسط" in region
+        or any(normalize_text(term) in text for term in MIDDLE_EAST_GEO_TERMS)
+    )
+
+    if topic_key == "gulf":
+        return is_middle_east
+
+    if topic_key == "wrld":
+        if is_middle_east:
+            return False
+        if region and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}:
+            return True
+        return any(normalize_text(term) in text for term in WORLD_GEO_TERMS)
+
+    return False
 
 
 def topic_filter(items, topic_key, max_results=25):
@@ -1234,12 +1312,17 @@ def topic_filter(items, topic_key, max_results=25):
     for item in items:
         if not _provider_title_ready(item):
             continue
-        forced_topic = str(getattr(item, "_exclusive_topic", "") or "")
-        if forced_topic:
-            if forced_topic != topic_key:
+
+        if topic_key in {"gulf", "wrld"}:
+            if not _geographic_topic_match(item, topic_key):
                 continue
-        elif not is_topic_match(item, topic_key):
-            continue
+        else:
+            forced_topic = str(getattr(item, "_exclusive_topic", "") or "")
+            if forced_topic:
+                if forced_topic != topic_key:
+                    continue
+            elif not is_topic_match(item, topic_key):
+                continue
 
         title = normalize_text(get_item_title(item))
         summary = normalize_text(get_item_summary(item))

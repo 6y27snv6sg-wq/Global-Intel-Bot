@@ -103,7 +103,7 @@ X_SEARCH_TIMEOUT_SECONDS = 5
 X_SEARCH_CACHE_TTL_SECONDS = 3 * 3600
 X_SEARCH_CIRCUIT_ID = "__x_search_engine__"
 
-USER_AGENT = "Global-Intel-Bot/1.0 (official-social-source monitor)"
+USER_AGENT = "Al-Arrab-News/1.0 (public-source social-news monitor)"
 DEFAULT_INCLUDE_SUPPORT = False
 
 _CIRCUIT_STATE: Dict[str, Dict[str, float]] = {}

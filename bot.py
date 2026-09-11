@@ -427,7 +427,7 @@ load_access_state()
 
 NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
-CALLBACK_ACK_TIMEOUT = 1.5
+CALLBACK_ACK_TIMEOUT = 0.45
 CALLBACK_DEDUP_TTL = 60
 CALLBACK_ACTION_DEBOUNCE = 5
 GEMINI_TIMEOUT = 35
@@ -460,7 +460,14 @@ DIRECT_REFRESH_INTERVAL = 30
 PROVIDER_LOOP_INTERVAL = 15
 SOCIAL_PROVIDER_TIMEOUT = 12
 DIRECT_PROVIDER_TIMEOUT = 10
-PROVIDER_TRANSLATION_BUDGET = 5.0
+PROVIDER_TRANSLATION_BUDGET = 4.0
+NEWS_TRANSLATION_BUDGET = 4.0
+NEWS_TRANSLATION_CAP = 120
+BREAKING_TRANSLATION_BUDGET = 2.0
+BREAKING_TRANSLATION_CAP = 40
+USER_STATE_TTL = 24 * 3600
+USER_STATE_PRUNE_INTERVAL = 300
+MAX_RUNTIME_USERS = 1500
 
 URGENT_MONITOR_INTERVAL = 20
 URGENT_INITIAL_DELAY = 8
@@ -468,6 +475,7 @@ BREAKING_LANE_TIMEOUT = 8
 MAX_SENT_URGENT_KEYS = 500
 MAX_RECENT_URGENT_EVENTS = 300
 RECENT_URGENT_EVENT_TTL = 12 * 3600
+URGENT_BUTTON_WINDOW_SECONDS = 3600
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -522,6 +530,13 @@ USER_TOPIC_RESULTS: Dict[str, List[Any]] = {}
 USER_SEEN_TOPIC_EVENTS: Dict[str, List[Any]] = {}
 MAX_SEEN_TOPIC_EVENTS = 120
 USER_LOCKS: Dict[int, asyncio.Lock] = {}
+USER_ACTIVITY: Dict[int, float] = {}
+LAST_USER_STATE_PRUNE = 0.0
+
+# Ready-to-serve presentation indexes. Buttons read these only; provider refreshes
+# own translation, deduplication, routing and rebuilding in the background.
+HOT_TOPIC_VIEWS: Dict[str, List[Any]] = {}
+HOT_VIEW_DIRTY = True
 ALERT_USERS: Set[int] = set()
 MUTED_USERS: Set[int] = set()
 SENT_URGENT_KEYS = deque(maxlen=MAX_SENT_URGENT_KEYS)
@@ -619,9 +634,47 @@ SEARCH_ALIASES = {
 }
 
 
+def _prune_user_runtime_state(now=None):
+    """Bound per-user snapshots/history so long runtimes do not leak memory."""
+    global LAST_USER_STATE_PRUNE
+    now = time.monotonic() if now is None else float(now)
+    if (
+        len(USER_ACTIVITY) <= MAX_RUNTIME_USERS
+        and LAST_USER_STATE_PRUNE
+        and (now - LAST_USER_STATE_PRUNE) < USER_STATE_PRUNE_INTERVAL
+    ):
+        return
+
+    LAST_USER_STATE_PRUNE = now
+    stale_before = now - USER_STATE_TTL
+    stale = [uid for uid, seen_at in USER_ACTIVITY.items() if seen_at < stale_before]
+
+    if len(USER_ACTIVITY) - len(stale) > MAX_RUNTIME_USERS:
+        survivors = sorted(
+            ((seen_at, uid) for uid, seen_at in USER_ACTIVITY.items() if uid not in stale),
+            reverse=True,
+        )
+        keep = {uid for _, uid in survivors[:MAX_RUNTIME_USERS]}
+        stale.extend(uid for uid in USER_ACTIVITY if uid not in keep and uid not in stale)
+
+    for uid in set(stale):
+        USER_ACTIVITY.pop(uid, None)
+        USER_SEARCH_RESULTS.pop(uid, None)
+        USER_SEARCH_QUERY.pop(uid, None)
+        USER_LOCKS.pop(uid, None)
+        prefix = f"{uid}:"
+        for mapping in (USER_TOPIC_RESULTS, USER_SEEN_TOPIC_EVENTS):
+            for key in list(mapping):
+                if str(key).startswith(prefix):
+                    mapping.pop(key, None)
+
+
 def register_user(user_id):
-    """Register only authorized users for alerts. Revoked/blocked users stay out."""
+    """Register only authorized users for alerts and refresh bounded activity state."""
     uid = int(user_id)
+    now = time.monotonic()
+    USER_ACTIVITY[uid] = now
+    _prune_user_runtime_state(now)
     if is_authorized(uid) and uid not in BLOCKED_USERS:
         ALERT_USERS.add(uid)
     else:
@@ -636,6 +689,7 @@ def remove_runtime_user(user_id):
     USER_SEARCH_RESULTS.pop(uid, None)
     USER_SEARCH_QUERY.pop(uid, None)
     USER_LOCKS.pop(uid, None)
+    USER_ACTIVITY.pop(uid, None)
     # Topic history keys use a user prefix in this bot. Remove defensively.
     prefix = f"{uid}:"
     for mapping in (USER_TOPIC_RESULTS, USER_SEEN_TOPIC_EVENTS):
@@ -1043,6 +1097,24 @@ def _canonical_provider_url(item):
         return ""
 
 
+async def _ensure_arabic_titles(items, *, budget, cap):
+    """Translate only missing Arabic headlines on background provider paths."""
+    candidates = [
+        item for item in list(items or [])
+        if get_item_title(item) and not _has_arabic_text(get_item_title(item))
+    ]
+    if not candidates:
+        return items
+    candidates = sorted(candidates, key=_provider_preference, reverse=True)[:max(1, int(cap))]
+    try:
+        await translate_news_titles(candidates, budget=budget)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Background Arabic title normalization failed.")
+    return items
+
+
 async def _run_news_collection():
     global LAST_NEWS_REFRESH, NEWS_PROVIDER_HEALTH
     try:
@@ -1057,6 +1129,15 @@ async def _run_news_collection():
                 log.info("News-engine health snapshot unavailable.")
         LAST_NEWS_REFRESH = time.monotonic()
         if items:
+            # First collapse obvious duplicates, then spend translation budget only
+            # on the strongest remaining foreign headlines. A final dedup pass
+            # benefits from normalized Arabic titles and reduces mirror coverage.
+            items = deduplicate_events(items, limit=NEWS_PROVIDER_ITEM_LIMIT)
+            await _ensure_arabic_titles(
+                items,
+                budget=NEWS_TRANSLATION_BUDGET,
+                cap=NEWS_TRANSLATION_CAP,
+            )
             items = deduplicate_events(items, limit=NEWS_PROVIDER_ITEM_LIMIT)
             NEWS_CACHE.set("all_news", items)
             _invalidate_hot_view()
@@ -1183,21 +1264,55 @@ def _has_arabic_text(value):
     return bool(re.search(r"[\u0600-\u06FF]", str(value or "")))
 
 
-def _provider_title_ready(item):
-    """Only merge translated provider headlines into the Arabic hot view.
-
-    Filtering happens BEFORE cross-provider deduplication so an untranslated
-    social/direct duplicate can never replace a translated native-news item and
-    then disappear from the topic result.
-    """
-    provider = str(getattr(item, "_provider_kind", "") or "")
-    if provider not in {"social_intel", "direct_radar"}:
-        return True
-    return _has_arabic_text(get_item_title(item))
+def _visible_item_ready(item):
+    """The public UI is Arabic-first across every provider, not social/direct only."""
+    title = get_item_title(item)
+    return bool(title and _has_arabic_text(title))
 
 
 def _invalidate_hot_view():
-    HOT_VIEW_CACHE.set("merged", None)
+    """Mark presentation data dirty without deleting the last ready snapshot."""
+    global HOT_VIEW_DIRTY
+    HOT_VIEW_DIRTY = True
+
+
+def _rebuild_hot_views():
+    """Build merged + six section indexes once on a background refresh path."""
+    global HOT_TOPIC_VIEWS, HOT_VIEW_DIRTY
+
+    breaking = BREAKING_CACHE.peek("breaking_news") or []
+    direct = DIRECT_CACHE.peek("direct_news") or []
+    social = SOCIAL_CACHE.peek("social_news") or []
+    broad = NEWS_CACHE.peek("all_news") or []
+
+    # Filter untranslated leftovers before cross-provider preference. This avoids
+    # a high-authority English duplicate replacing a translated Arabic version.
+    ready = [
+        item for item in (list(direct) + list(breaking) + list(social) + list(broad))
+        if _visible_item_ready(item)
+    ]
+    merged = deduplicate_events(ready, limit=HOT_CACHE_LIMIT)
+    HOT_VIEW_CACHE.set("merged", list(merged))
+
+    # Precompute routing, ranking and deduplication once. Button handlers are then
+    # O(page_size), not O(cache_size^2).
+    HOT_TOPIC_VIEWS = {
+        key: topic_filter(merged, key, MAX_TOPIC_RESULTS)
+        for key in TOPICS
+        if key != "urg"
+    }
+
+    # "عاجل" is a dedicated lane, not a generic classification bucket. If we
+    # force breaking-feed items through the normal router, an otherwise valid
+    # alert can disappear into World/Security because of its wording. Build the
+    # urgent button directly from the verified breaking overlay instead.
+    HOT_TOPIC_VIEWS["urg"] = _recent_publishable_urgent(
+        breaking,
+        limit=MAX_TOPIC_RESULTS,
+    )
+
+    HOT_VIEW_DIRTY = False
+    return list(merged)
 
 
 def get_cached_news_view(limit=HOT_CACHE_LIMIT):
@@ -1206,23 +1321,22 @@ def get_cached_news_view(limit=HOT_CACHE_LIMIT):
     if cached is not None:
         return list(cached[:limit])
 
-    breaking = BREAKING_CACHE.peek("breaking_news") or []
-    direct = [
-        item for item in (DIRECT_CACHE.peek("direct_news") or [])
-        if _provider_title_ready(item)
-    ]
-    social = [
-        item for item in (SOCIAL_CACHE.peek("social_news") or [])
-        if _provider_title_ready(item)
-    ]
-    broad = NEWS_CACHE.peek("all_news") or []
+    # Startup-only fallback before the first monitor cycle completes.
+    return list(_rebuild_hot_views()[:limit])
 
-    merged = deduplicate_events(
-        list(direct) + list(breaking) + list(social) + list(broad),
-        limit=HOT_CACHE_LIMIT,
-    )
-    HOT_VIEW_CACHE.set("merged", list(merged))
-    return list(merged[:limit])
+
+def get_cached_topic_view(topic_key, limit=MAX_TOPIC_RESULTS):
+    """Return a ready section index without re-running routing/dedup on a button."""
+    if topic_key not in TOPICS:
+        return []
+    cached = HOT_TOPIC_VIEWS.get(topic_key)
+    if cached is not None:
+        return list(cached[:limit])
+
+    # Startup-only fallback. Normal cycles build all topic indexes in advance.
+    if HOT_VIEW_CACHE.peek("merged") is None:
+        _rebuild_hot_views()
+    return list(HOT_TOPIC_VIEWS.get(topic_key, [])[:limit])
 
 
 def _provider_due(last_refresh, interval):
@@ -1307,6 +1421,8 @@ async def _run_all_source_refresh(force=False):
             if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                 log.error("Independent provider refresh failed: %r", result)
 
+        _rebuild_hot_views()
+
         health = get_network_health()
         log.info(
             "Network orchestrator hot=%d/%d news=%s social=%s direct=%s",
@@ -1317,6 +1433,8 @@ async def _run_all_source_refresh(force=False):
             health["direct_radar"],
         )
 
+    if HOT_VIEW_CACHE.peek("merged") is None:
+        _rebuild_hot_views()
     return get_cached_news_view()
 
 
@@ -1404,13 +1522,18 @@ async def get_fresh_news(force_refresh=False):
     return await refresh_all_sources(force=False)
 
 
-def _balance_topic_sources(items, limit):
-    """Re-rank every five-item page without dropping any valid story.
+def _distribution_key(item):
+    region = normalize_text(str(getattr(item, "region", "") or ""))
+    if region and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}:
+        return f"region:{region}"
+    source = normalize_text(get_item_source(item))
+    if source:
+        return f"source:{source}"
+    return f"domain:{_provider_domain(get_item_url(item)) or 'unknown'}"
 
-    At most two items from the same source are placed on a page when enough
-    source diversity exists. If diversity is insufficient, the remaining best
-    ranked items fill the page. The full result set is preserved.
-    """
+
+def _balance_topic_sources(items, limit):
+    """Prefer one country/source per five-item page, then fill by rank."""
     remaining = list(items or [])[:limit]
     balanced = []
 
@@ -1420,12 +1543,8 @@ def _balance_topic_sources(items, limit):
         counts = {}
 
         for idx, item in enumerate(remaining):
-            source_key = (
-                normalize_text(get_item_source(item))
-                or _provider_domain(get_item_url(item))
-                or "unknown"
-            )
-            if counts.get(source_key, 0) >= 2:
+            source_key = _distribution_key(item)
+            if counts.get(source_key, 0) >= 1:
                 continue
             selected.append(item)
             selected_indices.add(idx)
@@ -1470,9 +1589,10 @@ def _contains_any(text, terms):
 def _resolved_topic(item):
     """Resolve every story to exactly one visible section.
 
-    This is the single routing authority used by all six topic buttons.
-    It prevents cross-section duplication while allowing general geographic
-    stories to escape an overly broad engine specialist label.
+    Priority:
+    provider hard-route -> specialist institution -> explicit specialist event ->
+    official institution -> residual geography. Generic words such as "security",
+    "attack" or "forces" cannot by themselves hijack a story into Security.
     """
     forced = str(getattr(item, "_exclusive_topic", "") or "")
     if forced in TOPICS:
@@ -1484,50 +1604,84 @@ def _resolved_topic(item):
     region = normalize_text(str(getattr(item, "region", "") or ""))
 
     econ_sources = (
-        "بنك", "bank", "central bank", "reserve bank", "treasury",
-        "وزارة المالية", "ministry of finance", "sama",
+        "بنك مركزي", "البنك المركزي", "central bank", "reserve bank",
+        "treasury", "وزارة المالية", "ministry of finance", "sama",
+        "هيئة السوق", "stock exchange",
     )
     security_sources = (
-        "وزارة الدفاع", "الدفاع", "وزارة الداخلية", "القوات المسلحة",
-        "الجيش", "ministry of defense", "ministry of defence",
-        "army", "navy", "air force",
+        "وزارة الدفاع", "الدفاع", "القوات المسلحة", "الجيش",
+        "ministry of defense", "ministry of defence", "army", "navy",
+        "air force", "ناتو", "nato",
     )
     official_sources = (
         "وزارة الخارجية", "الخارجية", "foreign ministry",
         "ministry of foreign affairs", "state department",
         "الرئاسة", "presidency", "الحكومة", "government",
-        "الديوان الملكي",
+        "الديوان الملكي", "مجلس الوزراء",
     )
     explicit_official_terms = (
         "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
         "المتحدث باسم", "مصدر مسؤول", "أعلنت الوزارة", "اعلنت الوزارة",
         "قالت الوزارة", "أعلن الوزير", "اعلن الوزير", "قال الوزير",
     )
+    strong_econ_terms = (
+        "بنك مركزي", "فائده", "فائدة", "تضخم", "سياسه نقديه", "سياسة نقدية",
+        "اسعار الفائده", "أسعار الفائدة", "بورصه", "بورصة", "اسهم", "أسهم",
+        "سندات", "مزاد سندات", "ناتج محلي", "ميزانيه", "ميزانية",
+        "اسعار النفط", "أسعار النفط", "برنت", "اوبك", "أوبك",
+        "تعرفه جمركيه", "تعرفة جمركية", "عقوبات ماليه", "عقوبات مالية",
+        "central bank", "interest rate", "inflation", "monetary policy",
+        "stocks", "stock market", "bonds", "gdp", "budget", "oil prices",
+        "brent", "opec", "tariff", "financial sanctions",
+    )
+    strong_security_terms = (
+        "مناورات عسكريه", "مناورات عسكرية", "عمليه عسكريه", "عملية عسكرية",
+        "عمليات عسكريه", "عمليات عسكرية", "دفاع جوي", "قاعده عسكريه",
+        "قاعدة عسكرية", "تسليح", "اسلحه", "أسلحة", "صاروخ باليستي",
+        "طائره مسيره", "طائرة مسيرة", "سفينه حربيه", "سفينة حربية",
+        "اشتباكات مسلحه", "اشتباكات مسلحة", "قوات خاصه", "قوات خاصة",
+        "military exercise", "military operation", "air defense",
+        "military base", "weapons", "ballistic missile", "drone strike",
+        "warship", "armed clashes", "special forces",
+    )
 
-    # Institution identity is stronger than a broad engine label.
-    if _contains_any(source, econ_sources) or _contains_any(title, TOPICS["econ"][1]):
+    source_is_econ = _contains_any(source, econ_sources)
+    source_is_security = _contains_any(source, security_sources)
+    source_is_official = _contains_any(source, official_sources)
+    strong_econ = _contains_any(title, strong_econ_terms)
+    strong_security = _contains_any(title, strong_security_terms)
+
+    if source_is_econ:
         return "econ"
-    if _contains_any(source, security_sources):
+    if source_is_security:
         return "secu"
 
-    # Breaking must be explicit; ordinary attacks/security stories stay Security.
+    # Breaking requires both engine evidence and explicit breaking wording.
     if engine == "urg" and _contains_any(title, TOPICS["urg"][1]):
         return "urg"
 
-    if _contains_any(title, TOPICS["secu"][1]):
+    # Foreign ministries/presidencies/governments remain Official unless the
+    # substance is unmistakably economic or a concrete military operation.
+    if source_is_official:
+        if strong_econ and engine == "econ":
+            return "econ"
+        if strong_security and engine == "secu":
+            return "secu"
+        return "forg"
+
+    if _contains_any(title, explicit_official_terms):
+        return "forg"
+    if strong_econ:
+        return "econ"
+    if strong_security:
         return "secu"
 
-    # For official registry items, preserve the engine's specialist desk after
-    # correcting obvious economy/security institutions above.
+    # Preserve trusted official registry specialist labels when explicit source
+    # identity above did not resolve them.
     if getattr(item, "official", False) and engine in {"econ", "forg", "urg", "secu"}:
         return engine
 
-    if _contains_any(source, official_sources) or _contains_any(title, explicit_official_terms):
-        return "forg"
-
-    # Geographic browsing is the home for general news, including stories the
-    # engine labelled too broadly as economy/diplomacy/security without explicit
-    # specialist evidence.
+    # Geographic residual desks receive general international/regional coverage.
     geo_text = f"{title} {region}"
     if (
         engine == "gulf"
@@ -1540,7 +1694,6 @@ def _resolved_topic(item):
     if region and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}:
         return "wrld"
 
-    # Preserve otherwise-unplaceable specialist items instead of dropping them.
     if engine in {"econ", "forg", "urg", "secu"}:
         return engine
     return ""
@@ -1576,10 +1729,17 @@ def topic_filter(items, topic_key, max_results=25):
 
         score += float(getattr(item, "relevance_score", 0) or 0)
         score += float(getattr(item, "trust_score", 0) or 0) * 0.03
-        scored.append((score, item))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    ranked = [item for _, item in scored[:max_results * 3]]
+        published = _published_seconds(item) or 0
+        # Recency is a first-class ranking signal. Official statements especially
+        # should not be buried by older keyword-dense items.
+        scored.append((score, published, item))
+
+    if topic_key == "forg":
+        scored.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    else:
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    ranked = [item for _, _, item in scored[:max_results * 3]]
     if topic_key == "urg":
         return deduplicate_urgent_events(ranked, limit=max_results)
     deduped = deduplicate_events(ranked, limit=max_results)
@@ -2061,21 +2221,34 @@ URGENT_KEY_STOPWORDS = {
 }
 
 
+def _urgent_token_key(token):
+    """Light Arabic normalization for same-event matching only."""
+    token = normalize_text(token)
+    if re.search(r"[\u0600-\u06FF]", token):
+        if len(token) >= 5 and token.startswith("و"):
+            token = token[1:]
+        if len(token) >= 5 and token.startswith("ال"):
+            token = token[2:]
+        if len(token) >= 5 and token.endswith("ا"):
+            token = token[:-1]
+        if len(token) >= 5 and token.endswith("ه"):
+            token = token[:-1]
+    return token
+
+
 def urgent_event_tokens(item):
     title = normalize_text(get_item_title(item))
+    original = normalize_text(str(getattr(item, "original_title", "") or ""))
     tokens = []
-    for token in title.split():
+    for token in f"{title} {original}".split():
         if len(token) < 3:
             continue
-        bare = token[2:] if token.startswith("ال") and len(token) > 4 else token
-        if token in URGENT_KEY_STOPWORDS or bare in URGENT_KEY_STOPWORDS:
+        key = _urgent_token_key(token)
+        if not key or len(key) < 3:
             continue
-        # Arabic tanween can leave a trailing alef after diacritics are stripped
-        # (e.g. "انفجاراً" -> "انفجارا"). Canonicalize that lightweight form
-        # only for longer tokens used by the urgent-event matcher.
-        if re.search(r"[\u0600-\u06FF]", token) and len(token) >= 5 and token.endswith("ا"):
-            token = token[:-1]
-        tokens.append(token)
+        if token in URGENT_KEY_STOPWORDS or key in URGENT_KEY_STOPWORDS:
+            continue
+        tokens.append(key)
     return set(tokens)
 
 
@@ -2092,6 +2265,13 @@ def same_urgent_event(a, b):
     if not na or not nb:
         return False
     if na == nb:
+        return True
+
+    # Same canonical article URL is the same urgent event even if the publisher
+    # edits the headline between two polling cycles.
+    url_a = _canonical_provider_url(a)
+    url_b = _canonical_provider_url(b)
+    if url_a and url_b and url_a == url_b:
         return True
 
     nums_a = set(re.findall(r"(?<!\w)\d{2,}(?!\w)", na))
@@ -2112,9 +2292,10 @@ def same_urgent_event(a, b):
     similarity = difflib.SequenceMatcher(None, na, nb).ratio()
 
     return (
-        (len(common) >= 3 and (containment >= 0.55 or jaccard >= 0.42))
-        or (len(common) >= 2 and containment >= 0.80 and jaccard >= 0.50)
-        or (len(common) >= 2 and similarity >= 0.82)
+        (len(common) >= 3 and (containment >= 0.50 or jaccard >= 0.38))
+        or (len(common) >= 2 and containment >= 0.75 and jaccard >= 0.45)
+        or (len(common) >= 2 and similarity >= 0.78)
+        or (len(common) >= 4 and containment >= 0.45)
     )
 
 
@@ -2134,19 +2315,28 @@ EVENT_DEDUP_STOPWORDS = URGENT_KEY_STOPWORDS | {
 }
 
 
-def news_event_tokens(item):
-    """Meaningful headline tokens used for display-level event clustering.
+def _event_token_key(token):
+    """Light Arabic normalization used only for duplicate-event comparison."""
+    token = normalize_text(token)
+    if len(token) >= 5 and token.startswith("و"):
+        token = token[1:]
+    if len(token) >= 5 and token.startswith("ال"):
+        token = token[2:]
+    if len(token) >= 5 and token[-1:] in {"ه", "ا", "ى"}:
+        token = token[:-1]
+    return token
 
-    Engine deduplication intentionally stays conservative.  This second layer is
-    stricter about repeated coverage of the same event so the user sees one
-    representative story while corroborating publishers are retained as
-    alternate sources.
-    """
+
+def news_event_tokens(item):
+    """Meaningful translated/original headline tokens for event clustering."""
     title = normalize_text(get_item_title(item))
-    return {
-        token for token in title.split()
-        if len(token) >= 3 and token not in EVENT_DEDUP_STOPWORDS
-    }
+    original = normalize_text(str(getattr(item, "original_title", "") or ""))
+    result = set()
+    for token in f"{title} {original}".split():
+        key = _event_token_key(token)
+        if len(key) >= 3 and key not in EVENT_DEDUP_STOPWORDS:
+            result.add(key)
+    return result
 
 
 def news_event_numbers(item):
@@ -2204,10 +2394,21 @@ def same_news_event(a, b):
         # match after a full day is more likely to be a genuine follow-up.
         return len(common) >= 5 and containment >= 0.85 and jaccard >= 0.70
 
+    # A high string ratio catches publisher rewrites that keep the same factual
+    # spine but add/remove attribution. Compare both visible and original titles.
+    original_a = normalize_text(str(getattr(a, "original_title", "") or ""))
+    original_b = normalize_text(str(getattr(b, "original_title", "") or ""))
+    fuzzy = max(
+        difflib.SequenceMatcher(None, na, nb).ratio(),
+        difflib.SequenceMatcher(None, original_a, original_b).ratio()
+        if original_a and original_b else 0.0,
+    )
+
     return (
-        (len(common) >= 4 and containment >= 0.72)
-        or (len(common) >= 5 and jaccard >= 0.52)
-        or (len(common) >= 3 and containment >= 0.88)
+        fuzzy >= 0.88
+        or (len(common) >= 4 and containment >= 0.66)
+        or (len(common) >= 5 and jaccard >= 0.48)
+        or (len(common) >= 3 and containment >= 0.86)
     )
 
 
@@ -2473,12 +2674,19 @@ async def format_urgent_alert(item):
 
 
 async def _run_breaking_lane():
-    """Read only the lightweight direct-feed lane under a hard latency bound."""
+    """Read and normalize the lightweight breaking lane under a hard bound."""
     try:
-        return await asyncio.wait_for(
+        items = await asyncio.wait_for(
             collect_breaking_news(max_items=40),
             timeout=BREAKING_LANE_TIMEOUT,
         )
+        if items:
+            await _ensure_arabic_titles(
+                items,
+                budget=BREAKING_TRANSLATION_BUDGET,
+                cap=BREAKING_TRANSLATION_CAP,
+            )
+        return items or []
     except asyncio.TimeoutError:
         log.info("Breaking lane timed out; next cycle will retry.")
     except Exception:
@@ -2486,16 +2694,54 @@ async def _run_breaking_lane():
     return []
 
 
+def _urgent_within_button_window(item, now_epoch=None):
+    """Keep only recent urgent items for the user-facing عاجل button."""
+    published = _published_seconds(item)
+    if not published:
+        return False
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    age = now_epoch - published
+    return -300 <= age <= URGENT_BUTTON_WINDOW_SECONDS
+
+
+def _recent_publishable_urgent(items, limit=MAX_TOPIC_RESULTS):
+    """Canonical recent urgent timeline: trusted, Arabic-ready, last hour only."""
+    recent = [
+        item for item in list(items or [])
+        if _visible_item_ready(item)
+        and _urgent_within_button_window(item)
+        and urgent_precision_state(item)
+    ]
+    recent = deduplicate_urgent_events(recent)
+    recent.sort(
+        key=lambda item: (
+            _published_seconds(item) or 0,
+            urgent_score(item),
+            float(getattr(item, "trust_score", 0) or 0),
+        ),
+        reverse=True,
+    )
+    return recent[:limit]
+
+
 def _merge_breaking_into_cache(items):
-    """Update the fast overlay as canonical events, not raw feed-cycle headlines."""
-    if not items:
-        return
+    """Maintain a one-hour canonical urgent timeline across polling cycles."""
     cached = BREAKING_CACHE.get("breaking_news") or []
+    merged = deduplicate_urgent_events(list(items or []) + list(cached))
+    merged = [
+        item for item in merged
+        if _urgent_within_button_window(item)
+    ]
+    merged.sort(
+        key=lambda item: _published_seconds(item) or 0,
+        reverse=True,
+    )
     BREAKING_CACHE.set(
         "breaking_news",
-        deduplicate_urgent_events(list(items) + list(cached), limit=BREAKING_PROVIDER_ITEM_LIMIT),
+        merged[:BREAKING_PROVIDER_ITEM_LIMIT],
     )
     _invalidate_hot_view()
+    _rebuild_hot_views()
 
 
 async def initialize_urgent_baseline():
@@ -2531,11 +2777,9 @@ async def urgent_monitor(application):
                 # stays on its own cadence and can never delay an urgent alert.
                 items = await _run_breaking_lane()
                 _merge_breaking_into_cache(items)
-                alerts = find_new_urgent_news(items)
-                publishable = sum(
-                    1 for item in deduplicate_urgent_events(items)
-                    if urgent_precision_state(item)
-                )
+                recent_timeline = BREAKING_CACHE.get("breaking_news") or []
+                alerts = find_new_urgent_news(recent_timeline)
+                publishable = len(_recent_publishable_urgent(recent_timeline))
                 log.info(
                     "Urgent precision lane items=%d publishable=%d alerts=%d elapsed=%.2fs",
                     len(items), publishable, len(alerts), time.monotonic() - started,
@@ -2750,16 +2994,20 @@ async def show_topic(query, user_id, key, page):
         # Later pages must use that same snapshot for stable, instant pagination.
         raw_results = []
         if page == 1:
-            cached = get_cached_news_view()
-            raw_results = topic_filter(cached, key, MAX_TOPIC_RESULTS)
-            results = _filter_unseen_topic_events(user_id, key, raw_results)
+            raw_results = get_cached_topic_view(key, MAX_TOPIC_RESULTS)
+            # عاجل is a rolling timeline, not an "unread only" inbox. The last
+            # hour remains visible even after the alert was already delivered.
+            results = (
+                list(raw_results)
+                if key == "urg"
+                else _filter_unseen_topic_events(user_id, key, raw_results)
+            )
             if results:
                 USER_TOPIC_RESULTS[snapshot_key] = list(results)
         else:
             results = USER_TOPIC_RESULTS.get(snapshot_key, [])
             if not results:
-                cached = get_cached_news_view()
-                results = topic_filter(cached, key, MAX_TOPIC_RESULTS)
+                results = get_cached_topic_view(key, MAX_TOPIC_RESULTS)
                 if results:
                     USER_TOPIC_RESULTS[snapshot_key] = list(results)
 
@@ -2798,13 +3046,25 @@ async def show_topic(query, user_id, key, page):
                 "لا توجد أخبار جديدة منذ آخر عرض.",
                 parse_mode="HTML",
             )
-            track_task(
-                send_topic_update(query.message, key, raw_results, user_id),
-                f"topic-refresh-{user_id}-{key}",
+            if key != "urg":
+                track_task(
+                    send_topic_update(query.message, key, raw_results, user_id),
+                    f"topic-refresh-{user_id}-{key}",
+                )
+            return
+
+        # "عاجل" is continuously maintained by urgent_monitor. A button press
+        # must never launch a global force-refresh just because there is no alert.
+        if page == 1 and key == "urg":
+            await query.message.reply_text(
+                f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
+                "لا توجد أخبار عاجلة موثقة خلال آخر ساعة.\n"
+                "📡 الرصد العاجل مستمر تلقائياً.",
+                parse_mode="HTML",
             )
             return
 
-        # No cached result exists. Only page 1 may start background discovery.
+        # Other empty sections may request background discovery.
         if page == 1:
             await query.message.reply_text(
                 f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
@@ -3101,7 +3361,7 @@ async def button_handler(update, context):
                 )
                 return
 
-            results = topic_filter(items, key, 8)
+            results = get_cached_topic_view(key, 8)
             if not results:
                 await status.edit_text(
                     "⚠️ لا توجد بيانات كافية للتحليل."

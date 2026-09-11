@@ -40,6 +40,12 @@ from news_engine import (
 )
 
 try:
+    from news_engine import get_news_engine_health
+except Exception:
+    get_news_engine_health = None
+
+
+try:
     from intel_sources import collect_social_intel, source_health as get_social_source_health
 except Exception:
     collect_social_intel = None
@@ -409,6 +415,14 @@ def access_role(user_id):
     return "guest"
 
 
+def _runtime_access_allowed(user_id):
+    """Re-check authorization after long awaits before emitting a response."""
+    if user_id is None:
+        return True
+    uid = int(user_id)
+    return is_authorized(uid) and uid not in BLOCKED_USERS
+
+
 load_access_state()
 
 NEWS_COLLECTION_TIMEOUT = 25
@@ -419,20 +433,36 @@ CALLBACK_ACTION_DEBOUNCE = 5
 GEMINI_TIMEOUT = 35
 
 MAX_SEARCH_RESULTS = 25
-MAX_TOPIC_RESULTS = 60
+MAX_TOPIC_RESULTS = 100
 PER_PAGE = 5
+
+# Network capacity. The merged Hot Cache exposes up to 300 unique events.
+NETWORK_TARGET_ITEMS = 300
+HOT_CACHE_LIMIT = NETWORK_TARGET_ITEMS
+NEWS_PROVIDER_ITEM_LIMIT = NETWORK_TARGET_ITEMS
+SOCIAL_PROVIDER_ITEM_LIMIT = 120
+DIRECT_PROVIDER_ITEM_LIMIT = 120
+BREAKING_PROVIDER_ITEM_LIMIT = 100
+
+# Cache retention is deliberately longer than refresh cadence: a temporary
+# provider outage must never erase the last known-good snapshot.
 CACHE_TTL = 300
-HOT_CACHE_LIMIT = 260
 SOCIAL_CACHE_TTL = 180
 DIRECT_CACHE_TTL = 90
-SOCIAL_REFRESH_INTERVAL = 180
+
+# Base cadences. The orchestrator shortens selected intervals when a provider
+# reports degradation, while direct/urgent sensors keep their fast lane.
+NEWS_REFRESH_INTERVAL = 180
+NEWS_DEGRADED_REFRESH_INTERVAL = 90
+SOCIAL_REFRESH_INTERVAL = 120
+SOCIAL_DEGRADED_REFRESH_INTERVAL = 90
 DIRECT_REFRESH_INTERVAL = 30
-PROVIDER_LOOP_INTERVAL = 30
+PROVIDER_LOOP_INTERVAL = 15
 SOCIAL_PROVIDER_TIMEOUT = 12
 DIRECT_PROVIDER_TIMEOUT = 10
 PROVIDER_TRANSLATION_BUDGET = 5.0
 
-URGENT_MONITOR_INTERVAL = 30
+URGENT_MONITOR_INTERVAL = 20
 URGENT_INITIAL_DELAY = 8
 BREAKING_LANE_TIMEOUT = 8
 MAX_SENT_URGENT_KEYS = 500
@@ -508,6 +538,7 @@ PROVIDER_MONITOR_TASK = None
 PROVIDER_MONITOR_STARTED = False
 LAST_SOCIAL_REFRESH = 0.0
 LAST_DIRECT_REFRESH = 0.0
+NEWS_PROVIDER_HEALTH = {}
 SOCIAL_PROVIDER_HEALTH = {}
 DIRECT_PROVIDER_HEALTH = {}
 LAST_NEWS_REFRESH = 0.0
@@ -1013,21 +1044,38 @@ def _canonical_provider_url(item):
 
 
 async def _run_news_collection():
-    global LAST_NEWS_REFRESH
+    global LAST_NEWS_REFRESH, NEWS_PROVIDER_HEALTH
     try:
         items = await asyncio.wait_for(
-            collect_news(max_items=150),
+            collect_news(max_items=NEWS_PROVIDER_ITEM_LIMIT),
             timeout=NEWS_COLLECTION_TIMEOUT,
         )
+        if get_news_engine_health is not None:
+            try:
+                NEWS_PROVIDER_HEALTH = get_news_engine_health() or {}
+            except Exception:
+                log.info("News-engine health snapshot unavailable.")
+        LAST_NEWS_REFRESH = time.monotonic()
         if items:
-            items = deduplicate_events(items, limit=150)
+            items = deduplicate_events(items, limit=NEWS_PROVIDER_ITEM_LIMIT)
             NEWS_CACHE.set("all_news", items)
             _invalidate_hot_view()
-            LAST_NEWS_REFRESH = time.monotonic()
             return items
+        # A completed empty cycle is not a reason to hammer the provider again.
+        # Keep the last known-good cache and let health telemetry drive the
+        # shorter degraded retry cadence when appropriate.
+        return NEWS_CACHE.peek("all_news") or []
     except asyncio.TimeoutError:
+        LAST_NEWS_REFRESH = time.monotonic()
+        NEWS_PROVIDER_HEALTH = dict(NEWS_PROVIDER_HEALTH or {})
+        NEWS_PROVIDER_HEALTH["state"] = "degraded"
         log.warning("News collection timed out; keeping last available cache.")
+    except asyncio.CancelledError:
+        raise
     except Exception:
+        LAST_NEWS_REFRESH = time.monotonic()
+        NEWS_PROVIDER_HEALTH = dict(NEWS_PROVIDER_HEALTH or {})
+        NEWS_PROVIDER_HEALTH["state"] = "degraded"
         log.exception("News collection failed; keeping last available cache.")
     return NEWS_CACHE.peek("all_news") or []
 
@@ -1049,21 +1097,40 @@ async def collect_and_cache_news():
 async def _refresh_social_provider():
     global LAST_SOCIAL_REFRESH, SOCIAL_PROVIDER_HEALTH
     if collect_social_intel is None:
+        LAST_SOCIAL_REFRESH = time.monotonic()
+        SOCIAL_PROVIDER_HEALTH = {
+            "_provider": {"status": "disabled", "detail": "import_unavailable", "items": 0}
+        }
         return SOCIAL_CACHE.peek("social_news") or []
     try:
         events = await asyncio.wait_for(collect_social_intel(), timeout=SOCIAL_PROVIDER_TIMEOUT)
         if get_social_source_health is not None:
             SOCIAL_PROVIDER_HEALTH = get_social_source_health()
+        SOCIAL_PROVIDER_HEALTH.pop("_provider", None)
         items = await _adapt_provider_events(events, "social_intel")
         if items:
-            SOCIAL_CACHE.set("social_news", deduplicate_events(items, limit=80))
+            SOCIAL_CACHE.set("social_news", deduplicate_events(items, limit=SOCIAL_PROVIDER_ITEM_LIMIT))
             _invalidate_hot_view()
         LAST_SOCIAL_REFRESH = time.monotonic()
     except asyncio.TimeoutError:
+        LAST_SOCIAL_REFRESH = time.monotonic()
+        SOCIAL_PROVIDER_HEALTH = dict(SOCIAL_PROVIDER_HEALTH or {})
+        SOCIAL_PROVIDER_HEALTH["_provider"] = {
+            "status": "fetch_failed",
+            "detail": "timeout",
+            "items": 0,
+        }
         log.info("Social provider timed out; keeping previous cache.")
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        LAST_SOCIAL_REFRESH = time.monotonic()
+        SOCIAL_PROVIDER_HEALTH = dict(SOCIAL_PROVIDER_HEALTH or {})
+        SOCIAL_PROVIDER_HEALTH["_provider"] = {
+            "status": "fetch_failed",
+            "detail": type(exc).__name__,
+            "items": 0,
+        }
         log.exception("Social provider failed; keeping previous cache.")
     return SOCIAL_CACHE.peek("social_news") or []
 
@@ -1071,6 +1138,10 @@ async def _refresh_social_provider():
 async def _refresh_direct_provider(force=False):
     global LAST_DIRECT_REFRESH, DIRECT_PROVIDER_HEALTH
     if collect_direct_radar is None:
+        LAST_DIRECT_REFRESH = time.monotonic()
+        DIRECT_PROVIDER_HEALTH = {
+            "_provider": {"status": "disabled", "detail": "import_unavailable", "items": 0}
+        }
         return DIRECT_CACHE.peek("direct_news") or []
     try:
         events = await asyncio.wait_for(
@@ -1079,16 +1150,31 @@ async def _refresh_direct_provider(force=False):
         )
         if get_direct_source_health is not None:
             DIRECT_PROVIDER_HEALTH = get_direct_source_health()
+        DIRECT_PROVIDER_HEALTH.pop("_provider", None)
         items = await _adapt_provider_events(events, "direct_radar")
         if items:
-            DIRECT_CACHE.set("direct_news", deduplicate_events(items, limit=80))
+            DIRECT_CACHE.set("direct_news", deduplicate_events(items, limit=DIRECT_PROVIDER_ITEM_LIMIT))
             _invalidate_hot_view()
         LAST_DIRECT_REFRESH = time.monotonic()
     except asyncio.TimeoutError:
+        LAST_DIRECT_REFRESH = time.monotonic()
+        DIRECT_PROVIDER_HEALTH = dict(DIRECT_PROVIDER_HEALTH or {})
+        DIRECT_PROVIDER_HEALTH["_provider"] = {
+            "status": "fetch_failed",
+            "detail": "timeout",
+            "items": 0,
+        }
         log.info("Direct radar timed out; keeping previous cache.")
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        LAST_DIRECT_REFRESH = time.monotonic()
+        DIRECT_PROVIDER_HEALTH = dict(DIRECT_PROVIDER_HEALTH or {})
+        DIRECT_PROVIDER_HEALTH["_provider"] = {
+            "status": "fetch_failed",
+            "detail": type(exc).__name__,
+            "items": 0,
+        }
         log.exception("Direct radar failed; keeping previous cache.")
     return DIRECT_CACHE.peek("direct_news") or []
 
@@ -1143,19 +1229,94 @@ def _provider_due(last_refresh, interval):
     return not last_refresh or (time.monotonic() - last_refresh) >= interval
 
 
+def _sensor_network_state(snapshot):
+    """Collapse per-sensor telemetry into one provider state."""
+    if not isinstance(snapshot, dict) or not snapshot:
+        return "unknown"
+
+    # news_engine reports one aggregate state directly.
+    direct_state = str(snapshot.get("state", "") or "").strip().lower()
+    if direct_state in {"ok", "degraded", "unavailable"}:
+        return direct_state
+
+    statuses = []
+    for value in snapshot.values():
+        if isinstance(value, dict):
+            status = str(value.get("status", "") or "").strip().lower()
+            if status:
+                statuses.append(status)
+
+    if not statuses:
+        return "unknown"
+
+    healthy = {"ok", "empty", "not_due"}
+    failed = {
+        "fetch_failed", "parse_failed", "circuit_open",
+        "unavailable", "disabled",
+    }
+    good_count = sum(status in healthy for status in statuses)
+    bad_count = sum(status in failed for status in statuses)
+
+    if good_count and bad_count:
+        return "degraded"
+    if good_count:
+        return "ok"
+    if bad_count:
+        return "unavailable"
+    return "unknown"
+
+
+def get_network_health():
+    """Read-only orchestration snapshot; no network I/O."""
+    merged = get_cached_news_view()
+    return {
+        "news_engine": _sensor_network_state(NEWS_PROVIDER_HEALTH),
+        "social_intel": _sensor_network_state(SOCIAL_PROVIDER_HEALTH),
+        "direct_radar": _sensor_network_state(DIRECT_PROVIDER_HEALTH),
+        "hot_cache_items": len(merged),
+        "target_items": NETWORK_TARGET_ITEMS,
+    }
+
+
+def _effective_news_interval():
+    state = _sensor_network_state(NEWS_PROVIDER_HEALTH)
+    if state in {"degraded", "unavailable"}:
+        return NEWS_DEGRADED_REFRESH_INTERVAL
+    return NEWS_REFRESH_INTERVAL
+
+
+def _effective_social_interval():
+    state = _sensor_network_state(SOCIAL_PROVIDER_HEALTH)
+    if state in {"degraded", "unavailable"}:
+        return SOCIAL_DEGRADED_REFRESH_INTERVAL
+    return SOCIAL_REFRESH_INTERVAL
+
+
 async def _run_all_source_refresh(force=False):
     jobs = []
-    if force or _provider_due(LAST_NEWS_REFRESH, CACHE_TTL):
+    if force or _provider_due(LAST_NEWS_REFRESH, _effective_news_interval()):
         jobs.append(collect_and_cache_news())
-    if force or _provider_due(LAST_SOCIAL_REFRESH, SOCIAL_REFRESH_INTERVAL):
+    if force or _provider_due(LAST_SOCIAL_REFRESH, _effective_social_interval()):
         jobs.append(_refresh_social_provider())
     if force or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL):
         jobs.append(_refresh_direct_provider(force=force))
+
     if jobs:
         results = await asyncio.gather(*jobs, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                 log.error("Independent provider refresh failed: %r", result)
+
+        health = get_network_health()
+        log.info(
+            "Network orchestrator hot=%d/%d news=%s social=%s direct=%s",
+            health["hot_cache_items"],
+            health["target_items"],
+            health["news_engine"],
+            health["social_intel"],
+            health["direct_radar"],
+        )
+
     return get_cached_news_view()
 
 
@@ -1234,8 +1395,8 @@ async def get_fresh_news(force_refresh=False):
     cached = get_cached_news_view()
     if cached:
         if (
-            _provider_due(LAST_NEWS_REFRESH, CACHE_TTL)
-            or _provider_due(LAST_SOCIAL_REFRESH, SOCIAL_REFRESH_INTERVAL)
+            _provider_due(LAST_NEWS_REFRESH, _effective_news_interval())
+            or _provider_due(LAST_SOCIAL_REFRESH, _effective_social_interval())
             or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL)
         ):
             trigger_background_refresh(force=False)
@@ -2332,7 +2493,7 @@ def _merge_breaking_into_cache(items):
     cached = BREAKING_CACHE.get("breaking_news") or []
     BREAKING_CACHE.set(
         "breaking_news",
-        deduplicate_urgent_events(list(items) + list(cached), limit=80),
+        deduplicate_urgent_events(list(items) + list(cached), limit=BREAKING_PROVIDER_ITEM_LIMIT),
     )
     _invalidate_hot_view()
 
@@ -2386,7 +2547,7 @@ async def urgent_monitor(application):
                     delivered = False
 
                     for user_id in list(ALERT_USERS):
-                        if user_id in MUTED_USERS:
+                        if user_id in MUTED_USERS or not _runtime_access_allowed(user_id):
                             continue
                         try:
                             await application.bot.send_message(
@@ -2530,6 +2691,8 @@ async def send_topic_update(message, key, previous_results, user_id=None):
     """Refresh a topic in the background and send only meaningful additions."""
     try:
         fresh = await get_fresh_news(force_refresh=True)
+        if not _runtime_access_allowed(user_id):
+            return
         current = topic_filter(fresh, key, MAX_TOPIC_RESULTS)
         if not current:
             return
@@ -2556,6 +2719,8 @@ async def send_topic_update(message, key, previous_results, user_id=None):
             ),
             subheading=f"+{len(additions)} أخبار جديدة في {TOPICS[key][0]}",
         )
+        if not _runtime_access_allowed(user_id):
+            return
         await message.reply_text(
             report,
             disable_web_page_preview=True,
@@ -2727,6 +2892,9 @@ async def progressive_online_search(
                 pass
         return
 
+    if not _runtime_access_allowed(user_id):
+        return
+
     online = deduplicate_events(online or [], limit=MAX_SEARCH_RESULTS)
     local_keys = {urgent_key(item) for item in local_results}
     additions = [
@@ -2856,6 +3024,8 @@ async def button_handler(update, context):
         async def refresh_and_notify():
             before = len(cached)
             fresh = await get_fresh_news(force_refresh=True)
+            if not _runtime_access_allowed(user_id):
+                return
             after = len(fresh)
             try:
                 await query.message.reply_text(
@@ -2939,6 +3109,8 @@ async def button_handler(update, context):
                 return
 
             analysis = await analyze_with_gemini(results)
+            if not _runtime_access_allowed(user_id):
+                return
             await status.edit_text(
                 "🧠 <b>التحليل التنفيذي</b>\n\n"
                 + safe_html(analysis),

@@ -148,6 +148,8 @@ VALID_ROUTING_HINTS = {
 
 MAX_RESPONSE_BYTES = 900_000
 MAX_ITEMS_PER_SOURCE = 20
+DIRECT_COLLECTION_BUDGET_SECONDS = 7.5
+DIRECT_TASK_GRACE_SECONDS = 0.35
 CIRCUIT_FAILURES = 3
 CIRCUIT_COOLDOWN_SECONDS = 300
 USER_AGENT = (
@@ -1368,6 +1370,76 @@ def _log_direct_health_summary() -> None:
     )
 
 
+
+async def _collect_sources_with_budget(
+    session: aiohttp.ClientSession,
+    sources: List[Dict],
+    *,
+    budget_seconds: float,
+) -> List[Dict]:
+    """Return completed sensor results before the provider hard budget expires."""
+    if not sources:
+        return []
+
+    tasks: Dict[asyncio.Task, Dict] = {
+        asyncio.create_task(
+            _collect_one(session, source),
+            name=f"direct:{source['id']}",
+        ): source
+        for source in sources
+    }
+
+    done, pending = await asyncio.wait(
+        tasks.keys(),
+        timeout=max(0.1, float(budget_seconds)),
+        return_when=asyncio.ALL_COMPLETED,
+    )
+
+    merged: List[Dict] = []
+
+    for task in done:
+        source = tasks[task]
+        source_id = source["id"]
+        try:
+            result = task.result()
+            if result:
+                merged.extend(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _circuit_failure(source_id)
+            _set_source_health(
+                source_id,
+                HEALTH_FETCH_FAILED,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            log.warning("direct source isolated failure: %s: %s", source_id, exc)
+
+    if pending:
+        for task in pending:
+            source = tasks[task]
+            source_id = source["id"]
+            task.cancel()
+            current = str(_SOURCE_HEALTH.get(source_id, {}).get("status") or HEALTH_UNKNOWN)
+            if current not in {HEALTH_FETCH_FAILED, HEALTH_PARSE_FAILED, HEALTH_CIRCUIT_OPEN}:
+                _circuit_failure(source_id)
+                _set_source_health(
+                    source_id,
+                    HEALTH_FETCH_FAILED,
+                    detail="collection_budget_exhausted",
+                )
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=DIRECT_TASK_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+    return merged
+
+
 # =========================================================
 # PUBLIC COLLECTOR
 # =========================================================
@@ -1401,20 +1473,11 @@ async def collect_direct_radar(
         return []
 
     async def run(active_session: aiohttp.ClientSession) -> List[Dict]:
-        results = await asyncio.gather(
-            *(_collect_one(active_session, source) for source in sources),
-            return_exceptions=True,
+        merged = await _collect_sources_with_budget(
+            active_session,
+            sources,
+            budget_seconds=DIRECT_COLLECTION_BUDGET_SECONDS,
         )
-
-        merged: List[Dict] = []
-        for source, result in zip(sources, results):
-            if isinstance(result, BaseException):
-                if isinstance(result, asyncio.CancelledError):
-                    raise result
-                log.warning("direct source isolated failure: %s: %s", source["id"], result)
-                continue
-            merged.extend(result or [])
-
         output = deduplicate_radar_events(merged)
         _log_direct_health_summary()
         return output

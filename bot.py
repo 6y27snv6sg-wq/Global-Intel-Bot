@@ -84,6 +84,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("pro_news_bot")
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
@@ -319,16 +321,34 @@ async def _sync_access_state_to_telegram(bot):
 
 async def _access_cloud_sync_worker():
     global ACCESS_CLOUD_SYNC_DIRTY
+
+    failures = 0
     while True:
         ACCESS_CLOUD_SYNC_DIRTY = False
+        bot = ACCESS_BOT
+        if bot is None:
+            return
+
         try:
-            await _sync_access_state_to_telegram(ACCESS_BOT)
+            await _sync_access_state_to_telegram(bot)
+            failures = 0
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Authorization changes remain active in memory/local copy. A Telegram
-            # backup failure must never stop news delivery or lock the owner out.
-            log.warning("Could not mirror access state to Telegram; will retry on next change/startup.", exc_info=True)
+            # Keep the runtime/local authorization state active and retry a few
+            # times independently. This avoids losing a recent access change if
+            # Telegram has a transient failure and Railway restarts before the
+            # owner makes another access-control change.
+            failures += 1
+            log.warning(
+                "Could not mirror access state to Telegram (attempt %s/3).",
+                failures,
+                exc_info=True,
+            )
+            if failures < 3:
+                await asyncio.sleep(2 ** (failures - 1))
+                ACCESS_CLOUD_SYNC_DIRTY = True
+
         if not ACCESS_CLOUD_SYNC_DIRTY:
             return
         await asyncio.sleep(0)
@@ -1129,20 +1149,35 @@ async def _run_all_source_refresh(force=False):
 
 
 async def refresh_all_sources(force=False):
-    """Global single-flight refresh. Provider failures remain isolated."""
+    """Global single-flight refresh with force-upgrade semantics.
+
+    Concurrent callers share one cycle. If a manual/forced refresh arrives while
+    a non-forced cycle is already running, exactly one forced cycle follows it.
+    """
     global PROVIDER_REFRESH_TASK
+
     task = PROVIDER_REFRESH_TASK
+    created_here = False
     if task is None or task.done():
         task = asyncio.create_task(
             _run_all_source_refresh(force=force),
             name="all-source-refresh",
         )
+        task._force_refresh = bool(force)
         PROVIDER_REFRESH_TASK = task
+        created_here = True
+
+    running_force = bool(getattr(task, "_force_refresh", False))
     try:
-        return await asyncio.shield(task)
+        result = await asyncio.shield(task)
     finally:
         if PROVIDER_REFRESH_TASK is task and task.done():
             PROVIDER_REFRESH_TASK = None
+
+    if force and not running_force and not created_here:
+        return await refresh_all_sources(force=True)
+
+    return result
 
 
 def trigger_background_refresh(force=False):
@@ -1156,6 +1191,7 @@ def trigger_background_refresh(force=False):
         _run_all_source_refresh(force=force),
         name="background-hot-cache-refresh",
     )
+    task._force_refresh = bool(force)
     PROVIDER_REFRESH_TASK = task
     BACKGROUND_TASKS.add(task)
 
@@ -1243,44 +1279,99 @@ def _balance_topic_sources(items, limit):
     return balanced[:limit]
 
 
-SPECIALIST_TOPICS = ("econ", "forg", "urg", "secu")
-
-
-def _specialist_topic(item):
-    """Return the item's specialist desk, if any."""
+def _engine_topic(item):
+    """Read the engine/provider topic without making it the final UI section."""
     forced = str(getattr(item, "_exclusive_topic", "") or "")
-    if forced in SPECIALIST_TOPICS:
+    if forced in TOPICS:
         return forced
-    for key in SPECIALIST_TOPICS:
+    for key in ("urg", "secu", "econ", "forg", "gulf", "wrld"):
         if is_topic_match(item, key):
             return key
     return ""
 
 
-def _general_geo_match(item, topic_key):
-    """World/Middle-East contain only general news, never specialist-desk items."""
-    if _specialist_topic(item):
-        return False
+def _contains_any(text, terms):
+    text = normalize_text(text)
+    return any(normalize_text(term) in text for term in terms if term)
 
+
+def _resolved_topic(item):
+    """Resolve every story to exactly one visible section.
+
+    This is the single routing authority used by all six topic buttons.
+    It prevents cross-section duplication while allowing general geographic
+    stories to escape an overly broad engine specialist label.
+    """
+    forced = str(getattr(item, "_exclusive_topic", "") or "")
+    if forced in TOPICS:
+        return forced
+
+    engine = _engine_topic(item)
+    title = normalize_text(get_item_title(item))
+    source = normalize_text(get_item_source(item))
     region = normalize_text(str(getattr(item, "region", "") or ""))
 
-    if topic_key == "gulf":
-        return (
-            is_topic_match(item, "gulf")
-            or "الشرق الاوسط" in region
-        )
+    econ_sources = (
+        "بنك", "bank", "central bank", "reserve bank", "treasury",
+        "وزارة المالية", "ministry of finance", "sama",
+    )
+    security_sources = (
+        "وزارة الدفاع", "الدفاع", "وزارة الداخلية", "القوات المسلحة",
+        "الجيش", "ministry of defense", "ministry of defence",
+        "army", "navy", "air force",
+    )
+    official_sources = (
+        "وزارة الخارجية", "الخارجية", "foreign ministry",
+        "ministry of foreign affairs", "state department",
+        "الرئاسة", "presidency", "الحكومة", "government",
+        "الديوان الملكي",
+    )
+    explicit_official_terms = (
+        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
+        "المتحدث باسم", "مصدر مسؤول", "أعلنت الوزارة", "اعلنت الوزارة",
+        "قالت الوزارة", "أعلن الوزير", "اعلن الوزير", "قال الوزير",
+    )
 
-    if topic_key == "wrld":
-        if is_topic_match(item, "gulf") or "الشرق الاوسط" in region:
-            return False
-        if is_topic_match(item, "wrld"):
-            return True
-        return bool(
-            region
-            and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}
-        )
+    # Institution identity is stronger than a broad engine label.
+    if _contains_any(source, econ_sources) or _contains_any(title, TOPICS["econ"][1]):
+        return "econ"
+    if _contains_any(source, security_sources):
+        return "secu"
 
-    return False
+    # Breaking must be explicit; ordinary attacks/security stories stay Security.
+    if engine == "urg" and _contains_any(title, TOPICS["urg"][1]):
+        return "urg"
+
+    if _contains_any(title, TOPICS["secu"][1]):
+        return "secu"
+
+    # For official registry items, preserve the engine's specialist desk after
+    # correcting obvious economy/security institutions above.
+    if getattr(item, "official", False) and engine in {"econ", "forg", "urg", "secu"}:
+        return engine
+
+    if _contains_any(source, official_sources) or _contains_any(title, explicit_official_terms):
+        return "forg"
+
+    # Geographic browsing is the home for general news, including stories the
+    # engine labelled too broadly as economy/diplomacy/security without explicit
+    # specialist evidence.
+    geo_text = f"{title} {region}"
+    if (
+        engine == "gulf"
+        or "الشرق الاوسط" in region
+        or _contains_any(geo_text, TOPICS["gulf"][1])
+    ):
+        return "gulf"
+    if engine == "wrld" or _contains_any(geo_text, TOPICS["wrld"][1]):
+        return "wrld"
+    if region and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}:
+        return "wrld"
+
+    # Preserve otherwise-unplaceable specialist items instead of dropping them.
+    if engine in {"econ", "forg", "urg", "secu"}:
+        return engine
+    return ""
 
 
 def topic_filter(items, topic_key, max_results=25):
@@ -1289,16 +1380,8 @@ def topic_filter(items, topic_key, max_results=25):
 
     scored = []
     for item in items:
-        if topic_key in {"gulf", "wrld"}:
-            if not _general_geo_match(item, topic_key):
-                continue
-        else:
-            forced_topic = str(getattr(item, "_exclusive_topic", "") or "")
-            if forced_topic:
-                if forced_topic != topic_key:
-                    continue
-            elif not is_topic_match(item, topic_key):
-                continue
+        if _resolved_topic(item) != topic_key:
+            continue
 
         title = normalize_text(get_item_title(item))
         summary = normalize_text(get_item_summary(item))
@@ -2361,6 +2444,7 @@ async def post_init(application):
 async def post_stop(application):
     global URGENT_MONITOR_STARTED, URGENT_MONITOR_TASK
     global PROVIDER_MONITOR_STARTED, PROVIDER_MONITOR_TASK, PROVIDER_REFRESH_TASK
+    global NEWS_COLLECTION_TASK
     global ACCESS_BOT, ACCESS_CLOUD_SYNC_TASK
 
     access_task = ACCESS_CLOUD_SYNC_TASK
@@ -2372,12 +2456,20 @@ async def post_stop(application):
     PROVIDER_MONITOR_STARTED = False
     refresh_task = PROVIDER_REFRESH_TASK
     PROVIDER_REFRESH_TASK = None
+    news_task = NEWS_COLLECTION_TASK
+    NEWS_COLLECTION_TASK = None
     URGENT_MONITOR_TASK = None
     URGENT_MONITOR_STARTED = False
 
-    for bg_task in list(BACKGROUND_TASKS):
-        if not bg_task.done():
-            bg_task.cancel()
+    background_pending = {
+        bg_task for bg_task in list(BACKGROUND_TASKS)
+        if not bg_task.done()
+    }
+    for bg_task in background_pending:
+        bg_task.cancel()
+    if background_pending:
+        await asyncio.gather(*background_pending, return_exceptions=True)
+    BACKGROUND_TASKS.clear()
 
     if access_task and not access_task.done():
         access_task.cancel()
@@ -2386,7 +2478,7 @@ async def post_stop(application):
         except asyncio.CancelledError:
             pass
 
-    for extra_task in (provider_task, refresh_task):
+    for extra_task in (provider_task, refresh_task, news_task):
         if extra_task and not extra_task.done():
             extra_task.cancel()
             try:
@@ -2431,10 +2523,10 @@ async def send_topic_update(message, key, previous_results, user_id=None):
         if not current:
             return
 
-        previous_keys = {urgent_key(item) for item in previous_results}
+        matcher = same_urgent_event if key == "urg" else same_news_event
         additions = [
             item for item in current
-            if urgent_key(item) not in previous_keys
+            if not any(matcher(item, previous) for previous in previous_results)
         ]
         additions = deduplicate_events(additions, limit=PER_PAGE)
         if user_id is not None:
@@ -2490,7 +2582,7 @@ async def show_topic(query, user_id, key, page):
         else:
             results = USER_TOPIC_RESULTS.get(snapshot_key, [])
             if not results:
-                cached = NEWS_CACHE.peek("all_news") or []
+                cached = get_cached_news_view()
                 results = topic_filter(cached, key, MAX_TOPIC_RESULTS)
                 if results:
                     USER_TOPIC_RESULTS[snapshot_key] = list(results)
@@ -2969,10 +3061,14 @@ async def admin_command(update, context):
 
 
 async def error_handler(update, context):
+    error = context.error
+    exc_info = None
+    if isinstance(error, BaseException):
+        exc_info = (type(error), error, error.__traceback__)
     log.error(
         "Unhandled Telegram error: %r",
-        context.error,
-        exc_info=True,
+        error,
+        exc_info=exc_info,
     )
 
 

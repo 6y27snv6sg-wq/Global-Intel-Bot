@@ -16,6 +16,7 @@ Direct Intelligence Radar Sources
 5) routing_hint إشارة فقط؛ التصنيف النهائي يتم لاحقًا حسب مضمون الحدث.
 6) لا توجد أي عملية polling تلقائية هنا. يستدعي bot.py هذا المزود لاحقًا من مسار خلفي مستقل.
 7) OFAC يُقرأ من صفحة Recent Actions الجامعة فقط لتجنب طلبات مكررة لنفس العائلة المؤسسية.
+8) حساسات الزلازل والطيران تمر عبر بوابات شدة/حداثة قبل التسليم إلى bot.py لتجنب الضجيج.
 """
 
 from __future__ import annotations
@@ -23,9 +24,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import re
 import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -55,16 +60,12 @@ VALID_ROLES = {
 TYPE_MARITIME_SECURITY = "maritime_security"
 TYPE_SANCTIONS = "sanctions"
 TYPE_AVIATION_SECURITY = "aviation_security"
-TYPE_NUCLEAR_SECURITY = "nuclear_security"
-TYPE_ENERGY_SECURITY = "energy_security"
-TYPE_SECURITY_ADVISORY = "security_advisory"
+TYPE_SEISMIC_ALERT = "seismic_alert"
 VALID_SOURCE_TYPES = {
     TYPE_MARITIME_SECURITY,
     TYPE_SANCTIONS,
     TYPE_AVIATION_SECURITY,
-    TYPE_NUCLEAR_SECURITY,
-    TYPE_ENERGY_SECURITY,
-    TYPE_SECURITY_ADVISORY,
+    TYPE_SEISMIC_ALERT,
 }
 
 # =========================================================
@@ -123,10 +124,9 @@ RADAR_TOPICS: Set[str] = {
     "aviation_security",
     "conflict_zone",
     "airspace_risk",
-    "nuclear_security",
-    "nuclear_safety",
-    "energy_security",
-    "strategic_energy",
+    "earthquake",
+    "tsunami",
+    "natural_disaster",
 }
 
 ROUTE_DEFENSE = "defense_security"
@@ -203,6 +203,7 @@ DIRECT_SOURCES: List[Dict] = [
         "role": ROLE_PRIMARY_SENSOR,
         "active": True,
         "url": "https://www.ukmto.org/ukmto-products/warnings",
+        "parser": "ukmto_html",
         "official_proof": "https://www.ukmto.org/",
         "regions": {
             "Middle East", "Arabian Gulf", "Gulf of Oman", "Arabian Sea",
@@ -237,6 +238,7 @@ DIRECT_SOURCES: List[Dict] = [
         "role": ROLE_PRIMARY_SENSOR,
         "active": True,
         "url": "https://ofac.treasury.gov/recent-actions",
+        "parser": "ofac_html",
         "official_proof": "https://ofac.treasury.gov/",
         "regions": {"Global"},
         "topics": {
@@ -258,6 +260,91 @@ DIRECT_SOURCES: List[Dict] = [
         ),
         "notes": (
             "المصدر الأولي للعقوبات والتعيينات والتحديثات المرتبطة بـOFAC."
+        ),
+    },
+    {
+        "id": "usgs_earthquakes",
+        "entity": "United States",
+        "entity_ar": "الولايات المتحدة",
+        "organization": "U.S. Geological Survey",
+        "organization_ar": "هيئة المسح الجيولوجي الأمريكية",
+        "source_type": TYPE_SEISMIC_ALERT,
+        "grade": GRADE_A_PLUS,
+        "role": ROLE_PRIMARY_SENSOR,
+        "active": True,
+        "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_hour.geojson",
+        "parser": "usgs_geojson",
+        "official_proof": "https://earthquake.usgs.gov/earthquakes/feed/",
+        "regions": {"Global"},
+        "topics": {"earthquake", "tsunami", "natural_disaster"},
+        "product_types": {"earthquake_event"},
+        "routing_hint": ROUTE_BREAKING,
+        "dedup_group": "global_earthquake",
+        "priority": 100,
+        "poll_interval_seconds": 60,
+        "timeout_seconds": 4,
+        "default_event_status": STATUS_VERIFIED_REPORT,
+        "attribution_ar": "بحسب هيئة المسح الجيولوجي الأمريكية (USGS)",
+        "notes": (
+            "رادار زلازل عالمي لحظي. لا يُنشر كل حدث؛ تمر فقط الأحداث "
+            "ذات القيمة الإخبارية أو مؤشرات التسونامي/الخطورة."
+        ),
+    },
+    {
+        "id": "gdacs_earthquakes",
+        "entity": "International",
+        "entity_ar": "دولي",
+        "organization": "Global Disaster Alert and Coordination System",
+        "organization_ar": "النظام العالمي للإنذار والتنسيق في حالات الكوارث (GDACS)",
+        "source_type": TYPE_SEISMIC_ALERT,
+        "grade": GRADE_A,
+        "role": ROLE_SPECIALIZED_SENSOR,
+        "active": True,
+        "url": "https://www.gdacs.org/contentdata/xml/rss_eq_24h.xml",
+        "parser": "gdacs_rss",
+        "official_proof": "https://www.gdacs.org/feed_reference.aspx",
+        "regions": {"Global"},
+        "topics": {"earthquake", "tsunami", "natural_disaster"},
+        "product_types": {"disaster_alert"},
+        "routing_hint": ROUTE_BREAKING,
+        "dedup_group": "global_earthquake",
+        "priority": 92,
+        "poll_interval_seconds": 360,
+        "timeout_seconds": 5,
+        "default_event_status": STATUS_VERIFIED_REPORT,
+        "attribution_ar": "بحسب النظام العالمي للإنذار والتنسيق في حالات الكوارث (GDACS)",
+        "notes": (
+            "حساس تأكيد دولي عالي الإشارة. تُقبل التنبيهات البرتقالية والحمراء "
+            "للزلازل فقط لتجنب الضجيج."
+        ),
+    },
+    {
+        "id": "easa_conflict_zones",
+        "entity": "European Union",
+        "entity_ar": "الاتحاد الأوروبي",
+        "organization": "European Union Aviation Safety Agency",
+        "organization_ar": "وكالة سلامة الطيران التابعة للاتحاد الأوروبي (EASA)",
+        "source_type": TYPE_AVIATION_SECURITY,
+        "grade": GRADE_A_PLUS,
+        "role": ROLE_PRIMARY_SENSOR,
+        "active": True,
+        "url": "https://www.easa.europa.eu/en/domains/air-operations/czibs/export-json?_format=json&page=",
+        "parser": "easa_json",
+        "official_proof": "https://www.easa.europa.eu/en/domains/air-operations/czibs",
+        "regions": {"Global"},
+        "topics": {"aviation_security", "conflict_zone", "airspace_risk", "international_security"},
+        "product_types": {"conflict_zone_advisory"},
+        "routing_hint": ROUTE_DEFENSE,
+        "dedup_group": "easa_conflict_zones",
+        "priority": 98,
+        "poll_interval_seconds": 300,
+        "timeout_seconds": 5,
+        "default_event_status": STATUS_ADVISORY,
+        "max_event_age_seconds": 7 * 24 * 3600,
+        "attribution_ar": "بحسب وكالة سلامة الطيران التابعة للاتحاد الأوروبي (EASA)",
+        "notes": (
+            "يرصد الإصدارات والتحديثات الحديثة فقط لنشرات مناطق النزاع الجوي، "
+            "ولا يعيد نشر القائمة التاريخية النشطة كاملة."
         ),
     },
 ]
@@ -481,6 +568,49 @@ def _anchors(document: str) -> List[Tuple[str, str]]:
     return parser.anchors
 
 
+
+def _parse_datetime(value: object) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = _clean_text(value)
+        if not raw:
+            return None
+        time_match = re.search(r'datetime=["\']([^"\']+)["\']', raw, flags=re.I)
+        if time_match:
+            raw = time_match.group(1)
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(raw)
+            except (TypeError, ValueError, OverflowError):
+                return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _event_is_recent(value: object, max_age_seconds: int) -> bool:
+    published = _parse_datetime(value)
+    if published is None:
+        return False
+    age = (datetime.now(timezone.utc) - published).total_seconds()
+    return -300 <= age <= max_age_seconds
+
+
+def _xml_local_name(tag: str) -> str:
+    return str(tag or "").rsplit("}", 1)[-1].lower()
+
+
+def _xml_child_text(node: ET.Element, *names: str) -> str:
+    wanted = {str(name).lower() for name in names}
+    for child in list(node):
+        if _xml_local_name(child.tag) in wanted:
+            return _clean_text("".join(child.itertext()))
+    return ""
+
+
 # =========================================================
 # UKMTO PARSING
 # =========================================================
@@ -672,6 +802,227 @@ def parse_ofac_html(document: str, *, source_id: str) -> List[Dict]:
     return events
 
 
+
+# =========================================================
+# EARLY-WARNING PARSERS
+# =========================================================
+
+def parse_usgs_geojson(document: str, *, source_id: str) -> List[Dict]:
+    if source_id != "usgs_earthquakes":
+        raise ValueError(f"Unsupported USGS source: {source_id}")
+    payload = json.loads(document)
+    if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
+        raise ValueError("invalid USGS GeoJSON")
+
+    events: List[Dict] = []
+    for feature in payload["features"]:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties") or {}
+        if not isinstance(props, dict):
+            continue
+
+        try:
+            magnitude = float(props.get("mag"))
+        except (TypeError, ValueError):
+            continue
+        alert = _clean_text(props.get("alert")).lower()
+        tsunami = int(props.get("tsunami") or 0)
+        significance = int(props.get("sig") or 0)
+
+        # High-signal gate: no routine M4.5 noise.
+        if not (
+            magnitude >= 5.5
+            or tsunami == 1
+            or alert in {"orange", "red"}
+            or significance >= 600
+        ):
+            continue
+
+        epoch_ms = props.get("time")
+        published = None
+        if isinstance(epoch_ms, (int, float)):
+            published = datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc)
+        if published is None or not _event_is_recent(published, 2 * 3600):
+            continue
+
+        place = _clean_text(props.get("place")) or "location not specified"
+        url = _canonical_url(props.get("url"))
+        event_id = _clean_text(feature.get("id") or props.get("code"))
+        geometry = feature.get("geometry") or {}
+        coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else []
+        depth_km = None
+        if isinstance(coordinates, list) and len(coordinates) >= 3:
+            try:
+                depth_km = round(float(coordinates[2]), 1)
+            except (TypeError, ValueError):
+                depth_km = None
+
+        title = f"Earthquake M{magnitude:.1f} - {place}"
+        summary_parts = [f"USGS magnitude {magnitude:.1f}"]
+        if depth_km is not None:
+            summary_parts.append(f"depth {depth_km:g} km")
+        if tsunami == 1:
+            summary_parts.append("tsunami flag: yes")
+        if alert:
+            summary_parts.append(f"alert level: {alert}")
+        summary_parts.append(f"significance: {significance}")
+
+        events.append(
+            build_radar_event(
+                source_id=source_id,
+                title=title,
+                original_title=title,
+                summary="; ".join(summary_parts),
+                url=url or get_direct_source(source_id)["official_proof"],
+                published=published,
+                external_id=event_id,
+                region=place,
+                event_status=STATUS_VERIFIED_REPORT,
+                metadata={
+                    "magnitude": magnitude,
+                    "alert": alert,
+                    "tsunami": tsunami,
+                    "significance": significance,
+                    "depth_km": depth_km,
+                },
+            )
+        )
+        if len(events) >= MAX_ITEMS_PER_SOURCE:
+            break
+    return events
+
+
+def parse_gdacs_rss(document: str, *, source_id: str) -> List[Dict]:
+    if source_id != "gdacs_earthquakes":
+        raise ValueError(f"Unsupported GDACS source: {source_id}")
+    root = ET.fromstring(document)
+    events: List[Dict] = []
+
+    for item in root.iter():
+        if _xml_local_name(item.tag) != "item":
+            continue
+
+        event_type = _xml_child_text(item, "eventtype").upper()
+        alert_level = _xml_child_text(item, "alertlevel").lower()
+        if event_type and event_type != "EQ":
+            continue
+        if alert_level not in {"orange", "red"}:
+            continue
+
+        title = _xml_child_text(item, "title")
+        link = _canonical_url(_xml_child_text(item, "link"))
+        description = _xml_child_text(item, "description")
+        published_raw = _xml_child_text(item, "pubdate", "fromdate", "todate")
+        published = _parse_datetime(published_raw)
+        if published is None or not _event_is_recent(published, 30 * 3600):
+            continue
+
+        event_id = _xml_child_text(item, "eventid")
+        episode_id = _xml_child_text(item, "episodeid")
+        country = _xml_child_text(item, "country")
+        if not title:
+            title = f"Earthquake - {country or 'GDACS alert'}"
+        elif "earthquake" not in title.lower():
+            title = f"Earthquake - {title}"
+
+        external_id = ":".join(part for part in (event_id, episode_id) if part)
+        events.append(
+            build_radar_event(
+                source_id=source_id,
+                title=title,
+                original_title=title,
+                summary=description,
+                url=link or get_direct_source(source_id)["official_proof"],
+                published=published,
+                external_id=external_id,
+                region=country,
+                event_status=STATUS_VERIFIED_REPORT,
+                metadata={
+                    "alert_level": alert_level,
+                    "event_type": event_type or "EQ",
+                },
+            )
+        )
+        if len(events) >= MAX_ITEMS_PER_SOURCE:
+            break
+    return events
+
+
+def parse_easa_json(document: str, *, source_id: str) -> List[Dict]:
+    if source_id != "easa_conflict_zones":
+        raise ValueError(f"Unsupported EASA source: {source_id}")
+    payload = json.loads(document)
+    zones = payload.get("conflict_zones")
+    if not isinstance(zones, list):
+        raise ValueError("invalid EASA conflict-zones JSON")
+
+    source = get_direct_source(source_id) or {}
+    max_age = int(source.get("max_event_age_seconds", 7 * 24 * 3600))
+    events: List[Dict] = []
+
+    for zone in zones:
+        if not isinstance(zone, dict):
+            continue
+        status = _clean_text(zone.get("status"))
+        if status.lower() != "active":
+            continue
+
+        published = _parse_datetime(zone.get("updated")) or _parse_datetime(zone.get("issued_date"))
+        if published is None or not _event_is_recent(published, max_age):
+            continue
+
+        name = _clean_text(zone.get("name"))
+        country = _clean_text(zone.get("country"))
+        nid = _clean_text(zone.get("Nid") or zone.get("nid"))
+        if not name:
+            continue
+
+        title = f"EASA conflict-zone airspace advisory: {name}"
+        summary = f"Status: {status}"
+        valid_until = _clean_text(zone.get("valid_until_date"))
+        if valid_until:
+            summary += f"; valid until {valid_until}"
+
+        events.append(
+            build_radar_event(
+                source_id=source_id,
+                title=title,
+                original_title=title,
+                summary=summary,
+                url=source.get("official_proof", ""),
+                published=published,
+                external_id=nid,
+                region=country or name,
+                event_status=STATUS_ADVISORY,
+                metadata={
+                    "status": status,
+                    "valid_until": valid_until,
+                    "coordinates": _clean_text(zone.get("coordinates")),
+                },
+            )
+        )
+        if len(events) >= MAX_ITEMS_PER_SOURCE:
+            break
+    return events
+
+
+def _parse_source_document(source: Dict, document: str) -> List[Dict]:
+    parser_name = source.get("parser")
+    source_id = source["id"]
+    if parser_name == "ukmto_html":
+        return parse_ukmto_html(document, source_id=source_id, base_url=source["url"])
+    if parser_name == "ofac_html":
+        return parse_ofac_html(document, source_id=source_id)
+    if parser_name == "usgs_geojson":
+        return parse_usgs_geojson(document, source_id=source_id)
+    if parser_name == "gdacs_rss":
+        return parse_gdacs_rss(document, source_id=source_id)
+    if parser_name == "easa_json":
+        return parse_easa_json(document, source_id=source_id)
+    raise ValueError(f"Unsupported direct parser: {parser_name}")
+
+
 # =========================================================
 # CIRCUIT BREAKER
 # =========================================================
@@ -766,15 +1117,23 @@ async def _fetch_text(
         return ""
 
 
-def _document_matches_source(source_id: str, document: str) -> bool:
+def _document_matches_source(source: Dict, document: str) -> bool:
     """Reject HTTP-200 challenge/error pages before treating a sensor as healthy."""
     low = (document or "").lower()
     if not low:
         return False
-    if source_id == "ukmto_warnings":
+
+    parser_name = source.get("parser")
+    if parser_name == "ukmto_html":
         return "ukmto" in low and any(token in low for token in ("warning", "incident", "maritime"))
-    if source_id == "ofac_recent_actions":
+    if parser_name == "ofac_html":
         return "ofac" in low and any(token in low for token in ("recent actions", "sanctions", "treasury"))
+    if parser_name == "usgs_geojson":
+        return '"featurecollection"' in low and '"features"' in low
+    if parser_name == "gdacs_rss":
+        return "<rss" in low and ("gdacs" in low or "<channel" in low)
+    if parser_name == "easa_json":
+        return '"conflict_zones"' in low
     return False
 
 
@@ -802,23 +1161,14 @@ async def _collect_one(
     if not document:
         return []
 
-    if not _document_matches_source(source_id, document):
+    if not _document_matches_source(source, document):
         _circuit_failure(source_id)
         _set_source_health(source_id, HEALTH_PARSE_FAILED, detail="unexpected_document_shape")
         log.warning("direct source returned unexpected document shape: %s", source_id)
         return []
 
     try:
-        if source_id == "ukmto_warnings":
-            events = parse_ukmto_html(
-                document,
-                source_id=source_id,
-                base_url=source["url"],
-            )
-        elif source_id == "ofac_recent_actions":
-            events = parse_ofac_html(document, source_id=source_id)
-        else:
-            raise ValueError(f"Unsupported direct source: {source_id}")
+        events = _parse_source_document(source, document)
 
         _circuit_success(source_id)
         _set_source_health(
@@ -971,7 +1321,7 @@ async def collect_direct_radar(
 
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml",
+        "Accept": "application/json,application/geo+json,application/xml,text/xml,text/html;q=0.8,*/*;q=0.5",
     }
     connector = aiohttp.TCPConnector(limit=max(4, len(sources) * 2))
     async with aiohttp.ClientSession(headers=headers, connector=connector) as owned:
@@ -988,7 +1338,7 @@ def validate_direct_sources() -> List[str]:
 
     required_fields = {
         "id", "entity", "organization", "source_type", "grade", "role",
-        "active", "url", "official_proof", "topics", "dedup_group",
+        "active", "url", "official_proof", "parser", "topics", "dedup_group",
         "priority", "default_event_status",
     }
 
@@ -1008,6 +1358,8 @@ def validate_direct_sources() -> List[str]:
             errors.append(f"{source_id}: invalid role")
         if source.get("source_type") not in VALID_SOURCE_TYPES:
             errors.append(f"{source_id}: invalid source_type")
+        if source.get("parser") not in {"ukmto_html", "ofac_html", "usgs_geojson", "gdacs_rss", "easa_json"}:
+            errors.append(f"{source_id}: invalid parser")
         if source.get("routing_hint") not in VALID_ROUTING_HINTS:
             errors.append(f"{source_id}: invalid routing_hint")
         if source.get("default_event_status") not in VALID_EVENT_STATUSES:
@@ -1046,6 +1398,8 @@ def registry_stats() -> Dict[str, int]:
         "a": sum(1 for s in active if s.get("grade") == GRADE_A),
         "maritime": sum(1 for s in active if s.get("source_type") == TYPE_MARITIME_SECURITY),
         "sanctions": sum(1 for s in active if s.get("source_type") == TYPE_SANCTIONS),
+        "aviation": sum(1 for s in active if s.get("source_type") == TYPE_AVIATION_SECURITY),
+        "seismic": sum(1 for s in active if s.get("source_type") == TYPE_SEISMIC_ALERT),
         "aviation": sum(1 for s in active if s.get("source_type") == TYPE_AVIATION_SECURITY),
     }
 

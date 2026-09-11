@@ -536,9 +536,12 @@ USER_LOCKS: Dict[int, asyncio.Lock] = {}
 USER_ACTIVITY: Dict[int, float] = {}
 LAST_USER_STATE_PRUNE = 0.0
 
-# Ready-to-serve presentation indexes. Buttons read these only; provider refreshes
-# own translation, deduplication, routing and rebuilding in the background.
+# Ready-to-serve presentation indexes. Buttons read one atomically-swapped
+# snapshot only; provider refreshes own translation, deduplication, routing and
+# rebuilding in the background. Keeping merged + topics under one reference
+# prevents callbacks from observing a half-published presentation state.
 HOT_TOPIC_VIEWS: Dict[str, List[Any]] = {}
+HOT_PRESENTATION_SNAPSHOT = {"merged": [], "topics": {}}
 HOT_VIEW_DIRTY = True
 PRESENTATION_REBUILD_TASK = None
 LAST_HOT_CANDIDATE_COUNT = 0
@@ -1356,12 +1359,13 @@ def _invalidate_hot_view():
 
 
 def _rebuild_hot_views():
-    """Publish one stable merged snapshot and precompute all visible sections.
+    """Build off-thread, then atomically publish one complete presentation snapshot.
 
-    A transient provider failure is allowed to add fresh items, but it is never
-    allowed to replace a large working snapshot with a tiny partial one.
+    The currently served snapshot remains untouched while routing/ranking/dedup is
+    computed. A transient provider failure may enrich a working snapshot, but it
+    must not collapse a healthy view into a tiny partial one.
     """
-    global HOT_TOPIC_VIEWS, HOT_VIEW_DIRTY
+    global HOT_TOPIC_VIEWS, HOT_PRESENTATION_SNAPSHOT, HOT_VIEW_DIRTY
     global LAST_HOT_CANDIDATE_COUNT, LAST_HOT_PUBLISHED_COUNT
     global LAST_HOT_SNAPSHOT_GUARDED
 
@@ -1369,7 +1373,11 @@ def _rebuild_hot_views():
     direct = DIRECT_CACHE.peek("direct_news") or []
     social = SOCIAL_CACHE.peek("social_news") or []
     broad = NEWS_CACHE.peek("all_news") or []
-    previous = HOT_VIEW_CACHE.peek("merged") or []
+
+    served_snapshot = HOT_PRESENTATION_SNAPSHOT
+    previous = list(served_snapshot.get("merged", []) or [])
+    if not previous:
+        previous = HOT_VIEW_CACHE.peek("merged") or []
 
     urgent_timeline = _recent_publishable_urgent(
         breaking,
@@ -1377,8 +1385,7 @@ def _rebuild_hot_views():
     )
 
     # Breaking-cache items belong exclusively to عاجل. For the remaining desks,
-    # merge only non-breaking providers and remove any event already active in
-    # the one-hour urgent timeline.
+    # merge only non-breaking providers and remove events active in عاجل.
     ready = [
         item for item in (list(direct) + list(social) + list(broad))
         if _visible_item_ready(item)
@@ -1394,9 +1401,6 @@ def _rebuild_hot_views():
         int(previous_count * HOT_SNAPSHOT_MIN_RETAIN_RATIO),
     ) if previous_count else 0
 
-    # Guard against catastrophic shrinkage. During degraded/unavailable news
-    # collection, or whenever the candidate falls below 70% of a working view,
-    # merge fresh candidates into the previous snapshot rather than replacing it.
     guarded = bool(
         previous
         and (
@@ -1424,32 +1428,58 @@ def _rebuild_hot_views():
     else:
         merged = list(candidate)
 
-    HOT_VIEW_CACHE.set("merged", list(merged))
-    LAST_HOT_PUBLISHED_COUNT = len(merged)
-    LAST_HOT_SNAPSHOT_GUARDED = guarded
-
-    # Precompute routing, ranking and deduplication once. Button handlers are then
-    # O(page_size), not O(cache_size^2).
-    HOT_TOPIC_VIEWS = {
+    # Build every desk locally first. Nothing below this point is visible to a
+    # Telegram callback until the single HOT_PRESENTATION_SNAPSHOT assignment.
+    next_topics = {
         key: topic_filter(merged, key, MAX_TOPIC_RESULTS)
         for key in TOPICS
         if key != "urg"
     }
+    next_topics["urg"] = list(urgent_timeline)
 
-    # "عاجل" remains the exclusive rolling one-hour lane.
-    HOT_TOPIC_VIEWS["urg"] = list(urgent_timeline)
+    # During a guarded/degraded cycle, preserve an existing non-empty desk if a
+    # partial provider result would otherwise make that one desk disappear.
+    previous_topics = served_snapshot.get("topics", {}) or {}
+    if previous_topics and (guarded or news_state in {"degraded", "unavailable"}):
+        for key in TOPICS:
+            if not next_topics.get(key) and previous_topics.get(key):
+                next_topics[key] = list(previous_topics[key])
 
+    published_snapshot = {
+        "merged": list(merged),
+        "topics": {key: list(value) for key, value in next_topics.items()},
+    }
+
+    # Atomic reference swap: callbacks see either the complete old snapshot or
+    # the complete new one, never a mixture. Compatibility mirrors are updated
+    # only after the served reference is live.
+    HOT_PRESENTATION_SNAPSHOT = published_snapshot
+    HOT_TOPIC_VIEWS = published_snapshot["topics"]
+    HOT_VIEW_CACHE.set("merged", published_snapshot["merged"])
+    LAST_HOT_PUBLISHED_COUNT = len(merged)
+    LAST_HOT_SNAPSHOT_GUARDED = guarded
     HOT_VIEW_DIRTY = False
-    return list(merged)
+    return list(published_snapshot["merged"])
 
 
 def _rebuild_urgent_view():
-    """Refresh only the rolling urgent button; never rebuild all six sections."""
-    HOT_TOPIC_VIEWS["urg"] = _recent_publishable_urgent(
+    """Atomically refresh only the rolling urgent desk."""
+    global HOT_TOPIC_VIEWS, HOT_PRESENTATION_SNAPSHOT
+
+    urgent_view = _recent_publishable_urgent(
         BREAKING_CACHE.peek("breaking_news") or [],
         limit=MAX_TOPIC_RESULTS,
     )
-    return list(HOT_TOPIC_VIEWS["urg"])
+    current = HOT_PRESENTATION_SNAPSHOT
+    topics = dict(current.get("topics", {}) or {})
+    topics["urg"] = list(urgent_view)
+    published_snapshot = {
+        "merged": list(current.get("merged", []) or []),
+        "topics": topics,
+    }
+    HOT_PRESENTATION_SNAPSHOT = published_snapshot
+    HOT_TOPIC_VIEWS = published_snapshot["topics"]
+    return list(urgent_view)
 
 
 async def _rebuild_hot_views_async():
@@ -1473,20 +1503,20 @@ async def _rebuild_hot_views_async():
 
 def get_cached_news_view(limit=HOT_CACHE_LIMIT):
     """Instant read-only merged snapshot; never performs network or heavy CPU work."""
-    cached = HOT_VIEW_CACHE.peek("merged")
-    if cached is not None:
+    snapshot = HOT_PRESENTATION_SNAPSHOT
+    cached = snapshot.get("merged", []) or []
+    if cached:
         return list(cached[:limit])
-    # During startup the background monitor owns the first rebuild. Returning an
-    # empty ready view is preferable to freezing Telegram callbacks.
     return []
 
 
 def get_cached_topic_view(topic_key, limit=MAX_TOPIC_RESULTS):
-    """Return a ready section index without routing/dedup work on a button."""
+    """Return a ready section index from one atomically published snapshot."""
     if topic_key not in TOPICS:
         return []
-    return list(HOT_TOPIC_VIEWS.get(topic_key, [])[:limit])
-
+    snapshot = HOT_PRESENTATION_SNAPSHOT
+    topics = snapshot.get("topics", {}) or {}
+    return list(topics.get(topic_key, [])[:limit])
 
 def _provider_due(last_refresh, interval):
     return not last_refresh or (time.monotonic() - last_refresh) >= interval
@@ -1560,18 +1590,48 @@ def _effective_social_interval():
 async def _run_all_source_refresh(force=False):
     jobs = []
     if force or _provider_due(LAST_NEWS_REFRESH, _effective_news_interval()):
-        jobs.append(collect_and_cache_news())
+        jobs.append(("news", collect_and_cache_news()))
     if force or _provider_due(LAST_SOCIAL_REFRESH, _effective_social_interval()):
-        jobs.append(_refresh_social_provider())
+        jobs.append(("social", _refresh_social_provider()))
     if force or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL):
-        jobs.append(_refresh_direct_provider(force=force))
+        jobs.append(("direct", _refresh_direct_provider(force=force)))
 
     if jobs:
-        results = await asyncio.gather(*jobs, return_exceptions=True)
+        tasks = [
+            asyncio.create_task(coro, name=f"provider-refresh-{name}")
+            for name, coro in jobs
+        ]
+
+        # Cold start only: publish the first useful provider result instead of
+        # keeping every section empty until the slowest provider finishes. This
+        # costs at most one extra off-thread presentation build per process start.
+        if not get_cached_news_view():
+            pending = set(tasks)
+            while pending and not get_cached_news_view():
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if (
+                    NEWS_CACHE.peek("all_news")
+                    or SOCIAL_CACHE.peek("social_news")
+                    or DIRECT_CACHE.peek("direct_news")
+                ):
+                    await _rebuild_hot_views_async()
+                    if get_cached_news_view():
+                        log.info(
+                            "Cold-start Hot Cache bootstrap published=%d pending_providers=%d",
+                            len(get_cached_news_view()),
+                            len(pending),
+                        )
+                        break
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                 log.error("Independent provider refresh failed: %r", result)
 
+        # Final publication includes every provider that completed this cycle.
         await _rebuild_hot_views_async()
 
         health = get_network_health()
@@ -1587,7 +1647,7 @@ async def _run_all_source_refresh(force=False):
             health["direct_radar"],
         )
 
-    if HOT_VIEW_CACHE.peek("merged") is None:
+    if not get_cached_news_view():
         await _rebuild_hot_views_async()
     return get_cached_news_view()
 

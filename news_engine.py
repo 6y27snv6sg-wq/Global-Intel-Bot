@@ -74,6 +74,7 @@ _FEED_PARSE_EXECUTOR = ThreadPoolExecutor(
     max_workers=FEED_PARSE_WORKERS,
     thread_name_prefix="feed-parser",
 )
+_FEED_PARSE_SEMAPHORE = asyncio.Semaphore(FEED_PARSE_WORKERS)
 BREAKING_TRANSLATION_BUDGET = 1.2
 BREAKING_MAX_PER_FEED = 12
 

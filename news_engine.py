@@ -84,10 +84,7 @@ CURRENT_NEWS_LOOKBACK_DAYS = 3
 
 TRUSTED_FEEDS = {
     "الجزيرة": "https://www.aljazeera.net/aljazeerarss/a7c1866f-6829-4883-8441-358d731800bc/43316f44-8e12-4320-b4c2-a22f6654b321",
-    "سكاي نيوز عربية": "https://www.skynewsarabia.com/rss/v1/news.xml",
-    "CNBC عربية": "https://www.cnbcarabia.com/rss.xml",
     "Investing": "https://sa.investing.com/rss/news.rss",
-    "وكالة الأنباء السعودية": "https://www.spa.gov.sa/rss.xml",
     "BBC عربي": "https://feeds.bbci.co.uk/arabic/rss.xml",
     "DW عربي": "https://rss.dw.com/rdf/rss-ar-all",
     "France24 عربي": "https://www.france24.com/ar/rss",
@@ -3857,6 +3854,14 @@ async def _collect_general_news(max_items=150):
         "site:abc.net.au/news Australia world news",
         "site:cbc.ca/news Canada world news",
         "site:skynews.com world breaking news",
+
+        # Publishers whose legacy RSS endpoints now return HTML/invalid payloads.
+        # Keep coverage through current publisher-domain discovery instead of
+        # wasting feed-parser/circuit-breaker capacity on dead RSS URLs.
+        "site:skynewsarabia.com آخر الأخبار",
+        "site:cnbcarabia.com اقتصاد أسواق",
+        "site:spa.gov.sa السعودية واس آخر الأخبار",
+
 
         # China / Russia: major television and national newsrooms.
         # Site discovery is used instead of guessing unstable RSS endpoints.

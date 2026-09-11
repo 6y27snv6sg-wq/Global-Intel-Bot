@@ -1594,44 +1594,73 @@ def _effective_social_interval():
 
 
 async def _run_all_source_refresh(force=False):
-    """Refresh providers in priority stages, never as one competing network burst.
+    """Refresh independent providers without making a slow provider block the rest.
 
-    Direct radar is refreshed first so عاجل can be served quickly. The broad news
-    engine follows, then social enrichment. A presentation rebuild is published
-    between stages, keeping Telegram callbacks on ready snapshots while network
-    work continues separately.
+    The direct radar gets the first scheduling slot, followed by the broad news
+    engine and social enrichment. The providers then run independently. Whichever
+    provider finishes first publishes a fresh presentation snapshot immediately;
+    slower providers are merged later when they become ready. This keeps priority
+    as a scheduling preference rather than a serial dependency chain.
     """
     jobs = []
     if force or _provider_due(LAST_DIRECT_REFRESH, DIRECT_REFRESH_INTERVAL):
-        jobs.append(("direct", lambda: _refresh_direct_provider(force=force)))
+        jobs.append(("direct", lambda: _refresh_direct_provider(force=force), 0.0))
     if force or _provider_due(LAST_NEWS_REFRESH, _effective_news_interval()):
-        jobs.append(("news", collect_and_cache_news))
+        jobs.append(("news", collect_and_cache_news, 0.15))
     if force or _provider_due(LAST_SOCIAL_REFRESH, _effective_social_interval()):
-        jobs.append(("social", _refresh_social_provider))
+        jobs.append(("social", _refresh_social_provider, 0.30))
+
+    async def run_provider(name, factory, start_delay):
+        if start_delay:
+            await asyncio.sleep(start_delay)
+        try:
+            await factory()
+            return name, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return name, exc
 
     if jobs:
-        for name, factory in jobs:
-            try:
-                await factory()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.error("Independent provider refresh failed stage=%s error=%r", name, exc)
+        tasks = [
+            asyncio.create_task(
+                run_provider(name, factory, start_delay),
+                name=f"provider-refresh-{name}",
+            )
+            for name, factory, start_delay in jobs
+        ]
 
-            # Publish whatever is ready after each provider stage. The rebuild is
-            # off the Telegram event loop and desks are routed by fixed priority.
-            if (
-                NEWS_CACHE.peek("all_news")
-                or SOCIAL_CACHE.peek("social_news")
-                or DIRECT_CACHE.peek("direct_news")
-                or BREAKING_CACHE.peek("breaking_news")
-            ):
-                await _rebuild_hot_views_async()
-                log.info(
-                    "Priority refresh stage=%s hot=%d",
-                    name,
-                    len(get_cached_news_view()),
-                )
+        try:
+            for completed in asyncio.as_completed(tasks):
+                name, exc = await completed
+                if exc is not None:
+                    log.error(
+                        "Independent provider refresh failed stage=%s error=%r",
+                        name,
+                        exc,
+                    )
+
+                # Publish every completed provider immediately. Presentation
+                # routing runs off the Telegram event loop and is atomically
+                # swapped, so UI callbacks never wait for unfinished providers.
+                if (
+                    NEWS_CACHE.peek("all_news")
+                    or SOCIAL_CACHE.peek("social_news")
+                    or DIRECT_CACHE.peek("direct_news")
+                    or BREAKING_CACHE.peek("breaking_news")
+                ):
+                    await _rebuild_hot_views_async()
+                    log.info(
+                        "Ready-first refresh provider=%s hot=%d",
+                        name,
+                        len(get_cached_news_view()),
+                    )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         health = get_network_health()
         log.info(
@@ -2070,13 +2099,27 @@ def search_result_keyboard(user_id, page):
     return InlineKeyboardMarkup(rows)
 
 
+def _topic_ready_counts():
+    """Return section counts from the already-published atomic snapshot only."""
+    snapshot = HOT_PRESENTATION_SNAPSHOT
+    topics = snapshot.get("topics", {}) or {}
+    return {
+        key: len(topics.get(key, []) or [])
+        for key in TOPIC_REFRESH_PRIORITY
+    }
+
+
 def main_keyboard(user_id):
     rows = []
+    counts = _topic_ready_counts()
     topic_items = list(TOPICS.items())
 
     for i in range(0, len(topic_items), 2):
         rows.append([
-            InlineKeyboardButton(label, callback_data=f"t:{key}:1")
+            InlineKeyboardButton(
+                f"{label} {counts.get(key, 0)}",
+                callback_data=f"t:{key}:1",
+            )
             for key, (label, _) in topic_items[i:i + 2]
         ])
 
@@ -3142,6 +3185,44 @@ async def post_stop(application):
             pass
 
 
+def home_message_html():
+    """One canonical Home message for /start and every in-bot return path."""
+    return (
+        f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "الرصد العالمي نشط.\n"
+        "اختر القسم المطلوب. الأخبار الجاهزة تظهر فوراً، "
+        "وتدخل بقية التغطية تلقائياً عند جاهزيتها.\n\n"
+        "🔄 <b>زر التحديث يبدأ جولة جديدة؛ لا يلزم انتظار المصادر البطيئة.</b>\n\n"
+        "🚨 التنبيهات العاجلة تعمل تلقائياً ويمكن إيقافها."
+    )
+
+
+async def _edit_or_reply(query, text, *, reply_markup=None, disable_web_page_preview=None):
+    """Prefer in-place navigation; fall back to a new message if editing is impossible."""
+    kwargs = {
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": reply_markup,
+    }
+    if disable_web_page_preview is not None:
+        kwargs["disable_web_page_preview"] = disable_web_page_preview
+    try:
+        await query.message.edit_text(**kwargs)
+        return
+    except Exception:
+        pass
+
+    reply_kwargs = {
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": reply_markup,
+    }
+    if disable_web_page_preview is not None:
+        reply_kwargs["disable_web_page_preview"] = disable_web_page_preview
+    await query.message.reply_text(**reply_kwargs)
+
+
 async def start(update, context):
     user = update.effective_user
     if not user or not update.message:
@@ -3152,12 +3233,7 @@ async def start(update, context):
 
     register_user(user.id)
     await update.message.reply_text(
-        f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "الرصد العالمي نشط.\n"
-        "اختر مسار المتابعة، وستظهر الأخبار المتاحة أولاً "
-        "بينما تستمر التغطية في الخلفية.\n\n"
-        "🚨 التنبيهات العاجلة تعمل تلقائياً ويمكن إيقافها.",
+        home_message_html(),
         reply_markup=main_keyboard(user.id),
         parse_mode="HTML",
     )
@@ -3257,11 +3333,11 @@ async def show_topic(query, user_id, key, page):
                     f"الصفحة {page} من {total_pages}"
                 ),
             )
-            await query.message.reply_text(
+            await _edit_or_reply(
+                query,
                 report,
                 reply_markup=result_keyboard(key, page, len(results)),
                 disable_web_page_preview=True,
-                parse_mode="HTML",
             )
             # UI callbacks are cache-only. The shared provider monitor owns
             # refresh scheduling so button presses never start heavy network work.
@@ -3270,27 +3346,30 @@ async def show_topic(query, user_id, key, page):
         # "عاجل" is continuously maintained by urgent_monitor. A button press
         # must never launch a global force-refresh just because there is no alert.
         if page == 1 and key == "urg":
-            await query.message.reply_text(
+            await _edit_or_reply(
+                query,
                 f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
                 "لا توجد أخبار عاجلة موثقة خلال آخر ساعة.\n"
                 "📡 الرصد العاجل مستمر تلقائياً.",
-                parse_mode="HTML",
+                reply_markup=result_keyboard(key, 1, 0),
             )
             return
 
         # Empty sections remain cache-only as well. Provider monitor owns refresh.
         if page == 1:
-            await query.message.reply_text(
+            await _edit_or_reply(
+                query,
                 f"{status_visual('monitoring')} <b>{safe_html(TOPICS[key][0])}</b>\n\n"
                 "◌ لا توجد نتائج جاهزة لهذا القسم الآن.\n"
                 "📡 الرصد والتحديث مستمران تلقائياً.",
-                parse_mode="HTML",
+                reply_markup=result_keyboard(key, 1, 0),
             )
         else:
-            await query.message.reply_text(
+            await _edit_or_reply(
+                query,
                 f"<b>{safe_html(TOPICS[key][0])}</b>\n\n"
                 "لا توجد أخبار إضافية محفوظة لهذه الصفحة.",
-                parse_mode="HTML",
+                reply_markup=result_keyboard(key, 1, 0),
             )
 
     except Exception:
@@ -3482,13 +3561,10 @@ async def button_handler(update, context):
             safe_query_answer(query),
             f"callback-ack-{getattr(query, 'id', '') or user_id}-home",
         )
-        await query.message.reply_text(
-            f"{visual('world')} <b>GLOBAL INTEL | مركز الأخبار</b>\n\n"
-            "اختر القسم المطلوب. الأخبار المتاحة تظهر أولاً "
-            "والرصد يستمر في الخلفية.\n\n"
-            "🔄 <b>اضغط زر التحديث وانتظر اكتمال التحديث، ثم اختر القسم المطلوب.</b>",
+        await _edit_or_reply(
+            query,
+            home_message_html(),
             reply_markup=main_keyboard(user_id),
-            parse_mode="HTML",
         )
         return
 
@@ -3499,42 +3575,20 @@ async def button_handler(update, context):
         )
 
         cached = get_cached_news_view()
-        refresh_status = await query.message.reply_text(
+        # The button only starts/joins a background refresh. It never waits for
+        # the slowest network source. Each provider publishes independently as
+        # soon as it finishes, while every section remains immediately usable.
+        # Fire-and-return: the UI never waits for provider completion. If a
+        # provider cycle is already active, reuse it rather than queueing a
+        # second full forced cycle behind it.
+        trigger_background_refresh(force=True)
+        await _edit_or_reply(
+            query,
             f"{status_visual('monitoring')} <b>تحديث التغطية</b>\n\n"
-            f"● المتاح الآن: {len(cached)} خبر\n"
-            "◌ جاري توسيع التغطية في الخلفية...",
-            parse_mode="HTML",
+            f"✅ الأخبار الجاهزة متاحة الآن: {len(cached)} خبر\n"
+            "📡 بدأت جولة تحديث جديدة. كل مصدر يضاف فور جاهزيته، "
+            "والمصادر البطيئة تستمر في الخلفية دون تعطيل الأقسام.",
             reply_markup=main_keyboard(user_id),
-        )
-
-        async def refresh_and_notify():
-            before = len(cached)
-            fresh = await get_fresh_news(force_refresh=True)
-            if not _runtime_access_allowed(user_id):
-                return
-            after = len(fresh)
-            guarded = bool(LAST_HOT_SNAPSHOT_GUARDED)
-            try:
-                await refresh_status.edit_text(
-                    f"✅ <b>اكتملت جولة التحديث</b>\n\n"
-                    f"الأخبار المتاحة الآن: {after}"
-                    + (
-                        f"\n+{max(0, after - before)} إضافة جديدة"
-                        if after > before else ""
-                    )
-                    + (
-                        "\n🛡 تم الاحتفاظ بآخر تغطية سليمة لأن الجولة الجديدة كانت ناقصة."
-                        if guarded else ""
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=main_keyboard(user_id),
-                )
-            except Exception:
-                log.exception("Refresh completion message failed.")
-
-        track_task(
-            refresh_and_notify(),
-            f"manual-refresh-{user_id}",
         )
         return
 

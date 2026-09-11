@@ -427,7 +427,7 @@ load_access_state()
 
 NEWS_COLLECTION_TIMEOUT = 25
 ONLINE_SEARCH_TIMEOUT = 6
-CALLBACK_ACK_TIMEOUT = 0.20
+CALLBACK_ACK_TIMEOUT = 3.0
 TELEGRAM_CONCURRENT_UPDATES = 8
 CALLBACK_DEDUP_TTL = 60
 CALLBACK_ACTION_DEBOUNCE = 8
@@ -3404,6 +3404,13 @@ async def button_handler(update, context):
         return
 
     if not claim_callback(query, user_id, data):
+        # Telegram still expects every delivered callback query to be answered.
+        # A repeated press must be ignored at the action layer, not at the ACK
+        # layer, otherwise the client keeps the button spinner active.
+        track_task(
+            safe_query_answer(query),
+            f"callback-ack-{getattr(query, 'id', '') or user_id}-duplicate",
+        )
         return
 
     if data == "toggle_alerts":

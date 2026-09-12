@@ -490,7 +490,13 @@ async def translate_news_titles(items, budget=None):
                 item = task_map[task]
                 try:
                     translated = task.result()
-                except Exception:
+                except Exception as exc:
+                    _log_fault_once(
+                        "search_translation_task",
+                        "Search title translation task failed",
+                        exc=exc,
+                        level=logging.DEBUG,
+                    )
                     continue
                 if translated and translated != item.title:
                     item.original_title = item.original_title or item.title
@@ -3596,7 +3602,15 @@ async def search_news_online(query, max_results=25):
                     item.official = True
                     item.trust_score = max(item.trust_score, 98.0)
                 raw_items.append(item)
-        except Exception:
+        except Exception as exc:
+            discovery_query = task_queries.get(task, "")
+            _log_fault_once(
+                f"online_search_task:{discovery_query}",
+                "Online search feed failed query=%r",
+                discovery_query,
+                exc=exc,
+                level=logging.WARNING,
+            )
             continue
 
     if direct_official_task is not None:
@@ -4067,7 +4081,13 @@ async def _collect_general_news(max_items=150):
                         continue
                     items.append(item)
                     discovery_added += 1
-            except Exception:
+            except Exception as exc:
+                _log_fault_once(
+                    "background_discovery_task",
+                    "Background discovery task failed",
+                    exc=exc,
+                    level=logging.WARNING,
+                )
                 continue
 
         log.info(

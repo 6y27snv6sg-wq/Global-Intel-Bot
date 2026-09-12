@@ -1,0 +1,33 @@
+name: Topic Routing Tests
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "test_topic_routing.py"
+      - "bot.py"
+      - "news_engine.py"
+      - ".github/workflows/topic-routing-tests.yml"
+
+jobs:
+  topic-routing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run topic routing characterization tests
+        env:
+          TELEGRAM_BOT_TOKEN: ""
+          GEMINI_API_KEY: ""
+        run: python -m unittest -v test_topic_routing.py

@@ -1203,6 +1203,7 @@ async def _ensure_arabic_titles(items, *, budget, cap):
 
 
 async def _run_news_collection():
+    """Fetch one broad-news cycle and update NEWS_CACHE; called by the shared collector."""
     global LAST_NEWS_REFRESH, NEWS_PROVIDER_HEALTH
     try:
         items = await asyncio.wait_for(
@@ -1249,7 +1250,7 @@ async def _run_news_collection():
 
 
 async def collect_and_cache_news():
-    """Single-flight base collector: concurrent refreshes share one task."""
+    """Single-flight wrapper used by provider orchestration; concurrent callers share one news task."""
     global NEWS_COLLECTION_TASK
     task = NEWS_COLLECTION_TASK
     if task is None or task.done():
@@ -1681,7 +1682,7 @@ async def _run_all_source_refresh(force=False):
 
 
 async def refresh_all_sources(force=False):
-    """Global single-flight refresh with force-upgrade semantics.
+    """Await the shared all-provider refresh used by internal callers.
 
     Concurrent callers share one cycle. If a manual/forced refresh arrives while
     a non-forced cycle is already running, exactly one forced cycle follows it.
@@ -1713,7 +1714,7 @@ async def refresh_all_sources(force=False):
 
 
 def trigger_background_refresh(force=False):
-    """Schedule enrichment and return immediately; safe for button handlers."""
+    """Fire-and-return entry point for UI callbacks; schedules provider enrichment only."""
     global PROVIDER_REFRESH_TASK
     task = PROVIDER_REFRESH_TASK
     if task is not None and not task.done():
@@ -2215,7 +2216,7 @@ async def deny_or_request_access(update, context):
             try:
                 await query.answer(text, show_alert=True)
             except Exception:
-                pass
+                log.debug("Blocked-user callback acknowledgement failed.", exc_info=True)
         elif message:
             await message.reply_text(text)
         return True
@@ -2235,7 +2236,7 @@ async def deny_or_request_access(update, context):
         try:
             await query.answer("🔒 لا تملك صلاحية الدخول.", show_alert=True)
         except Exception:
-            pass
+            log.debug("Unauthorized-user callback acknowledgement failed.", exc_info=True)
     elif message:
         await message.reply_text(text, parse_mode="HTML")
     return True
@@ -2289,7 +2290,7 @@ async def owner_callback(query, context, data, actor_id):
             try:
                 await context.bot.send_message(target, "✅ تمت الموافقة على دخولك للبوت. أرسل /start للبدء.")
             except Exception:
-                pass
+                log.debug("Access approval notification failed target=%s", target, exc_info=True)
         elif action == "reject":
             PENDING_USERS.pop(target, None)
             APPROVED_USERS.discard(target)
@@ -2306,7 +2307,7 @@ async def owner_callback(query, context, data, actor_id):
             try:
                 await context.bot.send_message(target, "⛔ تم إلغاء صلاحية وصولك إلى البوت.")
             except Exception:
-                pass
+                log.debug("Access revocation notification failed target=%s", target, exc_info=True)
         elif action == "unblock":
             BLOCKED_USERS.discard(target)
             # Unblocking does not silently grant access; user must request again.
@@ -2733,7 +2734,7 @@ def _merge_event_sources(primary, duplicate):
     try:
         setattr(primary, "alternate_sources", merged)
     except Exception:
-        pass
+        log.debug("Could not attach alternate_sources to deduplicated item.", exc_info=True)
 
 
 def deduplicate_events(items, limit=None):
@@ -3211,7 +3212,7 @@ async def _edit_or_reply(query, text, *, reply_markup=None, disable_web_page_pre
         await query.message.edit_text(**kwargs)
         return
     except Exception:
-        pass
+        log.debug("In-place message edit failed; falling back to reply.", exc_info=True)
 
     reply_kwargs = {
         "text": text,
@@ -3424,7 +3425,7 @@ async def progressive_online_search(
                     parse_mode="HTML",
                 )
             except Exception:
-                pass
+                log.debug("Search empty-result status edit failed.", exc_info=True)
         return
     except asyncio.CancelledError:
         raise
@@ -3438,7 +3439,7 @@ async def progressive_online_search(
                     parse_mode="HTML",
                 )
             except Exception:
-                pass
+                log.debug("Search failure status edit failed.", exc_info=True)
         return
 
     if not _runtime_access_allowed(user_id):
@@ -3553,7 +3554,7 @@ async def button_handler(update, context):
         try:
             await query.message.edit_reply_markup(main_keyboard(user_id))
         except Exception:
-            pass
+            log.debug("Urgent-toggle keyboard refresh failed user=%s", user_id, exc_info=True)
         return
 
     if data == "home":

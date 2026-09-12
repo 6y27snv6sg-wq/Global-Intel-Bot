@@ -43,7 +43,8 @@ DATE_ENRICH_MAX_CANDIDATES = 12
 DATE_ENRICH_BUDGET = 2.5
 GENERAL_TRANSLATION_BUDGET = 2.0
 GENERAL_CANDIDATE_CAP = 100
-COLLECT_NEWS_TASK_BUDGET = 21.0
+COLLECT_NEWS_TASK_BUDGET = 19.0
+COLLECT_NEWS_CANCEL_GRACE = 1.0
 GENERAL_RESULT_MIN_SHARE = 0.34
 OFFICIAL_INDEX_TIMEOUT = 4.5
 OFFICIAL_INDEX_CONCURRENCY = 24
@@ -94,14 +95,24 @@ def _log_fault_once(key, message, *args, exc=None, level=logging.WARNING):
 
     Deliberately emits one line (no traceback) so a burst of unreachable official
     sites cannot exhaust Railway's log-rate budget. Recovery clears the latch.
+
+    Render the caller's %-style arguments before appending the exception
+    signature.  Exception text can itself contain percent-encoded URLs (for
+    example ``Press%20release``); appending that text to an unrendered logging
+    format string lets ``logging`` misread ``%20r`` as another placeholder and
+    raises ``TypeError: not enough arguments for format string``.
     """
     signature = _fault_signature(exc=exc)
     previous = _LOG_FAULT_STATE.get(key)
     if previous == signature:
         return False
     _LOG_FAULT_STATE[key] = signature
+    try:
+        rendered = message % args if args else str(message)
+    except Exception:
+        rendered = " ".join([str(message), *(str(arg) for arg in args)]).strip()
     suffix = f" [{signature}]" if signature else ""
-    log.log(level, message + suffix, *args)
+    log.log(level, "%s%s", rendered, suffix)
     return True
 
 
@@ -4161,30 +4172,64 @@ def _balanced_official_order(items):
 
 
 async def collect_news(max_items=150):
-    """Collect bounded official/general lanes within bot.py's 25s outer timeout."""
+    """Collect official/general lanes and return every lane that finishes in budget.
+
+    ``bot.py`` intentionally owns a hard 25-second provider deadline.  The
+    collector therefore stops accepting new lane work before that deadline and
+    spends only a short, bounded grace period cancelling unfinished lanes.  This
+    is important: the previous unbounded cancellation gather could run beyond the
+    caller's deadline, causing ``wait_for`` to cancel this function and discard
+    official/general results that had already completed successfully.
+    """
     tasks = [
         asyncio.create_task(_collect_general_news(max_items), name="general-news"),
         asyncio.create_task(collect_official_publisher_news(), name="official-news"),
     ]
     items = []
+    done = set()
+    pending = set(tasks)
     try:
-        done, _ = await asyncio.wait(tasks, timeout=COLLECT_NEWS_TASK_BUDGET)
-        for task in tasks:
-            if task in done:
-                try:
-                    items.extend(task.result())
-                except Exception as exc:
-                    _log_fault_once(
-                        "news_collector",
-                        "News collector failed",
-                        exc=exc,
-                        level=logging.WARNING,
-                    )
+        done, pending = await asyncio.wait(tasks, timeout=COLLECT_NEWS_TASK_BUDGET)
+
+        # Harvest completed lanes *before* touching slow lanes so their useful
+        # results survive even when another provider is cancelled.
+        for task in done:
+            try:
+                result = task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception as exc:
+                _log_fault_once(
+                    f"news_collector:{task.get_name()}",
+                    "News collector failed lane=%s",
+                    task.get_name(),
+                    exc=exc,
+                    level=logging.WARNING,
+                )
+                continue
+            if isinstance(result, list):
+                items.extend(result)
+
+        if pending:
+            log.warning(
+                "News collection lane budget reached completed=%d pending=%d; returning completed lanes.",
+                len(done), len(pending),
+            )
     finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        unfinished = [task for task in tasks if not task.done()]
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*unfinished, return_exceptions=True),
+                    timeout=COLLECT_NEWS_CANCEL_GRACE,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "News collector cancellation grace exceeded pending=%d; partial results preserved.",
+                    sum(not task.done() for task in unfinished),
+                )
 
     # Keep every verified registry publication available to its exclusive desk.
     # The Official view itself still receives only items routed to ``forg``.

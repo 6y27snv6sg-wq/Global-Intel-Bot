@@ -28,6 +28,6 @@ jobs:
 
       - name: Run topic routing characterization tests
         env:
-          TELEGRAM_BOT_TOKEN: ""
+          TELEGRAM_BOT_TOKEN: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
           GEMINI_API_KEY: ""
         run: python -m unittest -v test_topic_routing.py

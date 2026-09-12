@@ -1829,13 +1829,68 @@ def _contains_any(text, terms):
     return any(normalize_text(term) in text for term in terms if term)
 
 
-def _resolved_topic(item):
-    """Resolve every story to exactly one visible section.
+_TOPIC_ECON_SOURCES = (
+    "بنك مركزي", "البنك المركزي", "central bank", "reserve bank",
+    "treasury", "وزارة المالية", "ministry of finance", "sama",
+    "هيئة السوق", "stock exchange",
+)
 
-    Institution identity is authoritative. Security requires a defence/military
-    institution or concrete operational evidence; an engine label alone is not
-    sufficient. This prevents diplomacy and generic crime/politics from leaking
-    into Defense & Security.
+_TOPIC_SECURITY_SOURCES = (
+    "وزارة الدفاع", "الدفاع", "القوات المسلحة", "الجيش",
+    "ministry of defense", "ministry of defence", "army", "navy",
+    "air force", "ناتو", "nato",
+)
+
+_TOPIC_OFFICIAL_SOURCES = (
+    "وزارة الخارجية", "الخارجية", "foreign ministry",
+    "ministry of foreign affairs", "state department", "mfa",
+    "الرئاسة", "presidency", "الحكومة", "government",
+    "الديوان الملكي", "مجلس الوزراء",
+    "وكالة الأنباء السعودية", "وكالة الانباء السعودية",
+    "saudi press agency",
+)
+
+_TOPIC_EXPLICIT_OFFICIAL_TERMS = (
+    "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
+    "المتحدث باسم", "مصدر مسؤول", "أعلنت الوزارة", "اعلنت الوزارة",
+    "قالت الوزارة", "أعلن الوزير", "اعلن الوزير", "قال الوزير",
+)
+
+_TOPIC_STRONG_ECON_TERMS = (
+    "بنك مركزي", "فائده", "فائدة", "تضخم", "سياسه نقديه", "سياسة نقدية",
+    "اسعار الفائده", "أسعار الفائدة", "بورصه", "بورصة", "اسهم", "أسهم",
+    "سندات", "مزاد سندات", "ناتج محلي", "ميزانيه", "ميزانية",
+    "اسعار النفط", "أسعار النفط", "برنت", "اوبك", "أوبك",
+    "تعرفه جمركيه", "تعرفة جمركية", "عقوبات ماليه", "عقوبات مالية",
+    "central bank", "interest rate", "inflation", "monetary policy",
+    "stocks", "stock market", "bonds", "gdp", "budget", "oil prices",
+    "brent", "opec", "tariff", "financial sanctions",
+)
+
+_TOPIC_NON_OPERATIONAL_DEFENCE_TERMS = (
+    "جنازة", "تشييع", "يحيي ذكرى", "تحيي ذكرى", "تعزية", "تعازي",
+    "استقبال", "زيارة رسمية", "ذكرى سنوية", "مراسم",
+    "funeral", "memorial", "condolence", "ceremony", "official visit",
+)
+
+_TOPIC_STRONG_SECURITY_TERMS = (
+    "مناورات عسكريه", "مناورات عسكرية", "تمرين عسكري", "تدريب عسكري",
+    "عمليه عسكريه", "عملية عسكرية", "عمليات عسكريه", "عمليات عسكرية",
+    "دفاع جوي", "قاعده عسكريه", "قاعدة عسكرية", "تسليح", "اسلحه", "أسلحة",
+    "صاروخ باليستي", "طائره مسيره", "طائرة مسيرة", "سفينه حربيه",
+    "سفينة حربية", "اشتباكات مسلحه", "اشتباكات مسلحة", "قوات خاصه",
+    "قوات خاصة", "military exercise", "military drill", "military operation",
+    "air defense", "military base", "weapons", "ballistic missile",
+    "drone strike", "warship", "armed clashes", "special forces",
+)
+
+
+def _resolved_topic(item):
+    """Resolve one story to exactly one visible section.
+
+    Resolution order is intentional and covered by characterization tests:
+    institution identity, provider hard-route, explicit specialist evidence,
+    native official fallback, breaking exclusion, then geographic fallback.
     """
     engine = _engine_topic(item)
     forced = str(getattr(item, "_exclusive_topic", "") or "")
@@ -1843,91 +1898,40 @@ def _resolved_topic(item):
     source = normalize_text(get_item_source(item))
     region = normalize_text(str(getattr(item, "region", "") or ""))
 
-    econ_sources = (
-        "بنك مركزي", "البنك المركزي", "central bank", "reserve bank",
-        "treasury", "وزارة المالية", "ministry of finance", "sama",
-        "هيئة السوق", "stock exchange",
-    )
-    security_sources = (
-        "وزارة الدفاع", "الدفاع", "القوات المسلحة", "الجيش",
-        "ministry of defense", "ministry of defence", "army", "navy",
-        "air force", "ناتو", "nato",
-    )
-    official_sources = (
-        "وزارة الخارجية", "الخارجية", "foreign ministry",
-        "ministry of foreign affairs", "state department", "mfa",
-        "الرئاسة", "presidency", "الحكومة", "government",
-        "الديوان الملكي", "مجلس الوزراء",
-        "وكالة الأنباء السعودية", "وكالة الانباء السعودية",
-        "saudi press agency",
-    )
-    explicit_official_terms = (
-        "بيان رسمي", "تصريح رسمي", "بيان صحفي", "المتحدث الرسمي",
-        "المتحدث باسم", "مصدر مسؤول", "أعلنت الوزارة", "اعلنت الوزارة",
-        "قالت الوزارة", "أعلن الوزير", "اعلن الوزير", "قال الوزير",
-    )
-    strong_econ_terms = (
-        "بنك مركزي", "فائده", "فائدة", "تضخم", "سياسه نقديه", "سياسة نقدية",
-        "اسعار الفائده", "أسعار الفائدة", "بورصه", "بورصة", "اسهم", "أسهم",
-        "سندات", "مزاد سندات", "ناتج محلي", "ميزانيه", "ميزانية",
-        "اسعار النفط", "أسعار النفط", "برنت", "اوبك", "أوبك",
-        "تعرفه جمركيه", "تعرفة جمركية", "عقوبات ماليه", "عقوبات مالية",
-        "central bank", "interest rate", "inflation", "monetary policy",
-        "stocks", "stock market", "bonds", "gdp", "budget", "oil prices",
-        "brent", "opec", "tariff", "financial sanctions",
-    )
-    non_operational_defence_terms = (
-        "جنازة", "تشييع", "يحيي ذكرى", "تحيي ذكرى", "تعزية", "تعازي",
-        "استقبال", "زيارة رسمية", "ذكرى سنوية", "مراسم",
-        "funeral", "memorial", "condolence", "ceremony", "official visit",
-    )
-    strong_security_terms = (
-        "مناورات عسكريه", "مناورات عسكرية", "تمرين عسكري", "تدريب عسكري",
-        "عمليه عسكريه", "عملية عسكرية", "عمليات عسكريه", "عمليات عسكرية",
-        "دفاع جوي", "قاعده عسكريه", "قاعدة عسكرية", "تسليح", "اسلحه", "أسلحة",
-        "صاروخ باليستي", "طائره مسيره", "طائرة مسيرة", "سفينه حربيه",
-        "سفينة حربية", "اشتباكات مسلحه", "اشتباكات مسلحة", "قوات خاصه",
-        "قوات خاصة", "military exercise", "military drill", "military operation",
-        "air defense", "military base", "weapons", "ballistic missile",
-        "drone strike", "warship", "armed clashes", "special forces",
-    )
+    strong_econ = _contains_any(title, _TOPIC_STRONG_ECON_TERMS)
+    strong_security = _contains_any(title, _TOPIC_STRONG_SECURITY_TERMS)
 
-    source_is_econ = _contains_any(source, econ_sources)
-    source_is_security = _contains_any(source, security_sources)
-    source_is_official = _contains_any(source, official_sources)
-    strong_econ = _contains_any(title, strong_econ_terms)
-    strong_security = _contains_any(title, strong_security_terms)
-    non_operational_defence = _contains_any(title, non_operational_defence_terms)
-
-    # Institution identity wins even over a provider hard-route.
-    if source_is_econ:
+    # 1) Institution identity has highest precedence.
+    if _contains_any(source, _TOPIC_ECON_SOURCES):
         return "econ"
-    if source_is_official:
-        if strong_econ and engine == "econ":
-            return "econ"
-        return "forg"
-    if source_is_security:
-        if non_operational_defence:
+
+    if _contains_any(source, _TOPIC_OFFICIAL_SOURCES):
+        return "econ" if strong_econ and engine == "econ" else "forg"
+
+    if _contains_any(source, _TOPIC_SECURITY_SOURCES):
+        if _contains_any(title, _TOPIC_NON_OPERATIONAL_DEFENCE_TERMS):
             return "forg"
         return "secu"
 
-    # Provider hard-routes remain authoritative only after institutional checks.
-    if forced in {"econ", "forg", "secu"}:
-        if forced == "secu" and not strong_security:
-            # A support/provider label is insufficient without concrete evidence.
-            pass
-        else:
-            return forced
+    # 2) Provider hard-routes are accepted after institutional checks.
+    # Security still requires concrete operational evidence.
+    if forced == "econ":
+        return "econ"
+    if forced == "forg":
+        return "forg"
+    if forced == "secu" and strong_security:
+        return "secu"
 
-    if _contains_any(title, explicit_official_terms):
+    # 3) Strong title evidence resolves unlabelled/general items.
+    if _contains_any(title, _TOPIC_EXPLICIT_OFFICIAL_TERMS):
         return "forg"
     if strong_econ:
         return "econ"
     if strong_security:
         return "secu"
 
-    # Native official-registry items default to Official unless specialist
-    # evidence proves Economy or Security.
+    # 4) Native official-registry items default to Official unless the engine
+    # and concrete evidence agree on a specialist desk.
     if getattr(item, "official", False):
         if engine == "econ" and strong_econ:
             return "econ"
@@ -1935,12 +1939,11 @@ def _resolved_topic(item):
             return "secu"
         return "forg"
 
-    # Breaking is handled by its dedicated one-hour lane and is deliberately not
-    # routed into any other specialist section here.
+    # 5) Breaking has its own lane and must not leak into specialist sections.
     if forced == "urg":
         return ""
 
-    # Geographic residual desks receive all general/non-specialist coverage.
+    # 6) Remaining general coverage falls through to geographic desks.
     geo_text = f"{title} {region}"
     if (
         engine == "gulf"
@@ -1948,12 +1951,14 @@ def _resolved_topic(item):
         or _contains_any(geo_text, TOPICS["gulf"][1])
     ):
         return "gulf"
+
     if engine == "wrld" or _contains_any(geo_text, TOPICS["wrld"][1]):
         return "wrld"
+
     if region and region not in {"عام", "عالمي", "global", "غير محدد", "unknown"}:
         return "wrld"
 
-    # Do not trust weak engine specialist labels without positive evidence.
+    # Weak specialist engine labels are deliberately ignored without evidence.
     return "wrld"
 
 
